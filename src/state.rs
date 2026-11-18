@@ -159,7 +159,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(4));
+        root.insert("version".into(), Value::from(5));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -237,7 +237,7 @@ impl RiftState {
         }
         let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
         if let Some(b) = doc.get("spread_budget").and_then(|v| v.as_u64()) {
-            let upgraded = if version < 4 && matches!(b, 140 | 420) {
+            let upgraded = if version < 5 && matches!(b, 28 | 140 | 420) {
                 14
             } else {
                 b
@@ -448,5 +448,11 @@ mod tests {
         // Full vertical column is covered too.
         assert!(loaded.is_quart_corrupted([120, 180, -88]));
         assert!(loaded.is_quart_corrupted([120, -52, -88]));
+
+        // Legacy v1 saves with spread_budget=28 migrate cleanly down to calm 14 ops/tick,
+        // while explicit custom speeds on v5 stay preserved.
+        let legacy = serde_json::json!({ "version": 1, "spread_budget": 28 });
+        loaded.apply_json(&legacy);
+        assert_eq!(loaded.spread_budget, 14);
     }
 }

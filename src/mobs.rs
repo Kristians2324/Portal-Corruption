@@ -2,18 +2,67 @@ use crate::atmosphere::ParticlePalette;
 use crate::corruption::is_air_like;
 use crate::state::RiftState;
 use crate::types::{
-    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, dist_sq, horiz_dist_sq, spatial_hash,
-    strip_ns,
+    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, dist_sq, horiz_dist_sq,
+    spatial_hash, strip_ns,
 };
 use mod_api::{
-    ActiveEffect, BlockUpdateFlags, Compound, EntityRef, Heightmap, Host, Identifier, ItemStack,
-    LevelRef, LivingDeathEvent, ParticleOptions, PotentialSpawnsEvent, ServerHost, SoundSource,
-    SpawnEntry, Tag,
+    ActiveEffect, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, Heightmap, Host,
+    Identifier, ItemStack, LevelRef, LivingDeathEvent, ParticleOptions, PotentialSpawnsEvent,
+    ServerHost, SoundSource, SpawnEntry, SpawnReason, Tag,
 };
 
 const MOB_TICK_INTERVAL: u64 = 20;
 const HOGLIN_SPREAD_INTERVAL_TICKS: u64 = 24;
 const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
+
+/// Mobs only unlock once corruption has converted a pretty large Nether biome
+/// (~64-block diameter minimum across several chunks).
+pub const MIN_RIFT_BLOCKS_FOR_MOBS: u64 = 55_000;
+pub const MIN_RADIUS_SQ_FOR_MOBS: i64 = 32 * 32;
+
+pub fn rift_mobs_unlocked(rift: &RiftSource) -> bool {
+    rift.corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS && rift.max_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
+}
+
+/// True only if `pos` is covered by corrupted terrain belonging to a Rift that has grown
+/// into a large Nether biome (`>= MIN_RIFT_BLOCKS_FOR_MOBS` and radius `>= 32`).
+pub fn location_unlocks_nether_mobs(state: &RiftState, pos: [i32; 3]) -> bool {
+    if !state.is_quart_corrupted(pos) {
+        return false;
+    }
+    state.rifts.iter().any(|rift| {
+        rift_mobs_unlocked(rift)
+            && horiz_dist_sq(rift.center, pos) <= (rift.max_radius_sq + 256).max(MIN_RADIUS_SQ_FOR_MOBS)
+    })
+}
+
+/// Blocks vanilla natural spawns and portal piglin leaks in Overworld near an immature Rift
+/// until the corruption actually covers a large Nether biome.
+pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEvent<'_>) -> bool {
+    if event.dimension != OVERWORLD {
+        return false;
+    }
+    if !is_nether_predator(event.kind) && strip_ns(event.kind) != "strider" {
+        return false;
+    }
+    if !matches!(
+        event.reason,
+        SpawnReason::Natural | SpawnReason::ChunkGeneration | SpawnReason::Structure
+    ) {
+        return false;
+    }
+    let bp = [
+        event.pos[0].floor() as i32,
+        event.pos[1].floor() as i32,
+        event.pos[2].floor() as i32,
+    ];
+    let near_any_rift = state.is_quart_corrupted(bp)
+        || state
+            .rifts
+            .iter()
+            .any(|r| horiz_dist_sq(r.center, bp) <= (r.max_radius_sq + 512).max(32 * 32));
+    near_any_rift && !location_unlocks_nether_mobs(state, bp)
+}
 
 /// True for Nether mobs native to or brought forth by Rifts.
 pub fn is_nether_predator(kind: &str) -> bool {
@@ -31,8 +80,8 @@ pub fn is_nether_predator(kind: &str) -> bool {
     )
 }
 
-/// Maps any Overworld creature killed by Nether mobs (or dying inside corrupted
-/// territory) to its transformed Nether counterpart using vanilla mobs.
+/// Maps any Overworld creature killed by Nether mobs (or dying inside an established
+/// large corrupted Nether biome) to its transformed Nether counterpart using vanilla mobs.
 pub fn nether_death_conversion_target(kind: &str) -> Option<&'static str> {
     match strip_ns(kind) {
         "pig" | "cow" | "mooshroom" | "sheep" | "goat" | "horse" | "donkey" | "mule"
@@ -54,7 +103,7 @@ pub fn nether_death_conversion_target(kind: &str) -> Option<&'static str> {
 }
 
 /// Hostile Overworld mobs that gain Nether-Touched buffs & bonus drops while alive
-/// in corruption (and still transform on death when slain by Nether mobs).
+/// in large corrupted biomes (and still transform on death when slain by Nether mobs).
 pub fn is_nether_touched_candidate(kind: &str) -> bool {
     matches!(
         strip_ns(kind),
@@ -81,23 +130,28 @@ pub fn is_zombified_outcome(outcome: &str) -> bool {
     matches!(strip_ns(outcome), "zombified_piglin" | "zoglin")
 }
 
+pub fn local_corrupt_flavor(
+    host: &dyn Host,
+    level: LevelRef,
+    pos: [i32; 3],
+) -> Option<NetherFlavor> {
+    for sy in [pos[1].clamp(-56, 200), 64, 0] {
+        if let Some(name) = level.biome_at(host, [pos[0], sy, pos[2]])
+            && let Some(flavor) = NetherFlavor::from_name(&name)
+        {
+            return Some(flavor);
+        }
+    }
+    None
+}
+
 pub fn pos_is_corrupted(
     host: &dyn Host,
     level: LevelRef,
     state: &RiftState,
     pos: [i32; 3],
 ) -> bool {
-    if state.is_quart_corrupted(pos) {
-        return true;
-    }
-    for sy in [pos[1].clamp(-56, 200), 64, 0] {
-        if let Some(name) = level.biome_at(host, [pos[0], sy, pos[2]])
-            && NetherFlavor::from_name(&name).is_some()
-        {
-            return true;
-        }
-    }
-    false
+    state.is_quart_corrupted(pos) || local_corrupt_flavor(host, level, pos).is_some()
 }
 
 pub fn should_block_zombification(
@@ -212,7 +266,7 @@ pub fn tick_mobs(
 
 /// Keeps Nether mob tracking updated, directs Nether mobs to actively hunt & kill
 /// Overworld creatures via `MobRef::set_target` + `set_brain_target`, and grants
-/// Fire Resistance / Strength to surviving Nether-Touched hostiles.
+/// Fire Resistance / Strength to surviving Nether-Touched hostiles once corruption matures.
 fn process_predator_hunting_and_buffs(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -247,7 +301,7 @@ fn process_predator_hunting_and_buffs(
             pos[1].floor() as i32,
             pos[2].floor() as i32,
         ];
-        if is_nether_touched_candidate(kind) && pos_is_corrupted(host, level, state, bp) {
+        if is_nether_touched_candidate(kind) && location_unlocks_nether_mobs(state, bp) {
             let newly_touched = state.nether_touched_mobs.insert(*id);
             if newly_touched {
                 touched_buffs.push((*ent, *pos));
@@ -301,8 +355,8 @@ fn process_predator_hunting_and_buffs(
     }
 }
 
-/// Converts any Overworld creature killed by a Nether mob (or slain in corrupted
-/// territory) into its Nether version on death.
+/// Converts any Overworld creature killed by a Nether mob (or slain inside an already-large
+/// corrupted Nether biome) into its Nether version on death.
 pub fn handle_living_death(
     host: &mut dyn ServerHost,
     state: &mut RiftState,
@@ -345,7 +399,7 @@ pub fn handle_living_death(
                 .is_some_and(|k| is_nether_predator(&k.id(host)))
     });
 
-    if !attacker_is_nether && !pos_is_corrupted(host, level, state, bp) {
+    if !attacker_is_nether && !location_unlocks_nether_mobs(state, bp) {
         return;
     }
 
@@ -533,12 +587,42 @@ fn process_hoglin_edge_spreading(
     }
 }
 
+fn pick_mob_for_flavor(flavor: NetherFlavor, roll: u64, rift_blocks: u64) -> &'static str {
+    match (flavor, roll % 10) {
+        (NetherFlavor::CrimsonForest, 0..=4) => "minecraft:hoglin",
+        (NetherFlavor::CrimsonForest, 5..=8) => "minecraft:piglin",
+        (NetherFlavor::CrimsonForest, _) => "minecraft:zombified_piglin",
+        (NetherFlavor::WarpedForest, 0..=4) => "minecraft:enderman",
+        (NetherFlavor::WarpedForest, 5..=7) => "minecraft:piglin",
+        (NetherFlavor::WarpedForest, _) if rift_blocks >= 85_000 => "minecraft:blaze",
+        (NetherFlavor::WarpedForest, _) => "minecraft:strider",
+        (NetherFlavor::SoulSandValley, 0..=4) => "minecraft:wither_skeleton",
+        (NetherFlavor::SoulSandValley, 5..=7) => "minecraft:skeleton",
+        (NetherFlavor::SoulSandValley, _) if rift_blocks >= 85_000 => "minecraft:ghast",
+        (NetherFlavor::SoulSandValley, _) => "minecraft:wither_skeleton",
+        (NetherFlavor::BasaltDeltas, 0..=6) => "minecraft:magma_cube",
+        (NetherFlavor::BasaltDeltas, 7..=8) if rift_blocks >= 85_000 => "minecraft:ghast",
+        (NetherFlavor::BasaltDeltas, _) => "minecraft:blaze",
+        (NetherFlavor::NetherWastes, 0..=4) => "minecraft:piglin",
+        (NetherFlavor::NetherWastes, 5..=6) => "minecraft:zombified_piglin",
+        (NetherFlavor::NetherWastes, 7) => "minecraft:magma_cube",
+        (NetherFlavor::NetherWastes, 8) if rift_blocks >= 85_000 => "minecraft:blaze",
+        (NetherFlavor::NetherWastes, _) if rift_blocks >= 95_000 => "minecraft:ghast",
+        _ => "minecraft:piglin",
+    }
+}
+
 fn process_supplemental_spawns(
     host: &mut dyn ServerHost,
     level: LevelRef,
     state: &mut RiftState,
     entities: &[(EntityRef, u32, String, [f64; 3])],
 ) {
+    // Wait until at least one active rift has grown into a pretty large Nether biome.
+    if !state.rifts.iter().any(|r| !r.contained && rift_mobs_unlocked(r)) {
+        return;
+    }
+
     let nether_mob_count = entities
         .iter()
         .filter(|(_, _, k, _)| is_nether_predator(k))
@@ -547,7 +631,7 @@ fn process_supplemental_spawns(
         return;
     }
 
-    let mut spawn_anchor: Option<(u64, NetherFlavor, u64, [i32; 3], [i32; 3])> = None;
+    let mut spawn_anchor: Option<(u64, NetherFlavor, u64, [i32; 3])> = None;
 
     for player in host.players().server_players() {
         let Some(dim) = player.dimension(host) else {
@@ -567,33 +651,24 @@ fn process_supplemental_spawns(
         if let Some(rift) = state
             .rifts
             .iter()
-            .filter(|r| horiz_dist_sq(r.center, pp) <= 96 * 96)
+            .filter(|r| !r.contained && rift_mobs_unlocked(r) && horiz_dist_sq(r.center, pp) <= 96 * 96)
             .min_by_key(|r| dist_sq(r.center, pp))
         {
-            spawn_anchor = Some((
-                rift.id,
-                rift.flavor,
-                rift.corrupted_blocks,
-                rift.center,
-                pp,
-            ));
+            spawn_anchor = Some((rift.id, rift.flavor, rift.corrupted_blocks, pp));
             break;
         }
     }
 
     if spawn_anchor.is_none()
-        && let Some(rift) = state.rifts.iter().find(|r| !r.contained)
+        && let Some(rift) = state
+            .rifts
+            .iter()
+            .find(|r| !r.contained && rift_mobs_unlocked(r))
     {
-        spawn_anchor = Some((
-            rift.id,
-            rift.flavor,
-            rift.corrupted_blocks,
-            rift.center,
-            rift.center,
-        ));
+        spawn_anchor = Some((rift.id, rift.flavor, rift.corrupted_blocks, rift.center));
     }
 
-    let Some((rift_id, flavor, corrupted_blocks, rift_center, anchor)) = spawn_anchor else {
+    let Some((rift_id, fallback_flavor, corrupted_blocks, anchor)) = spawn_anchor else {
         return;
     };
 
@@ -611,20 +686,12 @@ fn process_supplemental_spawns(
         return;
     };
     let ground = [sx, sy - 1, sz];
-    if !pos_is_corrupted(host, level, state, ground) && horiz_dist_sq(rift_center, ground) > 16 * 16
-    {
+    if !location_unlocks_nether_mobs(state, ground) {
         return;
     }
 
-    let mob_kind = match (flavor, (h >> 16) % 8) {
-        (NetherFlavor::CrimsonForest, 0..=3) => "minecraft:hoglin",
-        (NetherFlavor::CrimsonForest, 4..=6) => "minecraft:piglin",
-        (NetherFlavor::SoulSandValley, 0..=3) => "minecraft:wither_skeleton",
-        (NetherFlavor::BasaltDeltas, 0..=4) => "minecraft:magma_cube",
-        (_, 6) if corrupted_blocks >= 2_500 => "minecraft:blaze",
-        (_, 7) if corrupted_blocks >= 5_000 => "minecraft:ghast",
-        _ => "minecraft:piglin",
-    };
+    let local_flavor = local_corrupt_flavor(host, level, ground).unwrap_or(fallback_flavor);
+    let mob_kind = pick_mob_for_flavor(local_flavor, h >> 16, corrupted_blocks);
     let spawn_y = if mob_kind == "minecraft:ghast" {
         f64::from(sy + 14)
     } else {
@@ -644,10 +711,37 @@ fn process_supplemental_spawns(
     }
 }
 
-pub fn augment_potential_spawns(state: &RiftState, event: &mut PotentialSpawnsEvent<'_>) {
-    if event.dimension != OVERWORLD || !state.is_quart_corrupted(event.pos) {
+pub fn augment_potential_spawns(
+    host: &dyn Host,
+    state: &RiftState,
+    event: &mut PotentialSpawnsEvent<'_>,
+) {
+    if event.dimension != OVERWORLD {
         return;
     }
+
+    let near_corrupt = state.is_quart_corrupted(event.pos)
+        || state
+            .rifts
+            .iter()
+            .any(|r| horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 256).max(32 * 32));
+    if !near_corrupt {
+        return;
+    }
+
+    // Before the corrupted area becomes a pretty large Nether biome, block premature
+    // Nether mob spawns even if vanilla biome cells already started converting.
+    if !location_unlocks_nether_mobs(state, event.pos) {
+        event
+            .entries
+            .retain(|e| !is_nether_predator(&e.entity) && strip_ns(&e.entity) != "strider");
+        return;
+    }
+
+    let flavor = host
+        .level(OVERWORLD)
+        .and_then(|l| local_corrupt_flavor(host, l, event.pos))
+        .unwrap_or_else(|| NetherFlavor::pick_for_region(event.pos[0], event.pos[2], state.seed));
 
     let push_if_missing =
         |entries: &mut Vec<SpawnEntry>, entity: &str, weight: u32, min: u32, max: u32| {
@@ -662,16 +756,39 @@ pub fn augment_potential_spawns(state: &RiftState, event: &mut PotentialSpawnsEv
             }
         };
 
-    match event.category {
-        "monster" => {
+    match (event.category, flavor) {
+        ("monster", NetherFlavor::CrimsonForest) => {
             push_if_missing(&mut event.entries, "minecraft:piglin", 24, 2, 4);
-            push_if_missing(&mut event.entries, "minecraft:magma_cube", 14, 1, 3);
-            push_if_missing(&mut event.entries, "minecraft:wither_skeleton", 8, 1, 2);
-            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
-            push_if_missing(&mut event.entries, "minecraft:ghast", 6, 1, 1);
+            push_if_missing(&mut event.entries, "minecraft:zombified_piglin", 6, 1, 2);
         }
-        "creature" => {
-            push_if_missing(&mut event.entries, "minecraft:hoglin", 18, 1, 3);
+        ("monster", NetherFlavor::WarpedForest) => {
+            push_if_missing(&mut event.entries, "minecraft:enderman", 20, 1, 3);
+            push_if_missing(&mut event.entries, "minecraft:piglin", 8, 1, 2);
+            push_if_missing(&mut event.entries, "minecraft:blaze", 3, 1, 1);
+        }
+        ("monster", NetherFlavor::SoulSandValley) => {
+            push_if_missing(&mut event.entries, "minecraft:wither_skeleton", 16, 1, 2);
+            push_if_missing(&mut event.entries, "minecraft:skeleton", 14, 2, 3);
+            push_if_missing(&mut event.entries, "minecraft:ghast", 10, 1, 1);
+            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+        }
+        ("monster", NetherFlavor::BasaltDeltas) => {
+            push_if_missing(&mut event.entries, "minecraft:magma_cube", 28, 2, 4);
+            push_if_missing(&mut event.entries, "minecraft:ghast", 10, 1, 1);
+            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+        }
+        ("monster", NetherFlavor::NetherWastes) => {
+            push_if_missing(&mut event.entries, "minecraft:piglin", 20, 2, 4);
+            push_if_missing(&mut event.entries, "minecraft:zombified_piglin", 12, 1, 3);
+            push_if_missing(&mut event.entries, "minecraft:magma_cube", 8, 1, 2);
+            push_if_missing(&mut event.entries, "minecraft:ghast", 6, 1, 1);
+            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+        }
+        ("creature", NetherFlavor::CrimsonForest) => {
+            push_if_missing(&mut event.entries, "minecraft:hoglin", 20, 1, 3);
+            push_if_missing(&mut event.entries, "minecraft:strider", 4, 1, 2);
+        }
+        ("creature", _) => {
             push_if_missing(&mut event.entries, "minecraft:strider", 6, 1, 2);
         }
         _ => {}
@@ -725,6 +842,70 @@ pub fn append_nether_touched_drops(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::build_ring_columns;
+
+    fn sample_rift(corrupted_blocks: u64, radius: i32) -> RiftSource {
+        RiftSource {
+            id: 1,
+            center: [0, 64, 0],
+            active_portal: true,
+            contained: false,
+            flavor: NetherFlavor::CrimsonForest,
+            age_ticks: 6_000,
+            corrupted_blocks,
+            max_radius_sq: i64::from(radius) * i64::from(radius),
+            ring_radius: radius,
+            ring_columns: build_ring_columns(0, 0, radius),
+            active_column: None,
+            deepen_radius: 10,
+            deepen_columns: Vec::new(),
+            bastions_placed: 0,
+        }
+    }
+
+    #[test]
+    fn nether_mobs_do_not_unlock_until_corruption_forms_large_biome() {
+        let mut state = RiftState::new();
+        state.mark_quart_corrupted([4, 64, 4]);
+
+        // Small newly-lit rift must keep mobs locked.
+        state.rifts.push(sample_rift(150, 4));
+        assert!(!rift_mobs_unlocked(&state.rifts[0]));
+        assert!(!location_unlocks_nether_mobs(&state, [4, 64, 4]));
+
+        // Large block count but too narrow radius still locked.
+        state.rifts[0] = sample_rift(60_000, 18);
+        assert!(!rift_mobs_unlocked(&state.rifts[0]));
+
+        // Wide radius but not enough converted blocks still locked.
+        state.rifts[0] = sample_rift(20_000, 36);
+        assert!(!rift_mobs_unlocked(&state.rifts[0]));
+
+        // Large biome (>= 55k blocks and radius >= 32) unlocks mobs.
+        state.rifts[0] = sample_rift(60_000, 36);
+        assert!(rift_mobs_unlocked(&state.rifts[0]));
+        assert!(location_unlocks_nether_mobs(&state, [4, 64, 4]));
+    }
+
+    #[test]
+    fn spawns_biome_appropriate_nether_mobs() {
+        assert_eq!(
+            pick_mob_for_flavor(NetherFlavor::CrimsonForest, 0, 70_000),
+            "minecraft:hoglin"
+        );
+        assert_eq!(
+            pick_mob_for_flavor(NetherFlavor::SoulSandValley, 0, 70_000),
+            "minecraft:wither_skeleton"
+        );
+        assert_eq!(
+            pick_mob_for_flavor(NetherFlavor::BasaltDeltas, 0, 70_000),
+            "minecraft:magma_cube"
+        );
+        assert_eq!(
+            pick_mob_for_flavor(NetherFlavor::WarpedForest, 0, 70_000),
+            "minecraft:enderman"
+        );
+    }
 
     #[test]
     fn maps_killed_overworld_creatures_to_nether_versions() {

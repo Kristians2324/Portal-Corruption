@@ -19,12 +19,13 @@ use types::{
 use mod_api::{
     BlockChangedEvent, BlockSpreadEvent, BlockUpdateFlags, BucketEmptyEvent, ClientHost,
     ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientTickPostEvent, Command,
-    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, FillBucketEvent, Flow,
-    FluidLevelChangeEvent, Heightmap, Hooks, HostSide, LevelDimension, LevelHost, LevelRef,
-    LevelTickPostEvent, LivingConversionPreEvent, LivingDeathEvent, LootDropsEvent, MusicEvent,
-    PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
+    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, FillBucketEvent,
+    FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide, LevelDimension,
+    LevelHost, LevelRef, LevelTickPostEvent, LivingConversionPreEvent, LivingDeathEvent,
+    LootDropsEvent, MusicEvent, PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent,
+    Registrar, RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost,
+    ServerStartedEvent, ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase,
+    WorldSavedEvent,
 };
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -857,9 +858,22 @@ impl Hooks for Mod {
         Flow::Continue
     }
 
-    fn potential_spawns(&self, _host: &dyn mod_api::Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {
+    fn finalize_spawn(
+        &self,
+        _host: &dyn mod_api::Host,
+        event: &mut FinalizeSpawnEvent<'_>,
+    ) -> Flow {
+        if let Ok(state) = self.state.lock()
+            && mobs::should_cancel_finalize_spawn(&state, event)
+        {
+            event.spawn_cancelled = true;
+        }
+        Flow::Continue
+    }
+
+    fn potential_spawns(&self, host: &dyn mod_api::Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {
         if let Ok(state) = self.state.lock() {
-            mobs::augment_potential_spawns(&state, event);
+            mobs::augment_potential_spawns(host, &state, event);
         }
         Flow::Continue
     }

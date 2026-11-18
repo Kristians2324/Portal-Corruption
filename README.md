@@ -21,9 +21,10 @@
   - Dense volcanic smog shrouds vision at ground level and medium flight height, keeping Overworld sky and clouds obscured until rising into the cloud deck (`Y = 188..222`).
   - Samples a 5×5 Gaussian-weighted biome neighborhood around the player and smooths RGB fog color transitions over time so walking or straddling borders between Nether biomes glides smoothly without snapping.
   - Plays vanilla Nether biome music (`minecraft:music.nether.*`) inside corrupted areas.
-- **Nether Mob Hunting, Kill Conversions & Rare Grounded Bastions**:
+- **Nether Mob Hunting, Large-Biome Gating, Kill Conversions & Bastions**:
+  - **No instant portal-lit mob spam**: Nether mobs (including vanilla portal Zombified Piglin leaks and natural biome spawns) do not begin spawning until the Rift has grown into a large corrupted Nether biome (`>= 55,000` corrupted blocks and radius `>= 32` blocks), and spawn to match each local Nether biome (`Hoglin`/`Piglin` in Crimson Forest, `Enderman` in Warped Forest, `Wither Skeleton`/`Skeleton`/`Ghast` in Soul Sand Valley, `Magma Cube`/`Blaze` in Basalt Deltas, mixed in Nether Wastes).
   - Prevents Piglin/Hoglin zombification inside corrupted Overworld zones.
-  - Nether mobs (`Piglin`, `Piglin Brute`, `Hoglin`, `Wither Skeleton`, `Blaze`) actively hunt Overworld creatures; victims killed by Nether mobs or inside corruption convert into Nether versions:
+  - Nether mobs (`Piglin`, `Piglin Brute`, `Hoglin`, `Wither Skeleton`, `Blaze`) actively hunt Overworld creatures; victims killed by Nether mobs or inside an already-large corrupted biome convert into Nether versions:
     - Pigs, Cows, Sheep, Goats, Horses, Donkeys, Llamas → **Hoglin**
     - Villagers, Wandering Traders, Pillagers, Evokers → **Piglin**
     - Iron Golems, Vindicators, Ravagers → **Piglin Brute**
@@ -31,8 +32,8 @@
     - Skeletons, Strays, Spiders, Phantoms → **Wither Skeleton**
     - Chickens, Rabbits, Slimes, Wolves, Foxes, Cats → **Magma Cube**
     - Witches, Creepers → **Blaze**
-  - Surviving Overworld hostiles gain Fire Resistance + Strength (**Nether-Touched**) with bonus Nether drops, and **Hoglins** near the border trample soils into crimson nylium/netherrack.
-  - Rare, massive, deeply corrupted regions (`>= 150k` blocks, radius `>= 52`, `>= 80%` local surface corrupted, and `>= 112` blocks away from all Overworld players) can form full vanilla Jigsaw **Bastion Remnants** with all Jigsaw/Structure/Command/Barrier technical blocks scrubbed and blackstone/basalt foundations extruded down to solid terrain.
+  - Surviving Overworld hostiles gain Fire Resistance + Strength (**Nether-Touched**) with bonus Nether drops inside mature corrupted biomes, and **Hoglins** near the border trample soils into crimson nylium/netherrack.
+  - Rare, massive, deeply corrupted regions (`>= 160k` blocks, radius `>= 48`, `>= 80%` local surface corrupted in a contiguous matching valid Bastion biome — never `Basalt Deltas` — and `>= 112` blocks away from all Overworld players) can form full vanilla Jigsaw **Bastion Remnants** with all Jigsaw/Structure/Command/Barrier technical blocks scrubbed and blackstone/basalt foundations extruded down to solid terrain.
 
 ## Commands
 

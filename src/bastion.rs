@@ -11,8 +11,8 @@ use mod_api::{
 };
 
 const BASTION_CHECK_INTERVAL_TICKS: u64 = 600;
-const MIN_RIFT_BLOCKS_FOR_BASTION: u64 = 150_000;
-const MIN_RADIUS_SQ_FOR_BASTION: i64 = 52 * 52;
+const MIN_RIFT_BLOCKS_FOR_BASTION: u64 = 160_000;
+const MIN_RADIUS_SQ_FOR_BASTION: i64 = 48 * 48;
 const MIN_DEEPEN_RADIUS_FOR_BASTION: i32 = 22;
 const SECOND_BASTION_BLOCKS: u64 = 500_000;
 const SECOND_BASTION_RING_RADIUS: i32 = 95;
@@ -20,6 +20,39 @@ const MAX_BASTIONS_PER_RIFT: u32 = 2;
 const MIN_BASTION_SPACING: i64 = 280;
 const MIN_PLAYER_DIST_FOR_BASTION: i64 = 112;
 const BASTION_RARITY_DENOM: u64 = 8;
+
+/// Follows `#minecraft:has_structure/bastion_remnant`: Bastion Remnants form in
+/// Crimson Forest, Warped Forest, Soul Sand Valley, and Nether Wastes — never Basalt Deltas.
+pub fn is_valid_bastion_biome(flavor: NetherFlavor) -> bool {
+    !matches!(flavor, NetherFlavor::BasaltDeltas)
+}
+
+pub fn select_dominant_bastion_biome(
+    counts: &[usize; 5],
+    total_samples: usize,
+) -> Option<NetherFlavor> {
+    if total_samples == 0 || counts[NetherFlavor::BasaltDeltas.to_u8() as usize] > 0 {
+        return None;
+    }
+    let mut best: Option<(NetherFlavor, usize)> = None;
+    for flavor in [
+        NetherFlavor::CrimsonForest,
+        NetherFlavor::WarpedForest,
+        NetherFlavor::SoulSandValley,
+        NetherFlavor::NetherWastes,
+    ] {
+        let count = counts[flavor.to_u8() as usize];
+        if best.is_none_or(|(_, bc)| count > bc) {
+            best = Some((flavor, count));
+        }
+    }
+    let (dominant, dom_count) = best?;
+    if dom_count * 25 >= total_samples * 20 {
+        Some(dominant)
+    } else {
+        None
+    }
+}
 
 /// Releases any active or post-placement Bastion forced chunks cleanly.
 pub fn release_bastion_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
@@ -218,12 +251,18 @@ fn find_bastion_site(
         let mut quart_corrupt = 0usize;
         let mut nether_surface = 0usize;
         let mut water_hits = 0usize;
+        let mut biome_counts = [0usize; 5];
 
         for (idx, (px, pz)) in probe_cols.iter().enumerate() {
             let sy = hs[idx] - 1;
             let p = [*px, sy, *pz];
             if state.is_quart_corrupted(p) {
                 quart_corrupt += 1;
+            }
+            if let Some(bname) = ow.biome_at(host, [*px, sy.clamp(-56, 200), *pz])
+                && let Some(bf) = NetherFlavor::from_name(&bname)
+            {
+                biome_counts[bf.to_u8() as usize] += 1;
             }
             if let Some(key) = ow.block(host, p) {
                 let name = key.id(host);
@@ -244,7 +283,9 @@ fn find_bastion_site(
             continue;
         }
 
-        let flavor = NetherFlavor::pick_for_region(cx, cz, state.seed ^ rift.id);
+        let Some(flavor) = select_dominant_bastion_biome(&biome_counts, probe_cols.len()) else {
+            continue;
+        };
         let base_y = min_h - 1;
         return Some(([cx, base_y, cz], flavor, h));
     }
@@ -691,17 +732,25 @@ fn build_fallback_bastion_keep(
     };
     let _ = host.edit_blocks(OVERWORLD, &edit);
 
-    // Spawn garrison Piglins + Brutes inside the courtyard.
-    for (idx, kind) in [
-        "minecraft:piglin_brute",
-        "minecraft:piglin_brute",
-        "minecraft:piglin",
-        "minecraft:piglin",
-        "minecraft:piglin",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // Spawn biome-appropriate garrison inside the courtyard.
+    let garrison: &[&str] = if flavor == NetherFlavor::CrimsonForest {
+        &[
+            "minecraft:piglin_brute",
+            "minecraft:piglin_brute",
+            "minecraft:piglin",
+            "minecraft:hoglin",
+            "minecraft:hoglin",
+        ]
+    } else {
+        &[
+            "minecraft:piglin_brute",
+            "minecraft:piglin_brute",
+            "minecraft:piglin",
+            "minecraft:piglin",
+            "minecraft:piglin",
+        ]
+    };
+    for (idx, kind) in garrison.iter().copied().enumerate() {
         let mut nbt = Compound::new();
         nbt.insert("IsImmuneToZombification".into(), mod_api::Tag::Byte(1));
         nbt.insert("PersistenceRequired".into(), mod_api::Tag::Byte(1));
@@ -718,10 +767,14 @@ fn mark_bastion_footprint_biomes(
     origin: [i32; 3],
     flavor: NetherFlavor,
 ) {
+    if !is_valid_bastion_biome(flavor) {
+        return;
+    }
     for x in (origin[0] - 48..=origin[0] + 48).step_by(4) {
         for z in (origin[2] - 48..=origin[2] + 48).step_by(4) {
             let p = [x, origin[1], z];
-            if state.mark_quart_corrupted(p) {
+            // Only fill gaps; preserve adjacent already-painted biomes seamlessly.
+            if !state.is_quart_corrupted(p) && state.mark_quart_corrupted(p) {
                 paint_biome_column(ow, host, x, z, flavor);
             }
         }
@@ -791,5 +844,33 @@ mod tests {
         assert!(!area_metrics_qualify(25, 12, 0, 25));
         assert!(!area_metrics_qualify(24, 22, 1, 25));
         assert!(area_metrics_qualify(24, 21, 0, 25));
+    }
+
+    #[test]
+    fn bastions_require_valid_non_basalt_matching_biome() {
+        assert!(is_valid_bastion_biome(NetherFlavor::CrimsonForest));
+        assert!(is_valid_bastion_biome(NetherFlavor::WarpedForest));
+        assert!(is_valid_bastion_biome(NetherFlavor::SoulSandValley));
+        assert!(is_valid_bastion_biome(NetherFlavor::NetherWastes));
+        assert!(!is_valid_bastion_biome(NetherFlavor::BasaltDeltas));
+
+        // Any Basalt Deltas presence or split biome (<80%) rejects Bastion placement.
+        let mut counts = [0usize; 5];
+        counts[NetherFlavor::CrimsonForest.to_u8() as usize] = 24;
+        counts[NetherFlavor::BasaltDeltas.to_u8() as usize] = 1;
+        assert_eq!(select_dominant_bastion_biome(&counts, 25), None);
+
+        counts = [0usize; 5];
+        counts[NetherFlavor::CrimsonForest.to_u8() as usize] = 14;
+        counts[NetherFlavor::WarpedForest.to_u8() as usize] = 11;
+        assert_eq!(select_dominant_bastion_biome(&counts, 25), None);
+
+        counts = [0usize; 5];
+        counts[NetherFlavor::SoulSandValley.to_u8() as usize] = 22;
+        counts[NetherFlavor::NetherWastes.to_u8() as usize] = 3;
+        assert_eq!(
+            select_dominant_bastion_biome(&counts, 25),
+            Some(NetherFlavor::SoulSandValley)
+        );
     }
 }
