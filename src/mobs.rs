@@ -24,15 +24,23 @@ pub fn rift_mobs_unlocked(rift: &RiftSource) -> bool {
     rift.corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS && rift.max_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
 }
 
-/// True only if `pos` is covered by corrupted terrain belonging to a Rift that has grown
-/// into a large Nether biome (`>= MIN_RIFT_BLOCKS_FOR_MOBS` and radius `>= 32`).
+pub fn rift_mobs_unlocked_in_state(state: &RiftState, rift_idx: usize) -> bool {
+    let w = state.connected_wasteland_for(rift_idx);
+    w.total_corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS
+        && w.total_area_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
+}
+
+/// True only if `pos` is covered by corrupted terrain belonging to a Rift (or merged
+/// touching Rift cluster) that has grown into a large Nether biome
+/// (`>= MIN_RIFT_BLOCKS_FOR_MOBS` and area radius `>= 32`).
 pub fn location_unlocks_nether_mobs(state: &RiftState, pos: [i32; 3]) -> bool {
     if !state.is_quart_corrupted(pos) {
         return false;
     }
-    state.rifts.iter().any(|rift| {
-        rift_mobs_unlocked(rift)
-            && horiz_dist_sq(rift.center, pos) <= (rift.max_radius_sq + 256).max(MIN_RADIUS_SQ_FOR_MOBS)
+    state.rifts.iter().enumerate().any(|(idx, rift)| {
+        rift_mobs_unlocked_in_state(state, idx)
+            && horiz_dist_sq(rift.center, pos)
+                <= (rift.max_radius_sq + 256).max(MIN_RADIUS_SQ_FOR_MOBS)
     })
 }
 
@@ -618,8 +626,13 @@ fn process_supplemental_spawns(
     state: &mut RiftState,
     entities: &[(EntityRef, u32, String, [f64; 3])],
 ) {
-    // Wait until at least one active rift has grown into a pretty large Nether biome.
-    if !state.rifts.iter().any(|r| !r.contained && rift_mobs_unlocked(r)) {
+    // Wait until at least one active rift (or connected wasteland) forms a pretty large Nether biome.
+    if !state
+        .rifts
+        .iter()
+        .enumerate()
+        .any(|(idx, r)| !r.contained && rift_mobs_unlocked_in_state(state, idx))
+    {
         return;
     }
 
@@ -648,24 +661,32 @@ fn process_supplemental_spawns(
             pos[1].floor() as i32,
             pos[2].floor() as i32,
         ];
-        if let Some(rift) = state
+        if let Some((idx, rift)) = state
             .rifts
             .iter()
-            .filter(|r| !r.contained && rift_mobs_unlocked(r) && horiz_dist_sq(r.center, pp) <= 96 * 96)
-            .min_by_key(|r| dist_sq(r.center, pp))
+            .enumerate()
+            .filter(|(idx, r)| {
+                !r.contained
+                    && rift_mobs_unlocked_in_state(state, *idx)
+                    && horiz_dist_sq(r.center, pp) <= 96 * 96
+            })
+            .min_by_key(|(_, r)| dist_sq(r.center, pp))
         {
-            spawn_anchor = Some((rift.id, rift.flavor, rift.corrupted_blocks, pp));
+            let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
+            spawn_anchor = Some((rift.id, rift.flavor, w_blocks, pp));
             break;
         }
     }
 
     if spawn_anchor.is_none()
-        && let Some(rift) = state
+        && let Some((idx, rift)) = state
             .rifts
             .iter()
-            .find(|r| !r.contained && rift_mobs_unlocked(r))
+            .enumerate()
+            .find(|(idx, r)| !r.contained && rift_mobs_unlocked_in_state(state, *idx))
     {
-        spawn_anchor = Some((rift.id, rift.flavor, rift.corrupted_blocks, rift.center));
+        let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
+        spawn_anchor = Some((rift.id, rift.flavor, w_blocks, rift.center));
     }
 
     let Some((rift_id, fallback_flavor, corrupted_blocks, anchor)) = spawn_anchor else {
@@ -885,6 +906,20 @@ mod tests {
         state.rifts[0] = sample_rift(60_000, 36);
         assert!(rift_mobs_unlocked(&state.rifts[0]));
         assert!(location_unlocks_nether_mobs(&state, [4, 64, 4]));
+
+        // Two separate ~30k rifts stay locked while apart, then pool together once they meet!
+        let mut parted = RiftState::new();
+        parted.mark_quart_corrupted([4, 64, 4]);
+        parted.rifts.push(sample_rift(30_000, 24));
+        let mut far_b = sample_rift(30_000, 24);
+        far_b.id = 2;
+        far_b.center = [120, 64, 0];
+        parted.rifts.push(far_b);
+        assert!(!location_unlocks_nether_mobs(&parted, [4, 64, 4]));
+
+        // Bring Rift #2 within 24+24 blocks so their corrupted wastelands touch -> pooled 60k unlocks!
+        parted.rifts[1].center = [44, 64, 0];
+        assert!(location_unlocks_nether_mobs(&parted, [4, 64, 4]));
     }
 
     #[test]

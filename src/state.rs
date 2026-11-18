@@ -6,6 +6,23 @@ use std::path::{Path, PathBuf};
 
 const SAVE_FILE_NAME: &str = "rift_bleed.json";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectedWasteland {
+    pub total_corrupted_blocks: u64,
+    pub total_area_radius_sq: i64,
+    pub max_deepen_radius: i32,
+    pub max_ring_radius: i32,
+    pub total_bastions_placed: u32,
+    pub member_count: usize,
+}
+
+fn rifts_touch(a: &RiftSource, b: &RiftSource) -> bool {
+    let ra = (a.max_radius_sq.max(0) as f64).sqrt();
+    let rb = (b.max_radius_sq.max(0) as f64).sqrt();
+    let sum_r = ra + rb + 4.0;
+    (crate::types::horiz_dist_sq(a.center, b.center) as f64) <= sum_r * sum_r
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingBastion {
     pub rift_id: u64,
@@ -124,6 +141,41 @@ impl RiftState {
             .iter_mut()
             .filter(|r| crate::types::dist_sq(r.center, pos) <= limit)
             .min_by_key(|r| crate::types::dist_sq(r.center, pos))
+    }
+
+    /// Computes combined territory stats across all active or scarred rifts whose
+    /// corrupted circles touch or overlap with `self.rifts[seed_idx]`.
+    pub fn connected_wasteland_for(&self, seed_idx: usize) -> ConnectedWasteland {
+        if seed_idx >= self.rifts.len() {
+            return ConnectedWasteland::default();
+        }
+        let mut visited = vec![false; self.rifts.len()];
+        let mut queue = VecDeque::new();
+        visited[seed_idx] = true;
+        queue.push_back(seed_idx);
+
+        let mut summary = ConnectedWasteland::default();
+        while let Some(idx) = queue.pop_front() {
+            let r = &self.rifts[idx];
+            summary.total_corrupted_blocks =
+                summary.total_corrupted_blocks.saturating_add(r.corrupted_blocks);
+            summary.total_area_radius_sq =
+                summary.total_area_radius_sq.saturating_add(r.max_radius_sq);
+            summary.max_deepen_radius = summary.max_deepen_radius.max(r.deepen_radius);
+            summary.max_ring_radius = summary.max_ring_radius.max(r.ring_radius);
+            summary.total_bastions_placed = summary
+                .total_bastions_placed
+                .saturating_add(r.bastions_placed);
+            summary.member_count += 1;
+
+            for next in 0..self.rifts.len() {
+                if !visited[next] && rifts_touch(r, &self.rifts[next]) {
+                    visited[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        summary
     }
 
     pub fn load_from_disk(&mut self) {

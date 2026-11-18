@@ -1,6 +1,6 @@
 use crate::corruption::{is_nether_terrain_block, is_open_space, is_water_like};
 use crate::mobs::paint_biome_column;
-use crate::state::{PendingBastion, RiftState};
+use crate::state::{ConnectedWasteland, PendingBastion, RiftState};
 use crate::types::{
     BastionSite, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, dist_sq,
     horiz_dist_sq, spatial_hash, strip_ns,
@@ -95,8 +95,9 @@ pub fn tick_bastion_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
     let player_positions = overworld_player_positions(host);
 
     for idx in 0..state.rifts.len() {
+        let wasteland = state.connected_wasteland_for(idx);
         let rift = &state.rifts[idx];
-        if !rift_eligible_for_bastion(rift) {
+        if !wasteland_eligible_for_bastion(rift, wasteland) {
             continue;
         }
         let roll = spatial_hash(
@@ -117,23 +118,41 @@ pub fn tick_bastion_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
     }
 }
 
-pub fn rift_eligible_for_bastion(rift: &RiftSource) -> bool {
+pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWasteland) -> bool {
     if rift.contained || rift.bastions_placed >= MAX_BASTIONS_PER_RIFT {
         return false;
     }
-    if rift.corrupted_blocks < MIN_RIFT_BLOCKS_FOR_BASTION
-        || rift.max_radius_sq < MIN_RADIUS_SQ_FOR_BASTION
-        || rift.deepen_radius < MIN_DEEPEN_RADIUS_FOR_BASTION
+    let max_group_bastions = ((wasteland.member_count as u32) * MAX_BASTIONS_PER_RIFT).min(4);
+    if wasteland.total_bastions_placed >= max_group_bastions {
+        return false;
+    }
+    if wasteland.total_corrupted_blocks < MIN_RIFT_BLOCKS_FOR_BASTION
+        || wasteland.total_area_radius_sq < MIN_RADIUS_SQ_FOR_BASTION
+        || wasteland.max_deepen_radius < MIN_DEEPEN_RADIUS_FOR_BASTION
     {
         return false;
     }
-    if rift.bastions_placed >= 1
-        && (rift.corrupted_blocks < SECOND_BASTION_BLOCKS
-            || rift.ring_radius < SECOND_BASTION_RING_RADIUS)
+    if wasteland.total_bastions_placed >= 1
+        && (wasteland.total_corrupted_blocks < SECOND_BASTION_BLOCKS
+            || wasteland.max_ring_radius < SECOND_BASTION_RING_RADIUS)
     {
         return false;
     }
     true
+}
+
+pub fn rift_eligible_for_bastion(rift: &RiftSource) -> bool {
+    wasteland_eligible_for_bastion(
+        rift,
+        ConnectedWasteland {
+            total_corrupted_blocks: rift.corrupted_blocks,
+            total_area_radius_sq: rift.max_radius_sq,
+            max_deepen_radius: rift.deepen_radius,
+            max_ring_radius: rift.ring_radius,
+            total_bastions_placed: rift.bastions_placed,
+            member_count: 1,
+        },
+    )
 }
 
 fn overworld_player_positions(host: &dyn ServerHost) -> Vec<[i32; 3]> {
@@ -180,8 +199,8 @@ fn find_bastion_site(
     overworld_players: &[[i32; 3]],
 ) -> Option<([i32; 3], NetherFlavor, u64)> {
     let radius = (rift.max_radius_sq as f64).sqrt() as i32;
-    let inner = 34;
-    let outer = (radius - 14).max(inner);
+    let inner = 44;
+    let outer = (radius - 10).max(inner);
 
     for attempt in 0..8u64 {
         let h = spatial_hash(
@@ -831,6 +850,23 @@ mod tests {
 
         rift.bastions_placed = 2;
         assert!(!rift_eligible_for_bastion(&rift));
+
+        // Connected wasteland pools corrupted territory across touching rifts for Bastion unlocks.
+        let mut r1 = sample_rift();
+        r1.corrupted_blocks = 90_000;
+        r1.max_radius_sq = 35 * 35;
+        let mut r2 = sample_rift();
+        r2.id = 2;
+        r2.center = [260, 64, 200];
+        r2.corrupted_blocks = 90_000;
+        r2.max_radius_sq = 35 * 35;
+
+        let mut st = RiftState::new();
+        st.rifts.push(r1);
+        st.rifts.push(r2);
+        assert!(!rift_eligible_for_bastion(&st.rifts[0]));
+        let combined = st.connected_wasteland_for(0);
+        assert!(wasteland_eligible_for_bastion(&st.rifts[0], combined));
     }
 
     #[test]
