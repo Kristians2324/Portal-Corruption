@@ -63,6 +63,20 @@ pub fn is_open_space(name: &str) -> bool {
                 | "rose_bush"
                 | "peony"
                 | "snow"
+                | "vine"
+                | "glow_lichen"
+                | "moss_carpet"
+                | "pink_petals"
+                | "sweet_berry_bush"
+                | "lily_pad"
+                | "big_dripleaf"
+                | "big_dripleaf_stem"
+                | "small_dripleaf"
+                | "brown_mushroom"
+                | "red_mushroom"
+                | "sugar_cane"
+                | "leaf_litter"
+                | "wildflowers"
         )
 }
 
@@ -76,6 +90,7 @@ pub fn is_water_like(name: &str) -> bool {
             | "kelp_plant"
             | "seagrass"
             | "tall_seagrass"
+            | "sea_pickle"
     )
 }
 
@@ -240,6 +255,17 @@ fn scar_roll(pos: [i32; 3], salt: u64) -> u64 {
     spatial_hash(pos[0], pos[1], pos[2], salt)
 }
 
+/// Blends a 2x2x2 coarse pocket roll with a fine voxel roll so surviving
+/// Overworld remnants (~`pct`%) form recognizable small weathered islands while
+/// keeping ~88-90% of the terrain decisively Nether-corrupted.
+/// Groups surviving Overworld remnants (~`pct`%) into organic 2x2x2 weathered
+/// pockets rather than isolated voxels while keeping ~88-90% corrupted.
+fn in_remnant_cluster(pos: [i32; 3], salt: u64, pct: u64) -> bool {
+    let pocket = spatial_hash(pos[0] >> 1, pos[1] >> 1, pos[2] >> 1, salt) % 100;
+    let fine = scar_roll(pos, salt ^ 0x9E37_79B9_7F4A_7C15) % 100;
+    pocket < (pct * 2).min(95) && fine < 50
+}
+
 fn flavor_surface_block(flavor: NetherFlavor, h: u64) -> &'static str {
     match flavor {
         NetherFlavor::CrimsonForest => {
@@ -302,8 +328,8 @@ fn transform_wood_and_foliage(
     h: u64,
 ) -> Option<TransformOutcome> {
     if short.ends_with("_log") || short.ends_with("_wood") {
-        // Leave 12% dead/stripped Overworld trunks scarred rather than uniform stems.
-        if (scar_roll(pos, 0x712E_A501) % 100) < 12 {
+        // Leave ~10% dead/stripped Overworld trunks scarred rather than uniform stems.
+        if in_remnant_cluster(pos, 0x712E_A501, 10) {
             return Some(TransformOutcome::replace("minecraft:stripped_oak_log"));
         }
         let stem = match flavor {
@@ -364,8 +390,8 @@ fn transform_stone_family(
         return None;
     }
 
-    // Leave ~14% scarred Overworld stone/deepslate so terrain visibly feels native Overworld.
-    if (scar_roll(pos, 0x5CA2_1001) % 100) < 14 {
+    // Leave ~12% scarred Overworld stone/cobble pockets so terrain visibly feels native Overworld.
+    if in_remnant_cluster(pos, 0x5CA2_1001, 12) {
         if short == "stone" && h % 2 == 0 {
             return Some(TransformOutcome::replace("minecraft:cobblestone"));
         }
@@ -468,20 +494,13 @@ pub fn transform_block(
     let short = strip_ns(current);
     let h = spatial_hash(pos[0], pos[1], pos[2], 0xB13E_D00D);
 
-    // Water evaporates cleanly; surface river/shore beds occasionally crust to magma/obsidian.
+    // All water and submerged water plants vanish completely into air.
     if is_water_like(current) {
-        if pos[1] >= 58 && !is_air_like(below) && !is_water_like(below) && h % 20 == 0 {
-            return TransformOutcome::replace("minecraft:magma_block");
-        }
         return TransformOutcome::replace("minecraft:air");
     }
 
     if matches!(short, "ice" | "packed_ice" | "blue_ice" | "frosted_ice") {
-        return TransformOutcome::replace(if h % 5 == 0 {
-            "minecraft:magma_block"
-        } else {
-            "minecraft:air"
-        });
+        return TransformOutcome::replace("minecraft:air");
     }
 
     if matches!(short, "snow" | "snow_block") {
@@ -519,7 +538,10 @@ pub fn transform_block(
             | "muddy_mangrove_roots"
             | "clay"
     ) {
-        if short != "coarse_dirt" && (scar_roll(pos, 0x5CA2_2002) % 100) < 12 {
+        if short != "coarse_dirt" && in_remnant_cluster(pos, 0x5CA2_2002, 12) {
+            if h % 4 == 0 && matches!(short, "grass_block" | "dirt") {
+                return TransformOutcome::unchanged(true);
+            }
             return TransformOutcome::replace("minecraft:coarse_dirt");
         }
         if is_open_space(above) {
@@ -544,7 +566,7 @@ pub fn transform_block(
     }
 
     if matches!(short, "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel") {
-        if (scar_roll(pos, 0x5CA2_3003) % 100) < 16 {
+        if in_remnant_cluster(pos, 0x5CA2_3003, 12) {
             return TransformOutcome::unchanged(true);
         }
         let block = match flavor {
@@ -581,7 +603,7 @@ pub fn transform_block(
             | "deepslate_bricks"
             | "deepslate_tiles"
     ) {
-        if (scar_roll(pos, 0x5CA2_4004) % 100) < 16 {
+        if in_remnant_cluster(pos, 0x5CA2_4004, 12) {
             return TransformOutcome::replace("minecraft:cracked_stone_bricks");
         }
         let block = match h % 24 {
@@ -650,15 +672,27 @@ mod tests {
 
     #[test]
     fn water_evaporates_and_caves_never_flood_with_lava() {
-        let water = transform_block(
-            [4, 40, 9],
+        for block in [
             "minecraft:water",
-            "minecraft:air",
-            "minecraft:stone",
-            NetherFlavor::NetherWastes,
-            true,
-        );
-        assert_eq!(water.block, Some("minecraft:air"));
+            "minecraft:flowing_water",
+            "minecraft:bubble_column",
+            "minecraft:kelp",
+            "minecraft:seagrass",
+            "minecraft:sea_pickle",
+            "minecraft:ice",
+        ] {
+            for y in [40, 62] {
+                let out = transform_block(
+                    [4, y, 9],
+                    block,
+                    "minecraft:air",
+                    "minecraft:stone",
+                    NetherFlavor::NetherWastes,
+                    true,
+                );
+                assert_eq!(out.block, Some("minecraft:air"), "{block} at y={y} must vanish into air");
+            }
+        }
 
         for x in 0..100 {
             let air = transform_block(

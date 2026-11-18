@@ -14,10 +14,10 @@
 - **Circular Non-Stop Overworld & Underground Terraforming**:
   - Expands evenly in concentric 360° circular rings (`build_ring_columns`) across the five Nether flavors (`crimson_forest`, `warped_forest`, `soul_sand_valley`, `basalt_deltas`, `nether_wastes`), updating full bedrock-to-sky biome columns on `minecraft:overworld` chunks.
   - Holds rolling chunk-load tickets (`rift_bleed:core` + up to 4 sliding `rift_bleed:frontier` chunks) so uncontained Rifts keep corrupting non-stop even when no player is nearby.
-  - Corrupted columns warp surface terrain, trees, and underground stone/caves down to `Y = -63`, leaving ~14% scarred Overworld stone/deepslate/cobblestone/coarse-dirt/stripped-log remnants.
+  - Corrupted columns warp surface terrain, trees, and underground stone/caves down to `Y = -63`, leaving ~12% clustered Overworld stone/deepslate/cobblestone/coarse-dirt/scarred soil/stripped-log remnants while keeping ~88% overwhelmingly corrupted.
   - Protects Bedrock, containers, beds, beacons, workstations, and portal/containment blocks, and preserves `diamond_ore`, `redstone_ore`, `lapis_ore`, and `emerald_ore` (plus deepslate variants).
-  - **Caves stay breathable**: open cave air never floods with lava; water evaporates cleanly on contact; deep corrupted Deepslate (`Y = -32..-60`) in mature rifts rarely forms `minecraft:ancient_debris`.
-  - **Beds stay safe** to use in corrupted Overworld zones, while water evaporates (`block.fire.extinguish` + smoke) and lava receives faster tick scheduling.
+  - **Caves stay breathable**: open cave air never floods with lava; water (oceans, rivers, kelp, seagrass, buckets, fluid spread) vanishes silently on contact without infinite refill loops; deep corrupted Deepslate (`Y = -32..-60`) in mature rifts rarely forms `minecraft:ancient_debris`.
+  - **Beds stay safe** to use in corrupted Overworld zones, while water vanishes cleanly (`block_spread` / `fill_bucket` / `fluid_level_change` blocked) and lava receives faster tick scheduling.
 - **Volcanic Smog up to the Clouds & Vanilla Nether Music**:
   - Dense volcanic smog shrouds vision (`env_end ~ 20–36`, `sky_end = 0.5`, `cloud_end = 0.5`) at ground level and medium flight height, keeping sun and clouds blocked until climbing above the cloud deck (`Y ~ 188..222`).
   - Plays vanilla Nether biome music (`minecraft:music.nether.*`) inside corrupted areas.
@@ -38,7 +38,7 @@
 
 - `/rift status` — Show all tracked Portals/Rift Scars, containment status, flavor, ring radius, block count, and Bastions.
 - `/rift scan` — Scan nearby loaded blocks for active Nether Portals.
-- `/rift speed <16..600>` *(OP level 2)* — Adjust block spread budget per tick (default `140`).
+- `/rift speed <16..1200>` *(OP level 2)* — Adjust block spread budget per tick (default `420`).
 - `/rift pause` / `/rift resume` *(OP level 2)* — Pause or resume Rift Bleed expansion.
 
 ## Layout & Building

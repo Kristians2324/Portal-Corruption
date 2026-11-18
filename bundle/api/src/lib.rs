@@ -26,15 +26,15 @@ use crate::types::{
 };
 use horizon_client::entry::rift_bridge;
 use horizon_client::mod_api::{
-    BlockChangedEvent, BlockStateId, BucketEmptyEvent, ChunkLoadEvent, ClientDisconnectingEvent,
-    ClientLevelLoadEvent, ClientTickPostEvent, ComputeFogColorEvent, Flow, FluidLevelChangeEvent,
-    Hooks, Host, LevelDimension, LevelHost, LevelTickPostEvent, LivingConversionPreEvent,
-    LivingDeathEvent, LootDropsEvent, MusicEvent, NativeBlockEdit, NativeBlockRun, NativeCommand,
-    NativeHeightmap, ParticleOptions, ParticleType, PerformCommandEvent, PortalCreateEvent,
-    PotentialSpawnsEvent, RegisterCommandsEvent, RenderFogEvent, Text, WorldLifecycleEvent,
-    WorldPhase, WorldSavedEvent,
+    BlockChangedEvent, BlockSpreadEvent, BlockStateId, BucketEmptyEvent, ChunkLoadEvent,
+    ClientDisconnectingEvent, ClientLevelLoadEvent, ClientTickPostEvent, ComputeFogColorEvent,
+    FillBucketEvent, Flow, FluidLevelChangeEvent, Hooks, Host, LevelDimension, LevelHost,
+    LevelTickPostEvent, LivingConversionPreEvent, LivingDeathEvent, LootDropsEvent, MusicEvent,
+    NativeBlockEdit, NativeBlockRun, NativeCommand, NativeHeightmap, ParticleOptions,
+    ParticleType, PerformCommandEvent, PortalCreateEvent, PotentialSpawnsEvent,
+    RegisterCommandsEvent, RenderFogEvent, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 const OWNER_CORE_TICKET: &str = "rift_bleed:core";
@@ -72,7 +72,14 @@ impl RuntimeState {
                 "nether_portal" => {
                     self.portal_state_ids.insert(id);
                 }
-                "water" | "flowing_water" => {
+                "water"
+                | "flowing_water"
+                | "bubble_column"
+                | "kelp"
+                | "kelp_plant"
+                | "seagrass"
+                | "tall_seagrass"
+                | "sea_pickle" => {
                     self.water_state_ids.insert(id);
                 }
                 "crying_obsidian" | "obsidian" | "iron_door" | "iron_trapdoor" => {
@@ -190,7 +197,7 @@ impl Hooks for RiftBleedMod {
             || level.state_with_property(event.new, "waterlogged", "true") == Some(event.new)
         {
             if rt.server.is_quart_corrupted(pos) {
-                rt.server.pending_water_evap.push_back(pos);
+                rt.server.queue_water_evap(pos);
             }
         }
 
@@ -204,27 +211,80 @@ impl Hooks for RiftBleedMod {
         }
     }
 
+    fn block_spread(&self, level: &dyn LevelHost, event: &mut BlockSpreadEvent<'_>) -> Flow {
+        if level.is_client_side()
+            || event.dimension != LevelDimension::Overworld
+            || event.kind != "fluid"
+        {
+            return Flow::Continue;
+        }
+        let from = [event.from.x, event.from.y, event.from.z];
+        let to = [event.to.x, event.to.y, event.to.z];
+        let Ok(rt) = runtime().lock() else {
+            return Flow::Continue;
+        };
+        if !rt.water_state_ids.contains(&level.block_state(from)) {
+            return Flow::Continue;
+        }
+        if rt.server.is_quart_corrupted(from) || rt.server.is_quart_corrupted(to) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
     fn fluid_level_change(&self, level: &dyn LevelHost, event: &mut FluidLevelChangeEvent<'_>) -> Flow {
         if level.is_client_side() || event.dimension != LevelDimension::Overworld {
             return Flow::Continue;
         }
         let pos = [event.pos.x, event.pos.y, event.pos.z];
-        let is_corrupted = runtime()
-            .lock()
-            .map(|rt| rt.server.is_quart_corrupted(pos))
-            .unwrap_or(false);
-        if !is_corrupted {
+        let mut cancel_water = false;
+        if let Ok(mut rt) = runtime().lock() {
+            if rt.server.is_quart_corrupted(pos) {
+                if event.fluid.contains("water") {
+                    rt.server.queue_water_evap(pos);
+                    if event.to > 0 {
+                        cancel_water = true;
+                    }
+                } else if event.fluid.contains("lava") && event.to > 0 {
+                    rift_bridge::enqueue_fast_lava(pos, event.fluid.to_owned());
+                }
+            }
+        }
+        if cancel_water {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    fn fill_bucket(&self, host: &mut dyn Host, event: &mut FillBucketEvent<'_>) -> Flow {
+        if !is_water_bucket_item(&event.stack.item) {
             return Flow::Continue;
         }
-
-        if event.fluid.contains("water") {
-            if let Ok(mut rt) = runtime().lock() {
-                rt.server.pending_water_evap.push_back(pos);
-            }
-        } else if event.fluid.contains("lava") && event.to > 0 {
-            rift_bridge::enqueue_fast_lava(pos, event.fluid.to_owned());
+        let near_overworld_player = host.server_players().iter().any(|p| {
+            p.dimension == OVERWORLD
+                && dist_sq(
+                    [
+                        p.position[0].floor() as i32,
+                        p.position[1].floor() as i32,
+                        p.position[2].floor() as i32,
+                    ],
+                    event.pos,
+                ) <= 16 * 16
+        });
+        if !near_overworld_player {
+            return Flow::Continue;
         }
-        Flow::Continue
+        let in_corrupt = runtime()
+            .lock()
+            .map(|rt| pos_is_corrupted(host, &rt.server, event.pos))
+            .unwrap_or(false);
+        if !in_corrupt {
+            return Flow::Continue;
+        }
+        emit_silent_vaporize(host, event.pos);
+        Flow::Cancel
     }
 
     fn bucket_empty(&self, host: &mut dyn Host, event: &mut BucketEmptyEvent<'_>) -> Flow {
@@ -248,27 +308,8 @@ impl Hooks for RiftBleedMod {
             return Flow::Continue;
         }
 
-        if let Ok(mut rt) = runtime().lock() {
-            rt.server.pending_water_evap.push_back(event.pos);
-        }
-        if let Some(level) = host.level(OVERWORLD) {
-            let at = [
-                f64::from(event.pos[0]) + 0.5,
-                f64::from(event.pos[1]) + 0.5,
-                f64::from(event.pos[2]) + 0.5,
-            ];
-            let _ = level.play_sound(host, "minecraft:block.fire.extinguish", at, 4, 0.7, 1.8);
-            let _ = level.send_particles(
-                host,
-                &ParticleOptions::simple(ParticleType::LargeSmoke),
-                None,
-                at,
-                [0.25, 0.25, 0.25],
-                0.02,
-                8,
-            );
-        }
-        Flow::Continue
+        emit_silent_vaporize(host, event.pos);
+        Flow::Cancel
     }
 
     fn living_conversion_pre(
@@ -310,9 +351,12 @@ impl Hooks for RiftBleedMod {
             let extra_portals = std::mem::take(&mut rt.server.pending_portals);
             let extra_checks = std::mem::take(&mut rt.server.pending_containment_checks);
             let extra_water = std::mem::take(&mut rt.server.pending_water_evap);
+            rt.server.pending_water_evap_set.clear();
             local_server.pending_portals.extend(extra_portals);
             local_server.pending_containment_checks.extend(extra_checks);
-            local_server.pending_water_evap.extend(extra_water);
+            for pos in extra_water {
+                local_server.queue_water_evap(pos);
+            }
             rt.server = local_server;
         }
         Flow::Continue
@@ -360,6 +404,9 @@ impl Hooks for RiftBleedMod {
         if local_server.tick % 10 == 1 {
             manage_rift_chunk_tickets(host, &mut local_server);
         }
+        if local_server.tick % 4 == 2 {
+            sweep_corrupted_surface_water(host, &mut local_server);
+        }
         process_water_evaporation(host, &mut local_server);
         spread_corruption_step(host, &mut local_server);
         emit_rift_ambient_effects(host, &local_server);
@@ -374,9 +421,12 @@ impl Hooks for RiftBleedMod {
             let extra_portals = std::mem::take(&mut rt.server.pending_portals);
             let extra_checks = std::mem::take(&mut rt.server.pending_containment_checks);
             let extra_water = std::mem::take(&mut rt.server.pending_water_evap);
+            rt.server.pending_water_evap_set.clear();
             local_server.pending_portals.extend(extra_portals);
             local_server.pending_containment_checks.extend(extra_checks);
-            local_server.pending_water_evap.extend(extra_water);
+            for pos in extra_water {
+                local_server.queue_water_evap(pos);
+            }
             rt.server = local_server;
         }
     }
@@ -447,7 +497,7 @@ impl Hooks for RiftBleedMod {
         if parts.is_empty() {
             let _ = host.tell(
                 event.player.uuid,
-                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <16..600>"),
+                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <16..1200>"),
             );
             return Flow::Cancel;
         }
@@ -526,7 +576,7 @@ impl Hooks for RiftBleedMod {
             }
             "speed" if event.player.permission >= 2 && parts.len() >= 2 => {
                 if let Ok(val) = parts[1].parse::<usize>() {
-                    let clamped = val.clamp(16, 600);
+                    let clamped = val.clamp(16, 1200);
                     if let Ok(mut rt) = runtime().lock() {
                         rt.server.spread_budget = clamped;
                         rt.server.dirty = true;
@@ -538,7 +588,7 @@ impl Hooks for RiftBleedMod {
                 } else {
                     let _ = host.tell(
                         event.player.uuid,
-                        Text::literal("[Rift Bleed] Usage: /rift speed <16..600>"),
+                        Text::literal("[Rift Bleed] Usage: /rift speed <16..1200>"),
                     );
                 }
                 Flow::Cancel
@@ -853,55 +903,198 @@ fn process_containment_checks(host: &mut dyn Host, state: &mut RiftState) {
     }
 }
 
-fn process_water_evaporation(host: &mut dyn Host, state: &mut RiftState) {
-    if state.pending_water_evap.is_empty() {
-        return;
-    }
-    let Some(air) = host.default_state("minecraft:air") else {
-        state.pending_water_evap.clear();
-        return;
-    };
-
-    let mut budget = 32usize;
-    while budget > 0 {
-        let Some(pos) = state.pending_water_evap.pop_front() else {
-            break;
-        };
-        if host.biome(pos).is_none() {
-            continue;
-        }
-        let block = host.block(pos);
-        if is_water_like(&block) {
-            if host.set_block(OVERWORLD, pos, air, 3) {
-                budget -= 1;
-                evaporate_fx(host, pos);
-            }
-        } else if host.block_property(pos, "waterlogged").as_deref() == Some("true")
-            && host.set_block_property(pos, "waterlogged", "false")
-        {
-            budget -= 1;
-            evaporate_fx(host, pos);
-        }
-    }
+fn is_water_bucket_item(item: &str) -> bool {
+    matches!(
+        strip_ns(item),
+        "water_bucket"
+            | "axolotl_bucket"
+            | "cod_bucket"
+            | "salmon_bucket"
+            | "pufferfish_bucket"
+            | "tropical_fish_bucket"
+            | "tadpole_bucket"
+    )
 }
 
-fn evaporate_fx(host: &mut dyn Host, pos: [i32; 3]) {
+fn emit_silent_vaporize(host: &mut dyn Host, pos: [i32; 3]) {
     if let Some(level) = host.level(OVERWORLD) {
         let at = [
             f64::from(pos[0]) + 0.5,
             f64::from(pos[1]) + 0.5,
             f64::from(pos[2]) + 0.5,
         ];
-        let _ = level.play_sound(host, "minecraft:block.fire.extinguish", at, 4, 0.45, 1.9);
         let _ = level.send_particles(
             host,
             &ParticleOptions::simple(ParticleType::LargeSmoke),
             None,
             at,
-            [0.2, 0.2, 0.2],
+            [0.25, 0.25, 0.25],
             0.02,
-            4,
+            6,
         );
+    }
+}
+
+/// Periodically checks loaded corrupted quart columns for leftover lakes, rivers,
+/// or puddles so water inside any corrupted area disappears completely.
+fn sweep_corrupted_surface_water(host: &mut dyn Host, state: &mut RiftState) {
+    let Some(ow) = host.level(OVERWORLD) else {
+        return;
+    };
+    if state.corrupted_quart_cols.is_empty() {
+        return;
+    }
+
+    let mut coords: Vec<(i32, i32)> = Vec::with_capacity(32);
+
+    // 1. Sample near Overworld players so lingering water within sight drains immediately.
+    for player in host.server_players() {
+        if player.dimension != OVERWORLD {
+            continue;
+        }
+        let px = player.position[0].floor() as i32;
+        let pz = player.position[2].floor() as i32;
+        for i in 0..16u64 {
+            let h = spatial_hash(px, 0, pz, state.tick.wrapping_add(i));
+            let dx = ((h % 65) as i32) - 32;
+            let dz = (((h >> 8) % 65) as i32) - 32;
+            let pos = [px + dx, 64, pz + dz];
+            if state.is_quart_corrupted(pos) && ow.is_loaded(host, pos) {
+                coords.push((px + dx, pz + dz));
+            }
+        }
+    }
+
+    // 2. Also sweep sequentially across tracked corrupted quart columns.
+    if coords.len() < 32 {
+        let all_cols: Vec<[i32; 2]> = state.corrupted_quart_cols.iter().copied().collect();
+        let len = all_cols.len();
+        let ox = ((state.tick / 4) % 4) as i32;
+        let oz = ((state.tick / 16) % 4) as i32;
+        let to_check = (32 - coords.len()).min(len);
+        for step in 0..to_check {
+            let idx = (state.water_sweep_cursor + step) % len;
+            let [qx, qz] = all_cols[idx];
+            let wx = (qx << 2) + ox;
+            let wz = (qz << 2) + oz;
+            if ow.is_loaded(host, [wx, 64, wz]) {
+                coords.push((wx, wz));
+            }
+        }
+        state.water_sweep_cursor = (state.water_sweep_cursor + to_check) % len.max(1);
+    }
+
+    if coords.is_empty() {
+        return;
+    }
+
+    if let Ok(heights) = host.surface_heights(OVERWORLD, &coords, NativeHeightmap::WorldSurface) {
+        for ((wx, wz), h_opt) in coords.into_iter().zip(heights) {
+            let Some(top) = h_opt else {
+                continue;
+            };
+            for y in [top - 1, top - 2] {
+                if y < OVERWORLD_MIN_Y {
+                    continue;
+                }
+                let p = [wx, y, wz];
+                if let Some(name) = ow.block(host, p)
+                    && is_water_like(&name)
+                {
+                    state.queue_water_evap(p);
+                } else if ow.block_property(host, p, "waterlogged").as_deref() == Some("true") {
+                    state.queue_water_evap(p);
+                }
+            }
+        }
+    }
+}
+
+/// Silently removes queued water / submerged plants inside corrupted terrain and
+/// flood-clears any connected water body within `is_quart_corrupted` without
+/// sending neighbor fluid updates or playing extinguish audio.
+fn process_water_evaporation(host: &mut dyn Host, state: &mut RiftState) {
+    if state.pending_water_evap.is_empty() {
+        return;
+    }
+    let Some(ow) = host.level(OVERWORLD) else {
+        return;
+    };
+
+    let mut edit = NativeBlockEdit {
+        palette: vec!["minecraft:air".to_owned()],
+        filters: Vec::new(),
+        runs: Vec::new(),
+        block_entities: Vec::new(),
+        neighbour_updates: false,
+    };
+    let mut visited: HashSet<[i32; 3]> = HashSet::new();
+    let mut worklist: VecDeque<[i32; 3]> = VecDeque::new();
+    let mut dry_props: Vec<[i32; 3]> = Vec::new();
+    let mut budget = 512usize;
+
+    while budget > 0 {
+        let next_pos = if let Some(p) = worklist.pop_front() {
+            Some(p)
+        } else {
+            state.pop_water_evap()
+        };
+        let Some(pos) = next_pos else {
+            break;
+        };
+        if !visited.insert(pos)
+            || !state.is_quart_corrupted(pos)
+            || !ow.is_loaded(host, pos)
+            || pos[1] < OVERWORLD_MIN_Y
+            || pos[1] >= OVERWORLD_MAX_Y
+        {
+            continue;
+        }
+
+        let Some(block) = ow.block(host, pos) else {
+            continue;
+        };
+        if is_water_like(&block) {
+            edit.runs.push(NativeBlockRun {
+                x: pos[0],
+                z: pos[2],
+                y: pos[1],
+                height: 1,
+                surface: None,
+                block: 0,
+                only: None,
+            });
+            budget -= 1;
+
+            for d in [
+                [1, 0, 0],
+                [-1, 0, 0],
+                [0, 1, 0],
+                [0, -1, 0],
+                [0, 0, 1],
+                [0, 0, -1],
+            ] {
+                let nb = [pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]];
+                if !visited.contains(&nb) && state.is_quart_corrupted(nb) {
+                    worklist.push_back(nb);
+                }
+            }
+        } else if ow.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+            dry_props.push(pos);
+            budget -= 1;
+        }
+    }
+
+    // Re-queue remaining connected BFS frontier if we hit the per-tick budget.
+    while let Some(rem) = worklist.pop_front() {
+        state.queue_water_evap(rem);
+    }
+
+    if !edit.runs.is_empty() {
+        let _ = host.edit_blocks(OVERWORLD, &edit);
+    }
+    for pos in dry_props {
+        let _ = host.set_block_property(pos, "waterlogged", "false");
     }
 }
 
@@ -912,6 +1105,9 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
     if state.paused {
         return;
     }
+    let Some(ow) = host.level(OVERWORLD) else {
+        return;
+    };
 
     let active_indices: Vec<usize> = state
         .rifts
@@ -925,7 +1121,7 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
     }
 
     let total_budget = state.spread_budget.max(16);
-    let per_rift_budget = (total_budget / active_indices.len()).max(16);
+    let per_rift_budget = (total_budget / active_indices.len()).max(24);
     let mut edit = NativeBlockEdit {
         palette: Vec::new(),
         filters: Vec::new(),
@@ -949,12 +1145,14 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
         let seed = state.seed;
 
         let mut remaining_writes = per_rift_budget;
-        let mut scan_budget = per_rift_budget * 8;
+        let mut water_budget = per_rift_budget * 3;
+        let mut water_cleared = 0usize;
+        let mut scan_budget = per_rift_budget * 10;
 
         while remaining_writes > 0 && scan_budget > 0 {
             // Pull next column if no active vertical column is currently in progress.
             if state.rifts[rift_idx].active_column.is_none() {
-                let is_deepen_turn = state.tick % 4 == 0
+                let is_deepen_turn = state.tick % 3 == 0
                     && state.rifts[rift_idx].deepen_radius < state.rifts[rift_idx].ring_radius
                     && rift_mature;
 
@@ -984,7 +1182,7 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                 };
 
                 // Require column chunk to be loaded (or wait a tick for ticketed chunk to load).
-                if host.biome([col[0], 64, col[1]]).is_none() {
+                if !ow.is_loaded(host, [col[0], 64, col[1]]) {
                     let chunk = [col[0] >> 4, col[1] >> 4];
                     let _ = host.chunk_load_request(OWNER_FRONTIER_TICKET, OVERWORLD, chunk);
                     if is_deepen_turn {
@@ -1000,7 +1198,7 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                     rift_center,
                 ) as f64)
                     .sqrt() as i32;
-                let min_y = allowed_min_y(
+                let full_min_y = allowed_min_y(
                     rift_center[1],
                     rift_age,
                     hdist,
@@ -1011,13 +1209,17 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                     .surface_heights(OVERWORLD, &[(col[0], col[1])], NativeHeightmap::WorldSurface)
                     .ok()
                     .and_then(|v| v.into_iter().next().flatten())
-                    .map(|y| (y + 1).clamp(min_y, OVERWORLD_MAX_Y - 1))
-                    .unwrap_or_else(|| (rift_center[1] + 24).clamp(min_y, OVERWORLD_MAX_Y - 1));
+                    .map(|y| (y + 1).clamp(full_min_y, OVERWORLD_MAX_Y - 1))
+                    .unwrap_or_else(|| {
+                        (rift_center[1] + 24).clamp(full_min_y, OVERWORLD_MAX_Y - 1)
+                    });
 
-                let start_y = if is_deepen_turn {
-                    top_y.min(rift_center[1] - 12).max(min_y)
+                let (start_y, col_min_y) = if is_deepen_turn {
+                    (top_y.min(rift_center[1] - 12).max(full_min_y), full_min_y)
+                } else if hdist <= 28 || !rift_mature {
+                    (top_y, full_min_y)
                 } else {
-                    top_y
+                    (top_y, full_min_y.max(top_y - 36))
                 };
 
                 // Paint the full 4x4x4 quart biome column for this `(x, z)` immediately.
@@ -1039,13 +1241,13 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                     state.rifts[rift_idx].max_radius_sq = r_sq;
                 }
 
-                state.rifts[rift_idx].active_column = Some((col, start_y, min_y));
+                state.rifts[rift_idx].active_column = Some((col, start_y, col_min_y));
             }
 
             let Some((col, mut cur_y, min_y)) = state.rifts[rift_idx].active_column else {
                 break;
             };
-            if host.biome([col[0], 64, col[1]]).is_none() {
+            if !ow.is_loaded(host, [col[0], 64, col[1]]) {
                 break;
             }
 
@@ -1057,25 +1259,54 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                 NetherFlavor::pick_for_region(col[0], col[1], seed ^ rift_id)
             };
 
+            let mut cleared_above_to_air = false;
             while cur_y >= min_y && remaining_writes > 0 && scan_budget > 0 {
                 scan_budget -= 1;
                 let pos = [col[0], cur_y, col[1]];
-                let cur = host.block(pos);
+                let cur = ow
+                    .block(host, pos)
+                    .unwrap_or_else(|| "minecraft:air".to_owned());
 
                 if !is_air_like(&cur) {
-                    let above = host.block([pos[0], pos[1] + 1, pos[2]]);
-                    let below = host.block([pos[0], pos[1] - 1, pos[2]]);
+                    let above_raw = ow
+                        .block(host, [pos[0], pos[1] + 1, pos[2]])
+                        .unwrap_or_else(|| "minecraft:air".to_owned());
+                    let above = if cleared_above_to_air {
+                        "minecraft:air"
+                    } else {
+                        above_raw.as_str()
+                    };
+                    let below = ow
+                        .block(host, [pos[0], pos[1] - 1, pos[2]])
+                        .unwrap_or_else(|| "minecraft:air".to_owned());
+                    let was_water = is_water_like(&cur);
                     let outcome =
-                        transform_block(pos, &cur, &above, &below, local_flavor, rift_mature);
+                        transform_block(pos, &cur, above, &below, local_flavor, rift_mature);
 
                     if let Some(new_block) = outcome.block {
                         push_edit(&mut edit, &mut palette_map, pos, new_block);
-                        remaining_writes -= 1;
+                        cleared_above_to_air = new_block == "minecraft:air";
+                        if was_water && water_budget > 0 {
+                            water_budget -= 1;
+                            water_cleared += 1;
+                            if water_cleared % 4 == 0 {
+                                remaining_writes -= 1;
+                            }
+                        } else {
+                            remaining_writes -= 1;
+                        }
                         state.rifts[rift_idx].corrupted_blocks += 1;
                         state.dirty = true;
+                    } else {
+                        cleared_above_to_air = false;
+                        if ow.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+                            state.queue_water_evap(pos);
+                        }
                     }
+
                     if let Some(above_block) = outcome.above
-                        && is_air_like(&above)
+                        && is_air_like(above)
+                        && !cleared_above_to_air
                     {
                         push_edit(
                             &mut edit,
@@ -1097,6 +1328,8 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
                     if outcome.is_corrupt && matches!(strip_ns(&cur), "lava" | "flowing_lava") {
                         lava_nudges.push((pos, cur));
                     }
+                } else {
+                    cleared_above_to_air = false;
                 }
                 cur_y -= 1;
             }
