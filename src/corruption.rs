@@ -255,9 +255,6 @@ fn scar_roll(pos: [i32; 3], salt: u64) -> u64 {
     spatial_hash(pos[0], pos[1], pos[2], salt)
 }
 
-/// Blends a 2x2x2 coarse pocket roll with a fine voxel roll so surviving
-/// Overworld remnants (~`pct`%) form recognizable small weathered islands while
-/// keeping ~88-90% of the terrain decisively Nether-corrupted.
 /// Groups surviving Overworld remnants (~`pct`%) into organic 2x2x2 weathered
 /// pockets rather than isolated voxels while keeping ~88-90% corrupted.
 fn in_remnant_cluster(pos: [i32; 3], salt: u64, pct: u64) -> bool {
@@ -469,7 +466,7 @@ fn transform_stone_family(
 
 /// Pure deterministic block corruption selector used by runtime frontier and unit tests.
 /// Never floods caves with lava, protects player chests/beds/containment/bedrock,
-/// preserves rare Overworld ores, leaves ~14% scarred Overworld remnants, and seeds
+/// preserves rare Overworld ores, leaves ~12% scarred Overworld remnants, and seeds
 /// deep Ancient Debris in mature rifts.
 pub fn transform_block(
     pos: [i32; 3],

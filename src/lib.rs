@@ -1,0 +1,1104 @@
+mod atmosphere;
+mod bastion;
+mod containment;
+mod corruption;
+mod mobs;
+mod state;
+mod types;
+
+use atmosphere::{ClientAtmosphere, ParticlePalette};
+use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
+use corruption::{allowed_min_y, is_air_like, is_water_like, transform_block};
+use mobs::paint_biome_column;
+use state::RiftState;
+use types::{
+    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, build_ring_columns,
+    dist_sq, horiz_dist_sq, neighbors_6, strip_ns,
+};
+
+use mod_api::{
+    BlockChangedEvent, BlockSpreadEvent, BlockUpdateFlags, BucketEmptyEvent, ClientHost,
+    ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientTickPostEvent, Command,
+    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, FillBucketEvent, Flow,
+    FluidLevelChangeEvent, Heightmap, Hooks, HostSide, LevelDimension, LevelHost, LevelRef,
+    LevelTickPostEvent, LivingConversionPreEvent, LivingDeathEvent, LootDropsEvent, MusicEvent,
+    PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
+};
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+const MAX_CORE_FORCED_CHUNKS: usize = 8;
+const MAX_FRONTIER_FORCED_CHUNKS: usize = 8;
+
+#[derive(Default)]
+pub struct Mod {
+    state: Mutex<RiftState>,
+    atmo: Mutex<ClientAtmosphere>,
+    particles: Mutex<Option<ParticlePalette>>,
+}
+
+struct ServerContainmentView<'a> {
+    host: &'a dyn ServerHost,
+    level: LevelRef,
+}
+
+impl ContainmentView for ServerContainmentView<'_> {
+    fn block_name(&self, pos: [i32; 3]) -> Option<String> {
+        if !self.level.is_loaded(self.host, pos) {
+            return None;
+        }
+        self.level
+            .block(self.host, pos)
+            .map(|k| k.id(self.host))
+    }
+
+    fn is_open(&self, pos: [i32; 3]) -> Option<bool> {
+        if !self.level.is_loaded(self.host, pos) {
+            return None;
+        }
+        self.level
+            .block_property(self.host, pos, "open")
+            .and_then(|v| match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            })
+    }
+}
+
+fn ensure_world_initialized(host: &dyn ServerHost, state: &mut RiftState) {
+    let dir = host.world_dir();
+    if dir.is_some() && state.world_dir != dir {
+        let seed = host.level(OVERWORLD).and_then(|l| l.seed(host));
+        state.reset_for_world(dir, seed);
+    } else if state.world_dir.is_none() && dir.is_some() {
+        let seed = host.level(OVERWORLD).and_then(|l| l.seed(host));
+        state.reset_for_world(dir, seed);
+    }
+}
+
+fn broadcast_overworld(host: &mut dyn ServerHost, msg: &str) {
+    let text = Text::literal(msg);
+    for player in host.players().server_players() {
+        if player
+            .dimension(host)
+            .is_some_and(|d| d.to_string() == OVERWORLD)
+        {
+            let _ = player.tell(host, text.clone());
+        }
+    }
+}
+
+fn release_all_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    for chunk in state.core_chunks.drain() {
+        if let Some(cref) = level.chunk_ref(host, chunk) {
+            let _ = cref.set_forced(host, false);
+        }
+    }
+    while let Some(chunk) = state.frontier_chunks.pop_front() {
+        if let Some(cref) = level.chunk_ref(host, chunk) {
+            let _ = cref.set_forced(host, false);
+        }
+    }
+    bastion::release_bastion_chunks(host, level, state);
+}
+
+fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    if state.paused || !state.has_uncontained() {
+        for chunk in state.core_chunks.drain() {
+            if let Some(cref) = level.chunk_ref(host, chunk) {
+                let _ = cref.set_forced(host, false);
+            }
+        }
+        while let Some(chunk) = state.frontier_chunks.pop_front() {
+            if let Some(cref) = level.chunk_ref(host, chunk) {
+                let _ = cref.set_forced(host, false);
+            }
+        }
+        return;
+    }
+
+    let mut desired_core: HashSet<[i32; 2]> = HashSet::new();
+    for rift in &state.rifts {
+        if rift.contained || desired_core.len() >= MAX_CORE_FORCED_CHUNKS {
+            continue;
+        }
+        desired_core.insert([rift.center[0] >> 4, rift.center[2] >> 4]);
+    }
+
+    let to_drop: Vec<[i32; 2]> = state
+        .core_chunks
+        .iter()
+        .copied()
+        .filter(|c| !desired_core.contains(c))
+        .collect();
+    for chunk in to_drop {
+        state.core_chunks.remove(&chunk);
+        if let Some(cref) = level.chunk_ref(host, chunk) {
+            let _ = cref.set_forced(host, false);
+        }
+    }
+    for chunk in desired_core {
+        if !state.core_chunks.contains(&chunk)
+            && let Some(cref) = level.chunk_ref(host, chunk)
+            && cref.set_forced(host, true)
+        {
+            state.core_chunks.insert(chunk);
+        }
+    }
+
+    let mut desired_frontier: Vec<[i32; 2]> = Vec::new();
+    for rift in &state.rifts {
+        if rift.contained {
+            continue;
+        }
+        if let Some(([x, z], _, _)) = rift.active_column {
+            let c = [x >> 4, z >> 4];
+            if !desired_frontier.contains(&c) {
+                desired_frontier.push(c);
+            }
+        }
+        for col in rift.ring_columns.iter().rev().take(48) {
+            let c = [col[0] >> 4, col[1] >> 4];
+            if !state.core_chunks.contains(&c) && !desired_frontier.contains(&c) {
+                desired_frontier.push(c);
+                if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
+                    break;
+                }
+            }
+        }
+        if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
+            break;
+        }
+    }
+
+    for chunk in desired_frontier {
+        if state.core_chunks.contains(&chunk) || state.frontier_chunks.contains(&chunk) {
+            continue;
+        }
+        while state.frontier_chunks.len() >= MAX_FRONTIER_FORCED_CHUNKS {
+            if let Some(old) = state.frontier_chunks.pop_front()
+                && let Some(cref) = level.chunk_ref(host, old)
+            {
+                let _ = cref.set_forced(host, false);
+            }
+        }
+        if let Some(cref) = level.chunk_ref(host, chunk)
+            && cref.set_forced(host, true)
+        {
+            state.frontier_chunks.push_back(chunk);
+        }
+    }
+}
+
+fn register_or_refresh_rift(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState, seed_pos: [i32; 3]) {
+    let view = ServerContainmentView { host, level };
+    let (lit, seeds, centroid) = inspect_portal_cluster(&view, seed_pos);
+
+    if let Some(rift) = state.find_near_source_mut(centroid, 12) {
+        rift.center = centroid;
+        rift.active_portal = lit;
+        let outcome = evaluate_chamber(&view, &seeds);
+        if outcome != ContainmentOutcome::Indeterminate {
+            rift.contained = outcome == ContainmentOutcome::Contained;
+        }
+        state.dirty = true;
+        return;
+    }
+
+    let id = state.next_id;
+    state.next_id += 1;
+    let flavor = NetherFlavor::pick_for_region(centroid[0], centroid[2], state.seed ^ id);
+    let outcome = evaluate_chamber(&view, &seeds);
+    let contained = outcome == ContainmentOutcome::Contained;
+
+    let rift = RiftSource {
+        id,
+        center: centroid,
+        active_portal: lit,
+        contained,
+        flavor,
+        age_ticks: 0,
+        corrupted_blocks: 0,
+        max_radius_sq: 1,
+        ring_radius: 1,
+        ring_columns: build_ring_columns(centroid[0], centroid[2], 1),
+        active_column: None,
+        deepen_radius: 1,
+        deepen_columns: build_ring_columns(centroid[0], centroid[2], 1),
+        bastions_placed: 0,
+    };
+    state.rifts.push(rift);
+    if state.mark_quart_corrupted(centroid) {
+        paint_biome_column(level, host, centroid[0], centroid[2], flavor);
+    }
+    state.dirty = true;
+
+    if contained {
+        broadcast_overworld(
+            host,
+            &format!(
+                "[Rift Bleed] A sealed portal at ({}, {}, {}) is held inside Crying Obsidian.",
+                centroid[0], centroid[1], centroid[2]
+            ),
+        );
+    } else {
+        broadcast_overworld(
+            host,
+            &format!(
+                "[Rift Bleed] A {} rift tore open at ({}, {}, {})! Enclose all 6 sides with Crying Obsidian + Iron Doors to stop the spread.",
+                flavor.display_name(),
+                centroid[0],
+                centroid[1],
+                centroid[2]
+            ),
+        );
+    }
+}
+
+fn evaluate_rift_containment(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState, force_all: bool) {
+    let periodic = state.tick % 40 == 0;
+    let queued = std::mem::take(&mut state.pending_containment_checks);
+    if !force_all && !periodic && queued.is_empty() {
+        return;
+    }
+
+    let mut announcements: Vec<String> = Vec::new();
+    let view = ServerContainmentView { host, level };
+
+    for idx in 0..state.rifts.len() {
+        let check_this = force_all
+            || periodic
+            || queued
+                .iter()
+                .any(|p| dist_sq(*p, state.rifts[idx].center) <= 22 * 22);
+        if !check_this {
+            continue;
+        }
+        let center = state.rifts[idx].center;
+        let (lit, seeds, centroid) = inspect_portal_cluster(&view, center);
+        let outcome = evaluate_chamber(&view, &seeds);
+
+        let rift = &mut state.rifts[idx];
+        rift.active_portal = lit;
+        if lit {
+            rift.center = centroid;
+        }
+        match outcome {
+            ContainmentOutcome::Contained => {
+                if !rift.contained {
+                    rift.contained = true;
+                    state.dirty = true;
+                    announcements.push(format!(
+                        "[Rift Bleed] Rift #{} at ({}, {}, {}) is SEALED by Crying Obsidian.",
+                        rift.id, rift.center[0], rift.center[1], rift.center[2]
+                    ));
+                }
+            }
+            ContainmentOutcome::Breached => {
+                if rift.contained {
+                    rift.contained = false;
+                    state.dirty = true;
+                    announcements.push(format!(
+                        "[Rift Bleed] Containment BREACHED at Rift #{} ({}, {}, {}) — Nether corruption resumes!",
+                        rift.id, rift.center[0], rift.center[1], rift.center[2]
+                    ));
+                }
+            }
+            ContainmentOutcome::Indeterminate => {}
+        }
+    }
+
+    for line in announcements {
+        broadcast_overworld(host, &line);
+    }
+}
+
+fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool {
+    if state.is_quart_corrupted(pos) {
+        return true;
+    }
+    for rift in &state.rifts {
+        let limit = (rift.max_radius_sq + 256).max(16 * 16);
+        if horiz_dist_sq(rift.center, pos) <= limit {
+            return true;
+        }
+    }
+    false
+}
+
+fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    let Some(air) = host.block_state_id("minecraft:air") else {
+        return;
+    };
+
+    let mut processed = 0usize;
+    while processed < 112 {
+        let Some(pos) = state.pop_water_evap() else {
+            break;
+        };
+        processed += 1;
+        if pos[1] < OVERWORLD_MIN_Y || pos[1] > OVERWORLD_MAX_Y || !level.is_loaded(host, pos) {
+            continue;
+        }
+        if !near_corruption_or_active_rift(state, pos) {
+            continue;
+        }
+
+        let Some(bkey) = level.block(host, pos) else {
+            continue;
+        };
+        let bname = bkey.id(host);
+        let short = strip_ns(&bname);
+        if is_water_like(&bname) || matches!(short, "ice" | "frosted_ice" | "packed_ice" | "blue_ice") {
+            let _ = level.set_block(
+                host,
+                pos,
+                air,
+                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS,
+            );
+            state.dirty = true;
+
+            for n in neighbors_6(pos) {
+                if n[1] >= OVERWORLD_MIN_Y
+                    && n[1] <= OVERWORLD_MAX_Y
+                    && near_corruption_or_active_rift(state, n)
+                    && level
+                        .block(host, n)
+                        .is_some_and(|nk| is_water_like(&nk.id(host)))
+                {
+                    state.queue_water_evap(n);
+                }
+            }
+        } else if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+            let _ = host.set_block_property(pos, "waterlogged", "false");
+            state.dirty = true;
+        }
+    }
+
+    // Continuous gentle surface & river sweep over existing corrupted quart columns
+    // so lingering ponds or lakes never survive inside corrupted lands.
+    if state.corrupted_quart_cols.is_empty() {
+        return;
+    }
+    let cols: Vec<[i32; 2]> = state.corrupted_quart_cols.iter().copied().collect();
+    for _ in 0..4 {
+        let idx = state.water_sweep_cursor % cols.len();
+        state.water_sweep_cursor = state.water_sweep_cursor.wrapping_add(1);
+        let qc = cols[idx];
+        let sub_x = (qc[0] << 2) + ((state.tick as i32) & 3);
+        let sub_z = (qc[1] << 2) + (((state.tick >> 2) as i32) & 3);
+        if !level.is_loaded(host, [sub_x, 64, sub_z]) {
+            continue;
+        }
+        if let Ok(hs) = host.surface_heights(OVERWORLD, &[(sub_x, sub_z)], Heightmap::WorldSurface)
+            && let Some(Some(top)) = hs.first().copied()
+        {
+            let lo = (top - 12).max(OVERWORLD_MIN_Y);
+            let hi = (top + 1).min(OVERWORLD_MAX_Y);
+            for y in lo..=hi {
+                let p = [sub_x, y, sub_z];
+                if level
+                    .block(host, p)
+                    .is_some_and(|k| is_water_like(&k.id(host)))
+                    || level.block_property(host, p, "waterlogged").as_deref() == Some("true")
+                {
+                    state.queue_water_evap(p);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_block(host: &dyn ServerHost, id: &str) -> Option<mod_api::BlockState> {
+    host.block_state_id(id)
+}
+
+fn pop_next_loaded_column(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    cols: &mut Vec<[i32; 2]>,
+    radius: &mut i32,
+    center: [i32; 3],
+) -> Option<[i32; 2]> {
+    for _ in 0..6 {
+        if cols.is_empty() {
+            *radius += 1;
+            *cols = build_ring_columns(center[0], center[2], *radius);
+        }
+        if let Some(pos_idx) = cols.iter().rposition(|c| level.is_loaded(host, [c[0], 64, c[1]])) {
+            return Some(cols.swap_remove(pos_idx));
+        }
+        // Keep expanding or waiting if outer ring is still loading; check up to a couple rings.
+        if cols.len() > 64 {
+            break;
+        }
+    }
+    None
+}
+
+fn corrupt_column_step(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+    budget: &mut usize,
+) {
+    let mut skips = 0usize;
+    while *budget > 0 && skips < 48 {
+        let rift_id = state.rifts[rift_idx].id;
+        let rift_center = state.rifts[rift_idx].center;
+        let rift_flavor = state.rifts[rift_idx].flavor;
+        let rift_age = state.rifts[rift_idx].age_ticks;
+        let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
+        let mature = rift_blocks >= 2_000 || rift_age >= 1_200;
+
+        if state.rifts[rift_idx].active_column.is_none() {
+            // Alternate 360-degree expansion ring with periodic inner-ring deepening down to bedrock.
+            let next_col = if let Some(col) = state.pending_frontier_columns.pop_front() {
+                if level.is_loaded(host, [col[0], 64, col[1]]) {
+                    Some(col)
+                } else {
+                    None
+                }
+            } else if state.tick % 4 == 1 && state.rifts[rift_idx].ring_radius > 2 {
+                let r = &mut state.rifts[rift_idx];
+                if r.deepen_columns.is_empty() {
+                    r.deepen_radius = if r.deepen_radius + 1 >= r.ring_radius {
+                        1
+                    } else {
+                        r.deepen_radius + 1
+                    };
+                    r.deepen_columns = build_ring_columns(rift_center[0], rift_center[2], r.deepen_radius);
+                }
+                let mut d_rad = r.deepen_radius;
+                let picked = pop_next_loaded_column(host, level, &mut r.deepen_columns, &mut d_rad, rift_center);
+                r.deepen_radius = d_rad;
+                picked
+            } else {
+                let r = &mut state.rifts[rift_idx];
+                let mut ring_r = r.ring_radius;
+                let picked = pop_next_loaded_column(host, level, &mut r.ring_columns, &mut ring_r, rift_center);
+                r.ring_radius = ring_r;
+                picked
+            };
+
+            let Some(col) = next_col else {
+                break;
+            };
+            let Ok(hs) = host.surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface) else {
+                break;
+            };
+            let Some(Some(top)) = hs.first().copied() else {
+                break;
+            };
+            let top_y = (top + 2).min(OVERWORLD_MAX_Y - 1);
+            let hdist = (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
+            let min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
+            state.rifts[rift_idx].active_column = Some((col, top_y, min_y));
+        }
+
+        let Some((col, y, min_y)) = state.rifts[rift_idx].active_column else {
+            break;
+        };
+        if y < min_y {
+            state.rifts[rift_idx].active_column = None;
+            continue;
+        }
+
+        // Advance active column cursor cleanly before inspecting blocks.
+        state.rifts[rift_idx].active_column = if y - 1 >= min_y {
+            Some((col, y - 1, min_y))
+        } else {
+            None
+        };
+
+        let pos = [col[0], y, col[1]];
+        if !level.is_loaded(host, pos) {
+            state.rifts[rift_idx].active_column = None;
+            break;
+        }
+
+        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
+        if current.is_empty() || is_air_like(&current) {
+            skips += 1;
+            continue;
+        }
+
+        let above = if y + 1 <= OVERWORLD_MAX_Y {
+            level
+                .block(host, [pos[0], pos[1] + 1, pos[2]])
+                .map(|k| k.id(host))
+                .unwrap_or_else(|| "minecraft:air".to_owned())
+        } else {
+            "minecraft:air".to_owned()
+        };
+        let below = if y - 1 >= OVERWORLD_MIN_Y {
+            level
+                .block(host, [pos[0], pos[1] - 1, pos[2]])
+                .map(|k| k.id(host))
+                .unwrap_or_else(|| "minecraft:air".to_owned())
+        } else {
+            "minecraft:bedrock".to_owned()
+        };
+
+        let d2 = horiz_dist_sq(rift_center, pos);
+        let local_flavor = if d2 <= 40 * 40 {
+            rift_flavor
+        } else {
+            NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
+        };
+
+        if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+            let _ = host.set_block_property(pos, "waterlogged", "false");
+            state.queue_water_evap(pos);
+        }
+
+        let out = transform_block(pos, &current, &above, &below, local_flavor, mature);
+
+        if is_water_like(&current) {
+            state.queue_water_evap(pos);
+        }
+
+        if let Some(target_id) = out.block
+            && let Some(block_state) = resolve_block(host, target_id)
+        {
+            let flags = if target_id == "minecraft:air" {
+                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS
+            } else {
+                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS
+            };
+            if level.set_block(host, pos, block_state, flags).unwrap_or(false) {
+                *budget = budget.saturating_sub(1);
+                state.rifts[rift_idx].corrupted_blocks += 1;
+                if d2 > state.rifts[rift_idx].max_radius_sq {
+                    state.rifts[rift_idx].max_radius_sq = d2;
+                }
+                state.dirty = true;
+
+                if let Some(above_id) = out.above
+                    && y + 1 < OVERWORLD_MAX_Y
+                    && is_air_like(&above)
+                    && let Some(above_state) = resolve_block(host, above_id)
+                {
+                    let _ = level.set_block(
+                        host,
+                        [pos[0], pos[1] + 1, pos[2]],
+                        above_state,
+                        BlockUpdateFlags::CLIENTS,
+                    );
+                }
+
+                if let Some(below_id) = out.below
+                    && y - 1 > OVERWORLD_MIN_Y
+                    && is_air_like(&below)
+                    && let Some(below_state) = resolve_block(host, below_id)
+                {
+                    let _ = level.set_block(
+                        host,
+                        [pos[0], pos[1] - 1, pos[2]],
+                        below_state,
+                        BlockUpdateFlags::CLIENTS,
+                    );
+                }
+            }
+        } else {
+            skips += 1;
+        }
+
+        if out.is_corrupt && state.mark_quart_corrupted(pos) {
+            paint_biome_column(level, host, pos[0], pos[2], local_flavor);
+            state.dirty = true;
+        }
+    }
+}
+
+fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    if state.paused || state.rifts.is_empty() {
+        return;
+    }
+
+    let uncontained_indices: Vec<usize> = state
+        .rifts
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.contained)
+        .map(|(i, _)| i)
+        .collect();
+    if uncontained_indices.is_empty() {
+        return;
+    }
+
+    for &idx in &uncontained_indices {
+        state.rifts[idx].age_ticks += 1;
+    }
+
+    let mut remaining = state.spread_budget;
+    let count = uncontained_indices.len();
+    let start = (state.tick as usize) % count;
+
+    for offset in 0..count {
+        if remaining == 0 {
+            break;
+        }
+        let r_idx = uncontained_indices[(start + offset) % count];
+        let slice = (remaining / (count - offset)).max(1);
+        let mut sub_budget = slice;
+        corrupt_column_step(host, level, state, r_idx, &mut sub_budget);
+        let spent = slice.saturating_sub(sub_budget);
+        remaining = remaining.saturating_sub(spent);
+    }
+}
+
+#[mod_api::horizon_mod]
+impl Hooks for Mod {
+    fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+        let pal = ParticlePalette {
+            ash: r.particle_key("minecraft:ash"),
+            crimson_spore: r.particle_key("minecraft:crimson_spore"),
+            warped_spore: r.particle_key("minecraft:warped_spore"),
+            white_ash: r.particle_key("minecraft:white_ash"),
+            flame: r.particle_key("minecraft:flame"),
+            small_flame: r.particle_key("minecraft:small_flame"),
+        };
+        if let Ok(mut guard) = self.particles.lock() {
+            *guard = Some(pal);
+        }
+    }
+
+    fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
+        if let Ok(mut state) = self.state.lock() {
+            ensure_world_initialized(host, &mut state);
+        }
+    }
+
+    fn world_saved(&self, host: &mut dyn ServerHost, _event: &mut WorldSavedEvent) {
+        if let Ok(mut state) = self.state.lock() {
+            ensure_world_initialized(host, &mut state);
+            state.save_to_disk();
+        }
+    }
+
+    fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
+        let ow = host.level(OVERWORLD);
+        if let Ok(mut state) = self.state.lock() {
+            state.save_to_disk();
+            if let Some(level) = ow {
+                release_all_forced_chunks(host, level, &mut state);
+            }
+        }
+    }
+
+    fn world_lifecycle(&self, host: &mut dyn ServerHost, event: &mut WorldLifecycleEvent<'_>) {
+        if matches!(event.phase, WorldPhase::WorldCloseFinal | WorldPhase::WorldCloseFailed) {
+            let ow = host.level(OVERWORLD);
+            if let Ok(mut state) = self.state.lock() {
+                state.save_to_disk();
+                if let Some(level) = ow {
+                    release_all_forced_chunks(host, level, &mut state);
+                }
+            }
+        }
+    }
+
+    fn portal_create(&self, host: &mut dyn ServerHost, event: &mut PortalCreateEvent<'_>) {
+        if event.dimension != OVERWORLD {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            ensure_world_initialized(host, &mut state);
+            state.pending_portals.push_back(event.pos);
+        }
+    }
+
+    fn block_changed(&self, level: &dyn LevelHost, event: &mut BlockChangedEvent) {
+        if event.dimension != LevelDimension::Overworld {
+            return;
+        }
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        let new_name = level.state_block(event.new).unwrap_or_default();
+        let old_name = level.state_block(event.old).unwrap_or_default();
+        let new_short = strip_ns(new_name);
+        let old_short = strip_ns(old_name);
+
+        if let Ok(mut state) = self.state.lock() {
+            if new_short == "nether_portal" {
+                state.pending_portals.push_back(pos);
+            }
+            if containment::is_seal_block(new_name, None)
+                || containment::is_seal_block(old_name, None)
+                || matches!(new_short, "iron_door" | "iron_trapdoor")
+                || matches!(old_short, "iron_door" | "iron_trapdoor" | "nether_portal")
+            {
+                state.pending_containment_checks.push(pos);
+            }
+            let has_water = is_water_like(new_name)
+                || level
+                    .state_fluid_state(event.new)
+                    .is_some_and(|f| !f.is_empty() && !matches!(new_short, "lava" | "flowing_lava"));
+            if has_water && near_corruption_or_active_rift(&state, pos) {
+                state.queue_water_evap(pos);
+            }
+        }
+    }
+
+    fn block_spread(&self, _level: &dyn LevelHost, event: &mut BlockSpreadEvent<'_>) -> Flow {
+        if event.dimension != LevelDimension::Overworld {
+            return Flow::Continue;
+        }
+        let to = [event.to.x, event.to.y, event.to.z];
+        if let Ok(mut state) = self.state.lock()
+            && near_corruption_or_active_rift(&state, to)
+        {
+            if is_water_like(event.kind) {
+                state.queue_water_evap(to);
+                return Flow::Cancel;
+            }
+            if matches!(
+                strip_ns(event.kind),
+                "grass_block" | "mycelium" | "vine" | "sculk" | "moss_block"
+            ) {
+                return Flow::Cancel;
+            }
+        }
+        Flow::Continue
+    }
+
+    fn fluid_level_change(
+        &self,
+        _level: &dyn LevelHost,
+        event: &mut FluidLevelChangeEvent<'_>,
+    ) -> Flow {
+        if event.dimension != LevelDimension::Overworld {
+            return Flow::Continue;
+        }
+        if !strip_ns(event.fluid).contains("water") {
+            return Flow::Continue;
+        }
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        if let Ok(mut state) = self.state.lock()
+            && near_corruption_or_active_rift(&state, pos)
+        {
+            state.queue_water_evap(pos);
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    fn create_fluid_source(&self, level: &dyn LevelHost, event: &mut CreateFluidSourceEvent) {
+        if event.dimension != LevelDimension::Overworld {
+            return;
+        }
+        let block_name = level.state_block(event.state).unwrap_or_default();
+        if !is_water_like(block_name) {
+            return;
+        }
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        if let Ok(mut state) = self.state.lock()
+            && near_corruption_or_active_rift(&state, pos)
+        {
+            event.can_convert = false;
+            state.queue_water_evap(pos);
+        }
+    }
+
+    fn fill_bucket(&self, host: &mut dyn ServerHost, event: &mut FillBucketEvent<'_>) -> Flow {
+        let _ = (host, event);
+        Flow::Continue
+    }
+
+    fn bucket_empty(&self, host: &mut dyn ServerHost, event: &mut BucketEmptyEvent<'_>) -> Flow {
+        if !strip_ns(event.fluid).contains("water") {
+            return Flow::Continue;
+        }
+        let in_overworld = host
+            .players()
+            .server_players()
+            .into_iter()
+            .find(|p| p.uuid() == event.player)
+            .and_then(|p| p.dimension(host))
+            .is_some_and(|d| d.to_string() == OVERWORLD);
+        if !in_overworld {
+            return Flow::Continue;
+        }
+        let Some(ow) = host.level(OVERWORLD) else {
+            return Flow::Continue;
+        };
+        if let Ok(mut state) = self.state.lock()
+            && (near_corruption_or_active_rift(&state, event.pos)
+                || mobs::pos_is_corrupted(host, ow, &state, event.pos))
+        {
+            state.queue_water_evap(event.pos);
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    fn living_conversion_pre(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut LivingConversionPreEvent<'_>,
+    ) -> Flow {
+        if let Ok(state) = self.state.lock()
+            && mobs::should_block_zombification(host, &state, event.entity, event.kind, event.outcome)
+        {
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
+        let pal = self.particles.lock().ok().and_then(|g| *g);
+        if let Ok(mut state) = self.state.lock() {
+            mobs::handle_living_death(host, &mut state, event, pal.as_ref());
+        }
+        Flow::Continue
+    }
+
+    fn potential_spawns(&self, _host: &dyn mod_api::Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {
+        if let Ok(state) = self.state.lock() {
+            mobs::augment_potential_spawns(&state, event);
+        }
+        Flow::Continue
+    }
+
+    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+        if event.context.dimension != OVERWORLD {
+            return;
+        }
+        let Some((eid, kind)) = event.context.entity else {
+            return;
+        };
+        if let Ok(state) = self.state.lock() {
+            mobs::append_nether_touched_drops(
+                host,
+                &state,
+                eid,
+                kind,
+                event.context.origin,
+                event.drops,
+            );
+        }
+    }
+
+    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        event.commands.push(Command::op("rift", 2));
+        event.commands.push(Command::op("rift status", 2));
+        event.commands.push(Command::op("rift scan", 2));
+        event.commands.push(Command::op("rift pause", 2));
+        event.commands.push(Command::op("rift resume", 2));
+        event.commands.push(Command::op("rift sealcheck", 2));
+        event
+            .commands
+            .push(Command::op("rift speed <ticks:integer>", 2));
+    }
+
+    fn run_mod_command(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut RunModCommandEvent<'_>,
+    ) -> Flow {
+        if event.command.literals.first().map(String::as_str) != Some("rift") {
+            return Flow::Continue;
+        }
+
+        let sub = event.command.literals.get(1).map(String::as_str);
+        let msg = if let Ok(mut state) = self.state.lock() {
+            ensure_world_initialized(host, &mut state);
+            match sub {
+                None | Some("status") => {
+                    let active = state.rifts.iter().filter(|r| !r.contained).count();
+                    let sealed = state.rifts.iter().filter(|r| r.contained).count();
+                    let blocks: u64 = state.rifts.iter().map(|r| r.corrupted_blocks).sum();
+                    format!(
+                        "[Rift Bleed] Rifts: {} total ({} active, {} sealed) | Corrupted blocks: {} | Bastions: {} | Speed: {} ops/tick | State: {}",
+                        state.rifts.len(),
+                        active,
+                        sealed,
+                        blocks,
+                        state.bastions.len(),
+                        state.spread_budget,
+                        if state.paused { "PAUSED" } else { "RUNNING" }
+                    )
+                }
+                Some("scan") => {
+                    if let Some(ow) = host.level(OVERWORLD) {
+                        let base = [
+                            event.command.position[0].floor() as i32,
+                            event.command.position[1].floor() as i32,
+                            event.command.position[2].floor() as i32,
+                        ];
+                        let mut found = 0usize;
+                        for dx in (-24..=24).step_by(2) {
+                            for dz in (-24..=24).step_by(2) {
+                                for dy in (-12..=12).step_by(2) {
+                                    let p = [
+                                        base[0] + dx,
+                                        (base[1] + dy).clamp(OVERWORLD_MIN_Y + 1, OVERWORLD_MAX_Y - 1),
+                                        base[2] + dz,
+                                    ];
+                                    if ow.is_loaded(host, p)
+                                        && ow
+                                            .block(host, p)
+                                            .is_some_and(|k| strip_ns(&k.id(host)) == "nether_portal")
+                                        && state.find_near_source_mut(p, 12).is_none()
+                                    {
+                                        register_or_refresh_rift(host, ow, &mut state, p);
+                                        found += 1;
+                                    }
+                                }
+                            }
+                        }
+                        format!("[Rift Bleed] Scan finished near ({}, {}, {}): registered {found} new portal(s).", base[0], base[1], base[2])
+                    } else {
+                        "[Rift Bleed] Overworld is not loaded.".to_owned()
+                    }
+                }
+                Some("pause") => {
+                    state.paused = true;
+                    state.dirty = true;
+                    if let Some(ow) = host.level(OVERWORLD) {
+                        sync_forced_chunks(host, ow, &mut state);
+                    }
+                    "[Rift Bleed] Corruption spread paused.".to_owned()
+                }
+                Some("resume") => {
+                    state.paused = false;
+                    state.dirty = true;
+                    "[Rift Bleed] Corruption spread resumed.".to_owned()
+                }
+                Some("sealcheck") => {
+                    if let Some(ow) = host.level(OVERWORLD) {
+                        evaluate_rift_containment(host, ow, &mut state, true);
+                    }
+                    if state.rifts.is_empty() {
+                        "[Rift Bleed] No Overworld rifts tracked yet.".to_owned()
+                    } else {
+                        let details: Vec<String> = state
+                            .rifts
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "#{} ({}, {}, {}) [{} | {}]",
+                                    r.id,
+                                    r.center[0],
+                                    r.center[1],
+                                    r.center[2],
+                                    if r.contained { "SEALED" } else { "BREACHED" },
+                                    if r.active_portal { "portal" } else { "scar" }
+                                )
+                            })
+                            .collect();
+                        format!("[Rift Bleed] {}", details.join(" ; "))
+                    }
+                }
+                Some("speed") => {
+                    let arg = event
+                        .command
+                        .arguments
+                        .iter()
+                        .find(|a| a.name == "ticks")
+                        .and_then(|a| match a.value {
+                            CommandArgumentValue::Integer(n) => Some(n),
+                            _ => None,
+                        });
+                    if let Some(n) = arg {
+                        state.spread_budget = (n.clamp(4, 1200)) as usize;
+                        state.dirty = true;
+                        format!(
+                            "[Rift Bleed] Spread speed set to {} ops/tick.",
+                            state.spread_budget
+                        )
+                    } else {
+                        "[Rift Bleed] Usage: /rift speed <4..1200>".to_owned()
+                    }
+                }
+                _ => "[Rift Bleed] Commands: /rift <status|scan|pause|resume|sealcheck|speed <ticks>>"
+                    .to_owned(),
+            }
+        } else {
+            "[Rift Bleed] Failed to lock mod state.".to_owned()
+        };
+
+        let _ = host.commands().feedback(Text::literal(msg));
+        Flow::Cancel
+    }
+
+    fn level_tick_post(&self, host: HostSide, event: &mut LevelTickPostEvent) {
+        let HostSide::Server(server) = host else {
+            return;
+        };
+        if event.level.dimension_id() != OVERWORLD {
+            return;
+        }
+
+        let pal = self.particles.lock().ok().and_then(|g| *g);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        ensure_world_initialized(server, &mut state);
+        state.tick = state.tick.wrapping_add(1);
+
+        while let Some(pos) = state.pending_portals.pop_front() {
+            register_or_refresh_rift(server, event.level, &mut state, pos);
+        }
+
+        evaluate_rift_containment(server, event.level, &mut state, false);
+        drain_water_evaporation(server, event.level, &mut state);
+
+        if state.tick % 20 == 0 {
+            sync_forced_chunks(server, event.level, &mut state);
+        }
+
+        spread_corruption_tick(server, event.level, &mut state);
+        mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
+        bastion::tick_bastion_emergence(server, event.level, &mut state);
+
+        if state.tick % 200 == 0 {
+            state.save_to_disk();
+        }
+    }
+
+    fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
+        if let Ok(mut atmo) = self.atmo.lock() {
+            *atmo = ClientAtmosphere::default();
+        }
+    }
+
+    fn client_level_unload(
+        &self,
+        _host: &mut dyn ClientHost,
+        _event: &mut ClientLevelUnloadEvent<'_>,
+    ) {
+        if let Ok(mut atmo) = self.atmo.lock() {
+            *atmo = ClientAtmosphere::default();
+        }
+    }
+
+    fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
+        let pal = self.particles.lock().ok().and_then(|g| *g);
+        if let Ok(mut atmo) = self.atmo.lock() {
+            atmosphere::tick_client_atmosphere(&mut atmo, host, pal.as_ref());
+        }
+    }
+
+    fn compute_fog_color(&self, _host: &dyn ClientHost, event: &mut ComputeFogColorEvent<'_>) {
+        if let Ok(atmo) = self.atmo.lock() {
+            atmosphere::apply_fog_color(&atmo, event);
+        }
+    }
+
+    fn render_fog(&self, _host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
+        if let Ok(atmo) = self.atmo.lock() {
+            atmosphere::apply_render_fog(&atmo, event);
+        }
+    }
+
+    fn music(&self, _host: &dyn ClientHost, event: &mut MusicEvent<'_>) {
+        if let Ok(atmo) = self.atmo.lock() {
+            atmosphere::apply_nether_music(&atmo, event);
+        }
+    }
+}

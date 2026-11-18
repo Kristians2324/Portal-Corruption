@@ -15,14 +15,6 @@ pub enum NetherFlavor {
 }
 
 impl NetherFlavor {
-    pub const ALL: [Self; 5] = [
-        Self::CrimsonForest,
-        Self::WarpedForest,
-        Self::SoulSandValley,
-        Self::BasaltDeltas,
-        Self::NetherWastes,
-    ];
-
     pub fn to_u8(self) -> u8 {
         self as u8
     }
@@ -34,16 +26,6 @@ impl NetherFlavor {
             2 => Self::SoulSandValley,
             3 => Self::BasaltDeltas,
             _ => Self::NetherWastes,
-        }
-    }
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::CrimsonForest => "crimson_forest",
-            Self::WarpedForest => "warped_forest",
-            Self::SoulSandValley => "soul_sand_valley",
-            Self::BasaltDeltas => "basalt_deltas",
-            Self::NetherWastes => "nether_wastes",
         }
     }
 
@@ -90,7 +72,7 @@ impl NetherFlavor {
     }
 
     /// Deterministically picks a core flavor for a portal at `center`, or
-    /// shifts smoothly across ~96-block regions as a large rift expands.
+    /// shifts seamlessly across ~96-block regions as a large rift expands.
     pub fn pick_for_region(x: i32, z: i32, salt: u64) -> Self {
         let rx = x.div_euclid(96);
         let rz = z.div_euclid(96);
@@ -142,10 +124,6 @@ pub fn strip_ns(name: &str) -> &str {
 
 pub fn quart_coords(pos: [i32; 3]) -> [i32; 3] {
     [pos[0] >> 2, pos[1] >> 2, pos[2] >> 2]
-}
-
-pub fn quart_block_origin(pos: [i32; 3]) -> [i32; 3] {
-    [(pos[0] >> 2) << 2, (pos[1] >> 2) << 2, (pos[2] >> 2) << 2]
 }
 
 pub fn spatial_hash(x: i32, y: i32, z: i32, salt: u64) -> u64 {

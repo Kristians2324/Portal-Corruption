@@ -1,5 +1,5 @@
 use crate::types::{BastionSite, NetherFlavor, RiftSource, build_ring_columns, quart_coords};
-use horizon_client::mod_api::serde_json::{self, Map, Value};
+use mod_api::serde_json::{self, Map, Value};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ pub struct PendingBastion {
     pub origin: [i32; 3],
     pub flavor: NetherFlavor,
     pub roll: u64,
-    pub tickets: Vec<[i32; 2]>,
+    pub forced_chunks: Vec<[i32; 2]>,
     pub queued_tick: u64,
 }
 
@@ -33,11 +33,11 @@ pub struct RiftState {
     pub nether_touched_mobs: HashSet<u32>,
     /// Tracks known living Nether predator entity IDs so `living_death` recognizes attackers cleanly.
     pub known_nether_mobs: HashSet<u32>,
-    /// Active chunk tickets held by Rift Bleed (`chunk_load_request` / `chunk_load_release`).
-    pub core_tickets: HashSet<[i32; 2]>,
-    pub frontier_tickets: VecDeque<[i32; 2]>,
+    /// Active chunk tickets held by Rift Bleed via `ChunkRef::set_forced`.
+    pub core_chunks: HashSet<[i32; 2]>,
+    pub frontier_chunks: VecDeque<[i32; 2]>,
     pub pending_bastion: Option<PendingBastion>,
-    pub bastion_release_tickets: Vec<[i32; 2]>,
+    pub bastion_release_chunks: Vec<[i32; 2]>,
     pub bastion_release_ttl: u8,
     /// Queues filled by read-only hooks and drained in `level_tick_post`.
     pub pending_portals: VecDeque<[i32; 3]>,
@@ -64,10 +64,10 @@ impl RiftState {
             corrupted_quart_cols: HashSet::new(),
             nether_touched_mobs: HashSet::new(),
             known_nether_mobs: HashSet::new(),
-            core_tickets: HashSet::new(),
-            frontier_tickets: VecDeque::new(),
+            core_chunks: HashSet::new(),
+            frontier_chunks: VecDeque::new(),
             pending_bastion: None,
-            bastion_release_tickets: Vec::new(),
+            bastion_release_chunks: Vec::new(),
             bastion_release_ttl: 0,
             pending_portals: VecDeque::new(),
             pending_containment_checks: Vec::new(),

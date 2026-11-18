@@ -1,6 +1,8 @@
 target/
+.horizon/
 **/*.rs.bk
 *.hnmod
+*.hmod
 *.exe
 __pycache__/
 *.pyc
