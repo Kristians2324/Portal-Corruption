@@ -675,6 +675,7 @@ fn release_all_chunk_tickets(host: &mut dyn Host, state: &mut RiftState) {
     while let Some(c) = state.frontier_tickets.pop_front() {
         let _ = host.chunk_load_release(OWNER_FRONTIER_TICKET, OVERWORLD, c);
     }
+    crate::bastion::release_bastion_tickets(host, state);
 }
 
 fn drain_pending_portals(host: &mut dyn Host, state: &mut RiftState) {

@@ -8,6 +8,7 @@ struct BridgeState {
     pending_mob_buffs: Vec<(u32, i32, i32, i32)>,
     pending_mob_targets: Vec<(u32, u32)>,
     pending_bastions: Vec<(String, [i32; 3], u8)>,
+    pending_bastion_jigsaws: Vec<([i32; 3], u8, u64)>,
     corrupted_quart_cells: HashSet<(i32, i32, i32)>,
     corrupted_quart_columns: HashSet<(i32, i32)>,
 }
@@ -24,6 +25,7 @@ pub fn reset_world_state() {
         guard.pending_mob_buffs.clear();
         guard.pending_mob_targets.clear();
         guard.pending_bastions.clear();
+        guard.pending_bastion_jigsaws.clear();
         guard.corrupted_quart_cells.clear();
         guard.corrupted_quart_columns.clear();
     }
@@ -125,5 +127,18 @@ pub fn drain_bastion_pieces() -> Vec<(String, [i32; 3], u8)> {
     state()
         .lock()
         .map(|mut g| std::mem::take(&mut g.pending_bastions))
+        .unwrap_or_default()
+}
+
+pub fn enqueue_bastion_jigsaw(pos: [i32; 3], flavor: u8, roll: u64) {
+    if let Ok(mut guard) = state().lock() {
+        guard.pending_bastion_jigsaws.push((pos, flavor, roll));
+    }
+}
+
+pub fn drain_bastion_jigsaws() -> Vec<([i32; 3], u8, u64)> {
+    state()
+        .lock()
+        .map(|mut g| std::mem::take(&mut g.pending_bastion_jigsaws))
         .unwrap_or_default()
 }

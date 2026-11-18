@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 
 const SAVE_FILE_NAME: &str = "rift_bleed.json";
 
+#[derive(Clone, Debug)]
+pub struct PendingBastion {
+    pub rift_id: u64,
+    pub origin: [i32; 3],
+    pub flavor: NetherFlavor,
+    pub roll: u64,
+    pub tickets: Vec<[i32; 2]>,
+    pub queued_tick: u64,
+}
+
 #[derive(Default)]
 pub struct RiftState {
     pub world_dir: Option<PathBuf>,
@@ -26,6 +36,9 @@ pub struct RiftState {
     /// Active chunk tickets held by Rift Bleed (`chunk_load_request` / `chunk_load_release`).
     pub core_tickets: HashSet<[i32; 2]>,
     pub frontier_tickets: VecDeque<[i32; 2]>,
+    pub pending_bastion: Option<PendingBastion>,
+    pub bastion_release_tickets: Vec<[i32; 2]>,
+    pub bastion_release_ttl: u8,
     /// Queues filled by read-only hooks and drained in `level_tick_post`.
     pub pending_portals: VecDeque<[i32; 3]>,
     pub pending_containment_checks: Vec<[i32; 3]>,
@@ -53,6 +66,9 @@ impl RiftState {
             known_nether_mobs: HashSet::new(),
             core_tickets: HashSet::new(),
             frontier_tickets: VecDeque::new(),
+            pending_bastion: None,
+            bastion_release_tickets: Vec::new(),
+            bastion_release_ttl: 0,
             pending_portals: VecDeque::new(),
             pending_containment_checks: Vec::new(),
             pending_water_evap: VecDeque::new(),

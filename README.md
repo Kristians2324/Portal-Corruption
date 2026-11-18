@@ -32,7 +32,7 @@
     - Chickens, Rabbits, Slimes, Wolves, Foxes, Cats → **Magma Cube**
     - Witches, Creepers → **Blaze**
   - Surviving Overworld hostiles gain Fire Resistance + Strength (**Nether-Touched**) with bonus Nether drops, and **Hoglins** near the border trample soils into crimson nylium/netherrack.
-  - Mature, large uncontained rifts spawn vanilla **Bastion Remnant** assemblies guarded by Piglin Brutes.
+  - Rare, massive, deeply corrupted regions (`>= 150k` blocks, radius `>= 52`, `>= 80%` local surface corrupted, and `>= 112` blocks away from all Overworld players) can form full vanilla Jigsaw **Bastion Remnants** with all Jigsaw/Structure technical blocks stripped and blackstone foundations grounded cleanly into terrain.
 
 ## Commands
 
