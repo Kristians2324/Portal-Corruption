@@ -11,26 +11,34 @@
 - **Breaking Portals Leaves a Rift Scar**:
   - Breaking or extinguishing an uncontained portal leaves an active **Rift Scar** emitting particles until the Scar itself is sealed inside Crying Obsidian.
   - Sealing a Rift stops new growth permanently (while the seal remains intact), leaving already-corrupted land permanently scarred.
-- **Scarred Overworld Corruption & Caves**:
-  - Converts terrain across the five Nether flavors (`crimson_forest`, `warped_forest`, `soul_sand_valley`, `basalt_deltas`, `nether_wastes`), updating chunk biome cells (`minecraft:overworld`) and syncing them to clients.
-  - Leaves ~14% scarred Overworld stone/deepslate/cobblestone/coarse-dirt/stripped-log remnants so zones feel torn apart rather than cloned.
-  - Protects Bedrock, containers, beds, beacons, workstations, and portal/containment blocks, and preserves `diamond_ore`, `redstone_ore`, `lapis_ore`, and `emerald_ore` (including deepslate variants).
+- **Circular Non-Stop Overworld & Underground Terraforming**:
+  - Expands evenly in concentric 360° circular rings (`build_ring_columns`) across the five Nether flavors (`crimson_forest`, `warped_forest`, `soul_sand_valley`, `basalt_deltas`, `nether_wastes`), updating full bedrock-to-sky biome columns on `minecraft:overworld` chunks.
+  - Holds rolling chunk-load tickets (`rift_bleed:core` + up to 4 sliding `rift_bleed:frontier` chunks) so uncontained Rifts keep corrupting non-stop even when no player is nearby.
+  - Corrupted columns warp surface terrain, trees, and underground stone/caves down to `Y = -63`, leaving ~14% scarred Overworld stone/deepslate/cobblestone/coarse-dirt/stripped-log remnants.
+  - Protects Bedrock, containers, beds, beacons, workstations, and portal/containment blocks, and preserves `diamond_ore`, `redstone_ore`, `lapis_ore`, and `emerald_ore` (plus deepslate variants).
   - **Caves stay breathable**: open cave air never floods with lava; water evaporates cleanly on contact; deep corrupted Deepslate (`Y = -32..-60`) in mature rifts rarely forms `minecraft:ancient_debris`.
   - **Beds stay safe** to use in corrupted Overworld zones, while water evaporates (`block.fire.extinguish` + smoke) and lava receives faster tick scheduling.
-- **Atmosphere & Vanilla Nether Music**:
-  - Volumetric heat-smog fog thickens inside corrupted zones, hiding the Overworld sun and clouds (`sky_end`/`cloud_end`) and drifting ash/spore/ember particles until you step back out.
+- **Volcanic Smog up to the Clouds & Vanilla Nether Music**:
+  - Dense volcanic smog shrouds vision (`env_end ~ 20–36`, `sky_end = 0.5`, `cloud_end = 0.5`) at ground level and medium flight height, keeping sun and clouds blocked until climbing above the cloud deck (`Y ~ 188..222`).
   - Plays vanilla Nether biome music (`minecraft:music.nether.*`) inside corrupted areas.
-- **Mobs & Bastions**:
+- **Nether Mob Hunting, Kill Conversions & Bastions**:
   - Prevents Piglin/Hoglin zombification inside corrupted Overworld zones.
-  - Mutates Overworld animals/undead caught in corruption (`pig`/`villager` → `piglin`, `cow`/`sheep`/`goat` → `hoglin`, `skeleton`/`stray` → `wither_skeleton`, `slime` → `magma_cube`) and buffs surviving Overworld hostiles as **Nether-Touched** (Fire Resistance + Strength + bonus Nether drops).
-  - **Hoglins** near the corruption frontier trample adjacent Overworld grass/dirt into crimson nylium/netherrack to expand the infection outward.
+  - Nether mobs (`Piglin`, `Piglin Brute`, `Hoglin`, `Wither Skeleton`, `Blaze`) actively hunt Overworld creatures; victims killed by Nether mobs or inside corruption convert into Nether versions:
+    - Pigs, Cows, Sheep, Goats, Horses, Donkeys, Llamas → **Hoglin**
+    - Villagers, Wandering Traders, Pillagers, Evokers → **Piglin**
+    - Iron Golems, Vindicators, Ravagers → **Piglin Brute**
+    - Zombies, Husks, Drowned → **Zombified Piglin**
+    - Skeletons, Strays, Spiders, Phantoms → **Wither Skeleton**
+    - Chickens, Rabbits, Slimes, Wolves, Foxes, Cats → **Magma Cube**
+    - Witches, Creepers → **Blaze**
+  - Surviving Overworld hostiles gain Fire Resistance + Strength (**Nether-Touched**) with bonus Nether drops, and **Hoglins** near the border trample soils into crimson nylium/netherrack.
   - Mature, large uncontained rifts spawn vanilla **Bastion Remnant** assemblies guarded by Piglin Brutes.
 
 ## Commands
 
-- `/rift status` — Show all tracked Portals/Rift Scars, containment status, flavor, radius, block count, and Bastions.
+- `/rift status` — Show all tracked Portals/Rift Scars, containment status, flavor, ring radius, block count, and Bastions.
 - `/rift scan` — Scan nearby loaded blocks for active Nether Portals.
-- `/rift speed <4..128>` *(OP level 2)* — Adjust frontier block spread budget per tick (default `28`).
+- `/rift speed <16..600>` *(OP level 2)* — Adjust block spread budget per tick (default `140`).
 - `/rift pause` / `/rift resume` *(OP level 2)* — Pause or resume Rift Bleed expansion.
 
 ## Layout & Building

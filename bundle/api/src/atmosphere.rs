@@ -5,9 +5,14 @@ use horizon_client::mod_api::{
     RenderFogEvent,
 };
 
+const CLOUD_FADE_START_Y: f64 = 188.0;
+const CLOUD_FADE_END_Y: f64 = 222.0;
+
 #[derive(Default)]
 pub struct ClientAtmosphere {
     pub smog_blend: f32,
+    pub player_y: f64,
+    pub height_above_ground: f32,
     pub active_flavor: Option<NetherFlavor>,
     pub tick_counter: u64,
     pub world_loaded: bool,
@@ -16,6 +21,8 @@ pub struct ClientAtmosphere {
 impl ClientAtmosphere {
     pub fn reset(&mut self) {
         self.smog_blend = 0.0;
+        self.player_y = 64.0;
+        self.height_above_ground = 0.0;
         self.active_flavor = None;
         self.tick_counter = 0;
         self.world_loaded = false;
@@ -23,7 +30,6 @@ impl ClientAtmosphere {
 }
 
 pub fn fog_target_rgb(flavor: NetherFlavor, time_phase: f32) -> [f32; 3] {
-    // Subtle shimmering furnace heat pulse across fog colors.
     let shimmer = (time_phase * 0.07).sin() * 0.015;
     let base = match flavor {
         NetherFlavor::CrimsonForest => [0.24, 0.055, 0.045],
@@ -39,56 +45,97 @@ pub fn fog_target_rgb(flavor: NetherFlavor, time_phase: f32) -> [f32; 3] {
     ]
 }
 
-fn sample_player_corruption(host: &dyn Host, pos: [i32; 3]) -> (f32, Option<NetherFlavor>) {
-    if let Some(flavor) = read_biome_flavor_at(host, pos) {
-        return (1.0, Some(flavor));
+/// Scales horizontal biome proximity against player altitude so vision remains
+/// shrouded in volcanic smog all the way up to the cloud layer (`Y ~ 188..222`).
+pub fn altitude_smog_factor(player_y: f64) -> f32 {
+    if player_y <= CLOUD_FADE_START_Y {
+        1.0
+    } else if player_y >= CLOUD_FADE_END_Y {
+        0.0
+    } else {
+        ((CLOUD_FADE_END_Y - player_y) / (CLOUD_FADE_END_Y - CLOUD_FADE_START_Y)) as f32
+    }
+}
+
+fn sample_player_corruption(host: &dyn Host, pos: [i32; 3], py: f64) -> (f32, f32, Option<NetherFlavor>) {
+    let alt_factor = altitude_smog_factor(py);
+    let height_above_ground = estimate_height_above_ground(host, pos, py);
+    if alt_factor <= 0.001 {
+        return (0.0, height_above_ground, None);
     }
 
-    // Smooth smog ramp right at the corrupted Overworld edge (+/- 10 blocks).
+    if let Some(flavor) = read_column_biome_flavor(host, pos[0], pos[1], pos[2]) {
+        return (alt_factor, height_above_ground, Some(flavor));
+    }
+
+    // Smooth smog gradient around corrupted borders (+/- 20 blocks).
     let offsets = [
-        [6, 0, 0],
-        [-6, 0, 0],
-        [0, 0, 6],
-        [0, 0, -6],
-        [0, -4, 0],
-        [10, 0, 10],
-        [-10, 0, -10],
+        [10, 0],
+        [-10, 0],
+        [0, 10],
+        [0, -10],
+        [18, 18],
+        [-18, -18],
+        [18, -18],
+        [-18, 18],
     ];
-    for off in offsets {
-        let p = [pos[0] + off[0], pos[1] + off[1], pos[2] + off[2]];
-        if let Some(flavor) = read_biome_flavor_at(host, p) {
-            let weight = if off[0].abs() <= 6 && off[2].abs() <= 6 {
-                0.55
+    for [dx, dz] in offsets {
+        if let Some(flavor) = read_column_biome_flavor(host, pos[0] + dx, pos[1], pos[2] + dz) {
+            let weight = if dx.abs() <= 10 && dz.abs() <= 10 {
+                0.7
             } else {
-                0.28
+                0.35
             };
-            return (weight, Some(flavor));
+            return (weight * alt_factor, height_above_ground, Some(flavor));
         }
     }
 
-    (0.0, None)
+    (0.0, height_above_ground, None)
 }
 
-fn read_biome_flavor_at(host: &dyn Host, pos: [i32; 3]) -> Option<NetherFlavor> {
+fn estimate_height_above_ground(host: &dyn Host, pos: [i32; 3], py: f64) -> f32 {
     let cx = pos[0] >> 4;
     let cz = pos[2] >> 4;
+    if let (Ok(chunks), Some(air)) = (
+        host.client_chunks([cx, cz], [cx, cz]),
+        host.default_state("minecraft:air"),
+    ) {
+        let start_y = pos[1].clamp(-60, 250);
+        for y in (-63..=start_y).rev() {
+            if chunks.block([pos[0], y, pos[2]]) != air {
+                return (py - f64::from(y + 1)).max(0.0) as f32;
+            }
+        }
+    }
+    (py - 64.0).max(0.0) as f32
+}
+
+fn read_column_biome_flavor(host: &dyn Host, x: i32, y: i32, z: i32) -> Option<NetherFlavor> {
+    let cx = x >> 4;
+    let cz = z >> 4;
+    let sample_ys = [y.clamp(-56, 200), 64, 32, 96, 0, -32, 140];
+
     if let (Ok(chunks), Some(biomes)) = (host.client_chunks([cx, cz], [cx, cz]), host.client_biomes())
-        && let Some(id) = chunks.biome(pos)
     {
-        let name = biomes.name(id);
-        if let Some(flavor) = NetherFlavor::from_name(name) {
+        for sy in sample_ys {
+            if let Some(id) = chunks.biome([x, sy, z])
+                && let Some(flavor) = NetherFlavor::from_name(biomes.name(id))
+            {
+                return Some(flavor);
+            }
+        }
+    }
+
+    for sy in [y.clamp(-56, 200), 64, 0, 128] {
+        if let Some(name) = host.biome([x, sy, z])
+            && let Some(flavor) = NetherFlavor::from_name(&name)
+        {
             return Some(flavor);
         }
     }
 
-    if let Some(name) = host.biome(pos)
-        && let Some(flavor) = NetherFlavor::from_name(&name)
-    {
-        return Some(flavor);
-    }
-
-    let q = quart_coords(pos);
-    if rift_bridge::is_quart_corrupted(q[0], q[1], q[2]) {
+    let q = quart_coords([x, y, z]);
+    if rift_bridge::is_quart_col_corrupted(q[0], q[2]) {
         return Some(NetherFlavor::CrimsonForest);
     }
 
@@ -109,28 +156,40 @@ pub fn tick_client_atmosphere(host: &mut dyn Host, atmo: &mut ClientAtmosphere) 
         return;
     }
 
+    atmo.player_y = player.y;
     let bp = [
         player.x.floor() as i32,
         player.y.floor() as i32,
         player.z.floor() as i32,
     ];
-    let (target_weight, detected_flavor) = sample_player_corruption(host, bp);
+    let (target_weight, height_above, detected_flavor) =
+        sample_player_corruption(host, bp, player.y);
+    atmo.height_above_ground = height_above;
+
     if let Some(flavor) = detected_flavor {
         atmo.active_flavor = Some(flavor);
     }
 
     if target_weight > atmo.smog_blend {
-        atmo.smog_blend = (atmo.smog_blend + 0.032).min(target_weight);
+        atmo.smog_blend = (atmo.smog_blend + 0.045).min(target_weight);
     } else {
-        atmo.smog_blend = (atmo.smog_blend - 0.025).max(target_weight);
+        atmo.smog_blend = (atmo.smog_blend - 0.03).max(target_weight);
         if atmo.smog_blend <= 0.01 {
             atmo.active_flavor = None;
         }
     }
 
-    if atmo.smog_blend >= 0.25 {
+    if atmo.smog_blend >= 0.2 {
         let flavor = atmo.active_flavor.unwrap_or(NetherFlavor::CrimsonForest);
-        spawn_heat_haze_particles(host, player.x, player.y, player.z, atmo.tick_counter, atmo.smog_blend, flavor);
+        spawn_heat_haze_particles(
+            host,
+            player.x,
+            player.y,
+            player.z,
+            atmo.tick_counter,
+            atmo.smog_blend,
+            flavor,
+        );
     }
 }
 
@@ -143,12 +202,12 @@ fn spawn_heat_haze_particles(
     blend: f32,
     flavor: NetherFlavor,
 ) {
-    let bursts = if blend > 0.75 { 4 } else { 2 };
+    let bursts = if blend > 0.7 { 5 } else { 2 };
     for i in 0..bursts {
         let h = spatial_hash(px as i32, py as i32, pz as i32, tick * 17 + i as u64);
         let ox = ((h & 255) as f64 / 255.0 - 0.5) * 18.0;
-        let oy = (((h >> 8) & 255) as f64 / 255.0) * 8.0 - 1.5;
-        let oz = (((h >> 16) & 255) as f64 / 255.0 - 0.5) * 18.0;
+        let oy = (((h >> 8) & 255) as f64 / 255.0) * 8.0 - 2.0;
+        let oz = (((h >> 16) & 255) as f64 / 255.0) * 18.0;
 
         let ty = match (flavor, (h >> 24) % 8) {
             (NetherFlavor::CrimsonForest, 0..=3) => ParticleType::CrimsonSpore,
@@ -184,10 +243,26 @@ pub fn apply_fog_color(atmo: &ClientAtmosphere, event: &mut ComputeFogColorEvent
     }
     let flavor = atmo.active_flavor.unwrap_or(NetherFlavor::CrimsonForest);
     let target = fog_target_rgb(flavor, atmo.tick_counter as f32 + event.partial);
-    let blend = (atmo.smog_blend * 0.94).clamp(0.0, 0.94);
+    let blend = (atmo.smog_blend * 0.98).clamp(0.0, 0.98);
     for i in 0..3 {
         event.rgb[i] = lerp(event.rgb[i], target[i], blend);
     }
+}
+
+pub fn compute_fog_ends(atmo: &ClientAtmosphere, partial: f32) -> (f32, f32, f32, f32) {
+    let wave = ((atmo.tick_counter as f32 + partial) * 0.09).sin() * 2.0;
+    // Low-to-medium height above corrupted ground: blind choking volcanic smog.
+    // High below the clouds: still heavily tainted & obscures sky/clouds until Y >= 190..222.
+    let high_relax = if atmo.height_above_ground <= 42.0 {
+        0.0
+    } else {
+        ((atmo.height_above_ground - 42.0) / 80.0).clamp(0.0, 1.0)
+    };
+    let env_start = lerp(0.0, 3.0, high_relax);
+    let env_end = (lerp(20.0, 36.0, high_relax) + wave).clamp(16.0, 44.0);
+    let sky_end = lerp(0.5, 2.0, high_relax);
+    let cloud_end = lerp(0.5, 1.5, high_relax);
+    (env_start, env_end, sky_end, cloud_end)
 }
 
 pub fn apply_render_fog(atmo: &ClientAtmosphere, event: &mut RenderFogEvent) {
@@ -195,16 +270,17 @@ pub fn apply_render_fog(atmo: &ClientAtmosphere, event: &mut RenderFogEvent) {
         return;
     }
     let b = atmo.smog_blend.clamp(0.0, 1.0);
-    let wave = ((atmo.tick_counter as f32 + event.partial) * 0.09).sin() * 2.5;
-    let target_end = (46.0 + wave).clamp(32.0, 60.0);
+    let (env_start, env_end, sky_end, cloud_end) = compute_fog_ends(atmo, event.partial);
 
-    // Choking volcanic smog swallows the sky dome and clouds inside corrupted biomes.
-    event.fog.sky_end = lerp(event.fog.sky_end, 3.0, b);
-    event.fog.cloud_end = lerp(event.fog.cloud_end, 2.0, b);
-    event.fog.environmental_start = lerp(event.fog.environmental_start, 3.5, b);
-    event.fog.environmental_end = lerp(event.fog.environmental_end, target_end, b);
-    event.fog.render_distance_start = lerp(event.fog.render_distance_start, 2.0, b * 0.85);
-    event.fog.render_distance_end = lerp(event.fog.render_distance_end, target_end + 10.0, b * 0.85);
+    // Swallow sky dome, sun glow, and clouds below cloud altitude, and pull in both
+    // environmental and render-distance fog ends so low/medium vision is thickly obscured.
+    event.fog.color[3] = lerp(event.fog.color[3], 1.0, b);
+    event.fog.sky_end = lerp(event.fog.sky_end, sky_end, b);
+    event.fog.cloud_end = lerp(event.fog.cloud_end, cloud_end, b);
+    event.fog.environmental_start = lerp(event.fog.environmental_start, env_start, b);
+    event.fog.environmental_end = lerp(event.fog.environmental_end, env_end, b);
+    event.fog.render_distance_start = lerp(event.fog.render_distance_start, env_start, b);
+    event.fog.render_distance_end = lerp(event.fog.render_distance_end, env_end + 4.0, b);
 }
 
 pub fn select_nether_music(atmo: &ClientAtmosphere) -> Option<Music> {
@@ -239,22 +315,38 @@ mod tests {
     }
 
     #[test]
-    fn smog_blend_selects_nether_music_and_red_crimson_haze() {
-        let mut atmo = ClientAtmosphere {
+    fn smog_stays_thick_below_clouds_and_clears_above_cloud_layer() {
+        assert_eq!(altitude_smog_factor(64.0), 1.0);
+        assert_eq!(altitude_smog_factor(140.0), 1.0);
+        assert_eq!(altitude_smog_factor(185.0), 1.0);
+        assert!(altitude_smog_factor(205.0) > 0.3 && altitude_smog_factor(205.0) < 0.7);
+        assert_eq!(altitude_smog_factor(225.0), 0.0);
+
+        let low = ClientAtmosphere {
             smog_blend: 1.0,
+            player_y: 80.0,
+            height_above_ground: 15.0,
             active_flavor: Some(NetherFlavor::CrimsonForest),
             tick_counter: 100,
             world_loaded: true,
         };
+        let (_, env_end, sky_end, cloud_end) = compute_fog_ends(&low, 0.0);
+        assert!(env_end <= 24.0);
+        assert!(sky_end <= 1.0);
+        assert!(cloud_end <= 1.0);
         assert_eq!(
-            select_nether_music(&atmo).map(|m| m.sound),
+            select_nether_music(&low).map(|m| m.sound),
             Some("minecraft:music.nether.crimson_forest".to_owned())
         );
 
-        let rgb = fog_target_rgb(NetherFlavor::CrimsonForest, 0.0);
-        assert!(rgb[0] > rgb[1] && rgb[0] > rgb[2]);
-
-        atmo.smog_blend = 0.0;
-        assert_eq!(select_nether_music(&atmo), None);
+        let above_clouds = ClientAtmosphere {
+            smog_blend: 0.0,
+            player_y: 230.0,
+            height_above_ground: 165.0,
+            active_flavor: None,
+            tick_counter: 100,
+            world_loaded: true,
+        };
+        assert_eq!(select_nether_music(&above_clouds), None);
     }
 }

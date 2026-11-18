@@ -6,28 +6,54 @@ use crate::types::{
 };
 use horizon_client::entry::rift_bridge;
 use horizon_client::mod_api::{
-    Compound, Host, ItemStack, NativeHeightmap, ParticleOptions, ParticleType, PotentialSpawnsEvent,
-    SpawnEntry, Tag,
+    Compound, Host, ItemStack, LivingDeathEvent, NativeHeightmap, ParticleOptions, ParticleType,
+    PotentialSpawnsEvent, SpawnEntry, Tag,
 };
 
-const MUTATION_INTERVAL_TICKS: u64 = 20;
+const MOB_TICK_INTERVAL: u64 = 20;
 const HOGLIN_SPREAD_INTERVAL_TICKS: u64 = 24;
-const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 120;
+const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
 
-/// Pure mapping of Overworld creatures caught in Nether-corrupted zones to
-/// existing vanilla Nether mobs (zero custom models required).
-pub fn nether_conversion_target(kind: &str) -> Option<&'static str> {
+/// True for Nether mobs native to or brought forth by Rifts.
+pub fn is_nether_predator(kind: &str) -> bool {
+    matches!(
+        strip_ns(kind),
+        "piglin"
+            | "piglin_brute"
+            | "hoglin"
+            | "zombified_piglin"
+            | "zoglin"
+            | "wither_skeleton"
+            | "blaze"
+            | "magma_cube"
+            | "ghast"
+    )
+}
+
+/// Maps any Overworld creature killed by Nether mobs (or dying inside corrupted
+/// territory) to its transformed Nether counterpart (using vanilla mobs/models).
+pub fn nether_death_conversion_target(kind: &str) -> Option<&'static str> {
     match strip_ns(kind) {
-        "pig" | "villager" | "wandering_trader" => Some("minecraft:piglin"),
-        "cow" | "mooshroom" | "sheep" | "goat" | "horse" | "donkey" => Some("minecraft:hoglin"),
-        "skeleton" | "stray" | "bogged" => Some("minecraft:wither_skeleton"),
-        "slime" => Some("minecraft:magma_cube"),
+        "pig" | "cow" | "mooshroom" | "sheep" | "goat" | "horse" | "donkey" | "mule"
+        | "llama" | "camel" | "sniffer" => Some("minecraft:hoglin"),
+        "villager" | "wandering_trader" | "pillager" | "evoker" | "illusioner" => {
+            Some("minecraft:piglin")
+        }
+        "iron_golem" | "vindicator" | "ravager" => Some("minecraft:piglin_brute"),
+        "zombie" | "husk" | "drowned" | "zombie_villager" => Some("minecraft:zombified_piglin"),
+        "skeleton" | "stray" | "bogged" | "spider" | "cave_spider" | "phantom" => {
+            Some("minecraft:wither_skeleton")
+        }
+        "slime" | "chicken" | "rabbit" | "wolf" | "cat" | "fox" | "frog" | "bat" => {
+            Some("minecraft:magma_cube")
+        }
+        "witch" | "creeper" | "breeze" => Some("minecraft:blaze"),
         _ => None,
     }
 }
 
-/// Hostile Overworld mobs that keep their body but gain Fire Resistance,
-/// Strength, ember trails, and Nether drops inside corrupted territory.
+/// Hostile Overworld mobs that gain Nether-Touched buffs & bonus drops while alive
+/// in corruption (and still transform on death when slain by Nether mobs).
 pub fn is_nether_touched_candidate(kind: &str) -> bool {
     matches!(
         strip_ns(kind),
@@ -71,8 +97,12 @@ pub fn pos_is_corrupted(host: &dyn Host, state: &RiftState, pos: [i32; 3]) -> bo
     if state.is_quart_corrupted(pos) {
         return true;
     }
-    if let Some(name) = host.biome(pos) {
-        return NetherFlavor::from_name(&name).is_some();
+    for sy in [pos[1].clamp(-56, 200), 64, 0] {
+        if let Some(name) = host.biome([pos[0], sy, pos[2]])
+            && NetherFlavor::from_name(&name).is_some()
+        {
+            return true;
+        }
     }
     false
 }
@@ -82,17 +112,17 @@ pub fn tick_mobs(host: &mut dyn Host, state: &mut RiftState) {
         return;
     }
 
-    let do_convert = state.tick % MUTATION_INTERVAL_TICKS == 5;
+    let do_combat = state.tick % MOB_TICK_INTERVAL == 5;
     let do_hoglin = state.tick % HOGLIN_SPREAD_INTERVAL_TICKS == 11;
     let do_spawn = state.tick % SUPPLEMENTAL_SPAWN_INTERVAL_TICKS == 45;
-    if !do_convert && !do_hoglin && !do_spawn {
+    if !do_combat && !do_hoglin && !do_spawn {
         return;
     }
 
     let entities = host.level_entities(OVERWORLD);
 
-    if do_convert {
-        process_mob_conversions(host, state, &entities);
+    if do_combat {
+        process_predator_hunting_and_buffs(host, state, &entities);
     }
     if do_hoglin {
         process_hoglin_edge_spreading(host, state, &entities);
@@ -102,65 +132,40 @@ pub fn tick_mobs(host: &mut dyn Host, state: &mut RiftState) {
     }
 }
 
-fn process_mob_conversions(
+/// Keeps Nether mob tracking updated, directs Nether mobs to actively hunt & kill
+/// Overworld creatures, and grants Fire Resistance / Strength to surviving Nether-Touched hostiles.
+fn process_predator_hunting_and_buffs(
     host: &mut dyn Host,
     state: &mut RiftState,
     entities: &[(u32, String, [f64; 3])],
 ) {
-    let mut converted_budget = 6usize;
+    let mut hunters: Vec<(u32, [f64; 3])> = Vec::new();
+    let mut prey: Vec<(u32, [f64; 3])> = Vec::new();
 
+    state.known_nether_mobs.clear();
     for (id, kind, pos) in entities {
+        if is_nether_predator(kind) {
+            state.known_nether_mobs.insert(*id);
+            if matches!(
+                strip_ns(kind),
+                "piglin" | "piglin_brute" | "hoglin" | "wither_skeleton" | "blaze" | "zoglin"
+            ) {
+                hunters.push((*id, *pos));
+            }
+            if is_piglin_or_hoglin(kind) && (state.tick + u64::from(*id)) % 80 < MOB_TICK_INTERVAL {
+                rift_bridge::enqueue_mob_buff(*id, 20 * 90, 0, 0);
+            }
+        } else if nether_death_conversion_target(kind).is_some() {
+            prey.push((*id, *pos));
+        }
+
         let bp = [
             pos[0].floor() as i32,
             pos[1].floor() as i32,
             pos[2].floor() as i32,
         ];
-        if !pos_is_corrupted(host, state, bp) {
-            continue;
-        }
-
-        if let Some(target_kind) = nether_conversion_target(kind) {
-            if converted_budget == 0 {
-                continue;
-            }
-            // Only transform mobs whose chunk is loaded and that stand above or inside corrupt ground.
-            if !host.remove_mob(OVERWORLD, *id) {
-                continue;
-            }
-            converted_budget -= 1;
-            let mut nbt = Compound::new();
-            if target_kind == "minecraft:piglin" || target_kind == "minecraft:hoglin" {
-                nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
-            }
-            if let Some(new_id) = host.summon(OVERWORLD, target_kind, *pos, nbt) {
-                state.nether_touched_mobs.insert(new_id);
-                rift_bridge::enqueue_mob_buff(new_id, 20 * 180, 20 * 120, 0);
-            }
-            if let Some(level) = host.level(OVERWORLD) {
-                let _ = level.send_particles(
-                    host,
-                    &ParticleOptions::simple(ParticleType::Flame),
-                    None,
-                    [pos[0], pos[1] + 0.9, pos[2]],
-                    [0.35, 0.45, 0.35],
-                    0.03,
-                    14,
-                );
-                let _ = level.play_sound(
-                    host,
-                    "minecraft:entity.zombie_villager.converted",
-                    *pos,
-                    5,
-                    0.8,
-                    0.9,
-                );
-            }
-            continue;
-        }
-
-        if is_nether_touched_candidate(kind) {
-            let newly_touched = state.nether_touched_mobs.insert(*id);
-            if newly_touched {
+        if is_nether_touched_candidate(kind) && pos_is_corrupted(host, state, bp) {
+            if state.nether_touched_mobs.insert(*id) {
                 rift_bridge::enqueue_mob_buff(*id, 20 * 600, 20 * 600, 0);
             }
             if let Some(level) = host.level(OVERWORLD) {
@@ -174,17 +179,114 @@ fn process_mob_conversions(
                     2,
                 );
             }
-        } else if is_piglin_or_hoglin(kind) && (state.tick + u64::from(*id)) % 80 < MUTATION_INTERVAL_TICKS
-        {
-            // Keep Overworld Piglins/Hoglins heat-resistant on magma & embers.
-            rift_bridge::enqueue_mob_buff(*id, 20 * 90, 0, 0);
         }
+    }
+
+    if hunters.is_empty() || prey.is_empty() {
+        return;
+    }
+
+    let mut pairs = Vec::new();
+    let hunt_range_sq = 32.0 * 32.0;
+
+    for (hunter_id, h_pos) in hunters {
+        let mut best: Option<(u32, f64)> = None;
+        for (prey_id, p_pos) in &prey {
+            let dx = h_pos[0] - p_pos[0];
+            let dy = h_pos[1] - p_pos[1];
+            let dz = h_pos[2] - p_pos[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 <= hunt_range_sq && best.is_none_or(|(_, b)| d2 < b) {
+                best = Some((*prey_id, d2));
+            }
+        }
+        if let Some((victim_id, _)) = best {
+            pairs.push((hunter_id, victim_id));
+        }
+    }
+
+    if !pairs.is_empty() {
+        rift_bridge::enqueue_mob_targets(&pairs);
+    }
+}
+
+/// Converts any Overworld creature killed by a Nether mob (or slain in corrupted
+/// territory) into its Nether version on death.
+pub fn handle_living_death(
+    host: &mut dyn Host,
+    state: &mut RiftState,
+    event: &LivingDeathEvent<'_>,
+) {
+    if strip_ns(event.kind) == "player" {
+        return;
+    }
+    let Some(target_kind) = nether_death_conversion_target(event.kind) else {
+        return;
+    };
+    let Some(pos) = host.entity(event.entity).and_then(|e| e.position(host)) else {
+        return;
+    };
+    let bp = [
+        pos[0].floor() as i32,
+        pos[1].floor() as i32,
+        pos[2].floor() as i32,
+    ];
+
+    let attacker_is_nether = event.attacker != 0
+        && (state.known_nether_mobs.contains(&event.attacker)
+            || state.nether_touched_mobs.contains(&event.attacker)
+            || host
+                .entity(event.attacker)
+                .and_then(|e| e.kind(host))
+                .is_some_and(|k| is_nether_predator(&k)));
+
+    if !attacker_is_nether && !pos_is_corrupted(host, state, bp) {
+        return;
+    }
+
+    let mut nbt = Compound::new();
+    if matches!(target_kind, "minecraft:piglin" | "minecraft:hoglin") {
+        nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+    }
+
+    if let Some(new_id) = host.summon(OVERWORLD, target_kind, pos, nbt) {
+        state.known_nether_mobs.insert(new_id);
+        rift_bridge::enqueue_mob_buff(new_id, 20 * 180, 20 * 120, 0);
+    }
+
+    if let Some(level) = host.level(OVERWORLD) {
+        let _ = level.send_particles(
+            host,
+            &ParticleOptions::simple(ParticleType::Flame),
+            None,
+            [pos[0], pos[1] + 0.8, pos[2]],
+            [0.45, 0.5, 0.45],
+            0.04,
+            18,
+        );
+        let _ = level.send_particles(
+            host,
+            &ParticleOptions::simple(ParticleType::CrimsonSpore),
+            None,
+            [pos[0], pos[1] + 0.8, pos[2]],
+            [0.5, 0.4, 0.5],
+            0.03,
+            12,
+        );
+        let _ = level.play_sound(
+            host,
+            "minecraft:entity.zombie_villager.converted",
+            pos,
+            5,
+            0.85,
+            0.9,
+        );
     }
 }
 
 /// Hoglins act as border vanguard: near the edge of corrupted land they root
 /// and trample uncorrupted Overworld grass/dirt into crimson nylium/netherrack
-/// and seed new frontier growth!
+/// and enqueue those columns cleanly!
 fn process_hoglin_edge_spreading(
     host: &mut dyn Host,
     state: &mut RiftState,
@@ -203,6 +305,7 @@ fn process_hoglin_edge_spreading(
 
     let mut total_trampled = 0usize;
     let mut biome_updates = Vec::new();
+    let mut quart_records = Vec::new();
 
     for (id, kind, pos) in entities {
         if total_trampled >= 8 {
@@ -219,12 +322,11 @@ fn process_hoglin_edge_spreading(
         if base[1] <= OVERWORLD_MIN_Y || base[1] >= OVERWORLD_MAX_Y - 2 {
             continue;
         }
-        // Must have some corrupted ground nearby to act as a frontier spreader.
         let near_corrupt = pos_is_corrupted(host, state, base)
             || state
                 .rifts
                 .iter()
-                .any(|r| !r.contained && horiz_dist_sq(r.center, base) <= r.max_radius_sq + 196);
+                .any(|r| !r.contained && horiz_dist_sq(r.center, base) <= r.max_radius_sq + 256);
         if !near_corrupt {
             continue;
         }
@@ -265,11 +367,11 @@ fn process_hoglin_edge_spreading(
                         {
                             let _ = host.set_block(OVERWORLD, [p[0], p[1] + 1, p[2]], r_id, 3);
                         }
-                        state.pending_frontier_injections.push_back(p);
+                        state.pending_frontier_columns.push_back([p[0], p[2]]);
                         if state.mark_quart_corrupted(p) {
                             let qb = quart_block_origin(p);
                             biome_updates.push((qb, NetherFlavor::CrimsonForest.to_u8()));
-                            rift_bridge::record_quart_cells(&[crate::types::quart_coords(p)]);
+                            quart_records.push(crate::types::quart_coords(p));
                         }
                         break;
                     }
@@ -300,6 +402,7 @@ fn process_hoglin_edge_spreading(
 
     if !biome_updates.is_empty() {
         rift_bridge::enqueue_biomes(&biome_updates);
+        rift_bridge::record_quart_cells(&quart_records);
         state.dirty = true;
     }
 }
@@ -309,31 +412,20 @@ fn process_supplemental_spawns(
     state: &mut RiftState,
     entities: &[(u32, String, [f64; 3])],
 ) {
-    let players = host.server_players();
-    if players.is_empty() {
-        return;
-    }
-
     let nether_mob_count = entities
         .iter()
-        .filter(|(_, k, _)| {
-            matches!(
-                strip_ns(k),
-                "piglin"
-                    | "piglin_brute"
-                    | "hoglin"
-                    | "wither_skeleton"
-                    | "magma_cube"
-                    | "ghast"
-                    | "blaze"
-            )
-        })
+        .filter(|(_, k, _)| is_nether_predator(k))
         .count();
-    if nether_mob_count >= 28 {
+    if nether_mob_count >= 34 {
         return;
     }
 
-    for player in players {
+    // First look for an uncontained rift near a player, else pick an active core
+    // (kept loaded by ticket) so invaders emerge into the world continuously.
+    let players = host.server_players();
+    let mut spawn_anchor: Option<(&crate::types::RiftSource, [i32; 3])> = None;
+
+    for player in &players {
         if player.dimension != OVERWORLD {
             continue;
         }
@@ -342,55 +434,70 @@ fn process_supplemental_spawns(
             player.position[1].floor() as i32,
             player.position[2].floor() as i32,
         ];
-        let Some(rift) = state
+        if let Some(rift) = state
             .rifts
             .iter()
             .filter(|r| horiz_dist_sq(r.center, pp) <= 96 * 96)
             .min_by_key(|r| dist_sq(r.center, pp))
-        else {
-            continue;
-        };
+        {
+            spawn_anchor = Some((rift, pp));
+            break;
+        }
+    }
 
-        let h = spatial_hash(pp[0], pp[1], pp[2], state.tick ^ rift.id);
-        let dx = ((h & 63) as i32) - 32;
-        let dz = (((h >> 8) & 63) as i32) - 32;
-        if dx * dx + dz * dz < 14 * 14 {
-            continue;
-        }
-        let sx = pp[0] + dx;
-        let sz = pp[2] + dz;
-        let Ok(heights) =
-            host.surface_heights(OVERWORLD, &[(sx, sz)], NativeHeightmap::MotionBlockingNoLeaves)
-        else {
-            continue;
-        };
-        let Some(Some(sy)) = heights.first().copied() else {
-            continue;
-        };
-        let ground = [sx, sy - 1, sz];
-        if !pos_is_corrupted(host, state, ground) {
-            continue;
-        }
-        let mob_kind = match (rift.flavor, (h >> 16) % 8) {
-            (NetherFlavor::CrimsonForest, 0..=3) => "minecraft:hoglin",
-            (NetherFlavor::CrimsonForest, 4..=6) => "minecraft:piglin",
-            (NetherFlavor::SoulSandValley, 0..=3) => "minecraft:wither_skeleton",
-            (NetherFlavor::BasaltDeltas, 0..=4) => "minecraft:magma_cube",
-            (_, 6) if rift.corrupted_blocks >= 3000 => "minecraft:blaze",
-            (_, 7) if rift.corrupted_blocks >= 6000 => "minecraft:ghast",
-            _ => "minecraft:piglin",
-        };
-        let spawn_y = if mob_kind == "minecraft:ghast" {
-            f64::from(sy + 14)
-        } else {
-            f64::from(sy)
-        };
-        let mut nbt = Compound::new();
-        if matches!(mob_kind, "minecraft:piglin" | "minecraft:hoglin") {
-            nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
-        }
-        let _ = host.summon(OVERWORLD, mob_kind, [f64::from(sx) + 0.5, spawn_y, f64::from(sz) + 0.5], nbt);
-        break;
+    if spawn_anchor.is_none()
+        && let Some(rift) = state.rifts.iter().find(|r| !r.contained)
+    {
+        spawn_anchor = Some((rift, rift.center));
+    }
+
+    let Some((rift, anchor)) = spawn_anchor else {
+        return;
+    };
+
+    let h = spatial_hash(anchor[0], anchor[1], anchor[2], state.tick ^ rift.id);
+    let dx = ((h & 31) as i32) - 16;
+    let dz = (((h >> 8) & 31) as i32) - 16;
+    let sx = anchor[0] + dx;
+    let sz = anchor[2] + dz;
+    let Ok(heights) =
+        host.surface_heights(OVERWORLD, &[(sx, sz)], NativeHeightmap::MotionBlockingNoLeaves)
+    else {
+        return;
+    };
+    let Some(Some(sy)) = heights.first().copied() else {
+        return;
+    };
+    let ground = [sx, sy - 1, sz];
+    if !pos_is_corrupted(host, state, ground) && horiz_dist_sq(rift.center, ground) > 16 * 16 {
+        return;
+    }
+
+    let mob_kind = match (rift.flavor, (h >> 16) % 8) {
+        (NetherFlavor::CrimsonForest, 0..=3) => "minecraft:hoglin",
+        (NetherFlavor::CrimsonForest, 4..=6) => "minecraft:piglin",
+        (NetherFlavor::SoulSandValley, 0..=3) => "minecraft:wither_skeleton",
+        (NetherFlavor::BasaltDeltas, 0..=4) => "minecraft:magma_cube",
+        (_, 6) if rift.corrupted_blocks >= 2_500 => "minecraft:blaze",
+        (_, 7) if rift.corrupted_blocks >= 5_000 => "minecraft:ghast",
+        _ => "minecraft:piglin",
+    };
+    let spawn_y = if mob_kind == "minecraft:ghast" {
+        f64::from(sy + 14)
+    } else {
+        f64::from(sy)
+    };
+    let mut nbt = Compound::new();
+    if matches!(mob_kind, "minecraft:piglin" | "minecraft:hoglin") {
+        nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+    }
+    if let Some(id) = host.summon(
+        OVERWORLD,
+        mob_kind,
+        [f64::from(sx) + 0.5, spawn_y, f64::from(sz) + 0.5],
+        nbt,
+    ) {
+        state.known_nether_mobs.insert(id);
     }
 }
 
@@ -464,14 +571,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_overworld_mobs_to_nether_counterparts() {
-        assert_eq!(nether_conversion_target("minecraft:pig"), Some("minecraft:piglin"));
-        assert_eq!(nether_conversion_target("minecraft:villager"), Some("minecraft:piglin"));
-        assert_eq!(nether_conversion_target("minecraft:cow"), Some("minecraft:hoglin"));
-        assert_eq!(nether_conversion_target("minecraft:sheep"), Some("minecraft:hoglin"));
-        assert_eq!(nether_conversion_target("minecraft:skeleton"), Some("minecraft:wither_skeleton"));
-        assert_eq!(nether_conversion_target("minecraft:slime"), Some("minecraft:magma_cube"));
-        assert_eq!(nether_conversion_target("minecraft:piglin"), None);
+    fn maps_killed_overworld_creatures_to_nether_versions() {
+        // Farm animals & beasts become Hoglins; villagers & traders become Piglins.
+        assert_eq!(nether_death_conversion_target("minecraft:pig"), Some("minecraft:hoglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:cow"), Some("minecraft:hoglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:sheep"), Some("minecraft:hoglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:villager"), Some("minecraft:piglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:wandering_trader"), Some("minecraft:piglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:iron_golem"), Some("minecraft:piglin_brute"));
+        assert_eq!(nether_death_conversion_target("minecraft:zombie"), Some("minecraft:zombified_piglin"));
+        assert_eq!(nether_death_conversion_target("minecraft:skeleton"), Some("minecraft:wither_skeleton"));
+        assert_eq!(nether_death_conversion_target("minecraft:slime"), Some("minecraft:magma_cube"));
+        assert_eq!(nether_death_conversion_target("minecraft:creeper"), Some("minecraft:blaze"));
+        // Nether predators don't convert into another victim.
+        assert_eq!(nether_death_conversion_target("minecraft:piglin"), None);
+        assert_eq!(nether_death_conversion_target("minecraft:hoglin"), None);
     }
 
     #[test]

@@ -6,8 +6,10 @@ struct BridgeState {
     pending_biomes: Vec<([i32; 3], u8)>,
     pending_fast_lava: Vec<([i32; 3], String)>,
     pending_mob_buffs: Vec<(u32, i32, i32, i32)>,
+    pending_mob_targets: Vec<(u32, u32)>,
     pending_bastions: Vec<(String, [i32; 3], u8)>,
     corrupted_quart_cells: HashSet<(i32, i32, i32)>,
+    corrupted_quart_columns: HashSet<(i32, i32)>,
 }
 
 fn state() -> &'static Mutex<BridgeState> {
@@ -20,8 +22,10 @@ pub fn reset_world_state() {
         guard.pending_biomes.clear();
         guard.pending_fast_lava.clear();
         guard.pending_mob_buffs.clear();
+        guard.pending_mob_targets.clear();
         guard.pending_bastions.clear();
         guard.corrupted_quart_cells.clear();
+        guard.corrupted_quart_columns.clear();
     }
 }
 
@@ -32,6 +36,7 @@ pub fn record_quart_cells(cells: &[[i32; 3]]) {
     if let Ok(mut guard) = state().lock() {
         for &[qx, qy, qz] in cells {
             guard.corrupted_quart_cells.insert((qx, qy, qz));
+            guard.corrupted_quart_columns.insert((qx, qz));
         }
     }
 }
@@ -39,7 +44,14 @@ pub fn record_quart_cells(cells: &[[i32; 3]]) {
 pub fn is_quart_corrupted(qx: i32, qy: i32, qz: i32) -> bool {
     state()
         .lock()
-        .map(|g| g.corrupted_quart_cells.contains(&(qx, qy, qz)))
+        .map(|g| g.corrupted_quart_cells.contains(&(qx, qy, qz)) || g.corrupted_quart_columns.contains(&(qx, qz)))
+        .unwrap_or(false)
+}
+
+pub fn is_quart_col_corrupted(qx: i32, qz: i32) -> bool {
+    state()
+        .lock()
+        .map(|g| g.corrupted_quart_columns.contains(&(qx, qz)))
         .unwrap_or(false)
 }
 
@@ -84,6 +96,22 @@ pub fn drain_mob_buffs() -> Vec<(u32, i32, i32, i32)> {
     state()
         .lock()
         .map(|mut g| std::mem::take(&mut g.pending_mob_buffs))
+        .unwrap_or_default()
+}
+
+pub fn enqueue_mob_targets(pairs: &[(u32, u32)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = state().lock() {
+        guard.pending_mob_targets.extend_from_slice(pairs);
+    }
+}
+
+pub fn drain_mob_targets() -> Vec<(u32, u32)> {
+    state()
+        .lock()
+        .map(|mut g| std::mem::take(&mut g.pending_mob_targets))
         .unwrap_or_default()
 }
 

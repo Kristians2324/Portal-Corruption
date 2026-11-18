@@ -16,25 +16,29 @@ use crate::containment::{
 };
 use crate::corruption::{allowed_min_y, is_air_like, is_water_like, transform_block};
 use crate::mobs::{
-    append_nether_touched_drops, augment_potential_spawns, pos_is_corrupted,
+    append_nether_touched_drops, augment_potential_spawns, handle_living_death, pos_is_corrupted,
     should_block_zombification, tick_mobs,
 };
-use crate::state::{MAX_FRONTIER_PER_RIFT, RiftState};
+use crate::state::RiftState;
 use crate::types::{
-    BEDROCK_FLOOR_Y, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource,
-    dist_sq, horiz_dist_sq, neighbors_6, quart_block_origin, quart_coords, spatial_hash, strip_ns,
+    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, build_ring_columns,
+    dist_sq, horiz_dist_sq, quart_block_origin, quart_coords, spatial_hash, strip_ns,
 };
 use horizon_client::entry::rift_bridge;
 use horizon_client::mod_api::{
-    BlockChangedEvent, BlockStateId, BucketEmptyEvent, ClientDisconnectingEvent,
+    BlockChangedEvent, BlockStateId, BucketEmptyEvent, ChunkLoadEvent, ClientDisconnectingEvent,
     ClientLevelLoadEvent, ClientTickPostEvent, ComputeFogColorEvent, Flow, FluidLevelChangeEvent,
     Hooks, Host, LevelDimension, LevelHost, LevelTickPostEvent, LivingConversionPreEvent,
-    LootDropsEvent, MusicEvent, NativeBlockEdit, NativeBlockRun, NativeCommand, NativeHeightmap,
-    ParticleOptions, ParticleType, PerformCommandEvent, PortalCreateEvent, PotentialSpawnsEvent,
-    RegisterCommandsEvent, RenderFogEvent, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
+    LivingDeathEvent, LootDropsEvent, MusicEvent, NativeBlockEdit, NativeBlockRun, NativeCommand,
+    NativeHeightmap, ParticleOptions, ParticleType, PerformCommandEvent, PortalCreateEvent,
+    PotentialSpawnsEvent, RegisterCommandsEvent, RenderFogEvent, Text, WorldLifecycleEvent,
+    WorldPhase, WorldSavedEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+
+const OWNER_CORE_TICKET: &str = "rift_bleed:core";
+const OWNER_FRONTIER_TICKET: &str = "rift_bleed:frontier";
 
 struct RuntimeState {
     server: RiftState,
@@ -94,7 +98,6 @@ struct HostContainmentView<'a> {
 
 impl ContainmentView for HostContainmentView<'_> {
     fn block_name(&self, pos: [i32; 3]) -> Option<String> {
-        // `biome(pos)` returns `None` when the column's chunk is unloaded.
         self.host.biome(pos)?;
         Some(self.host.block(pos))
     }
@@ -123,18 +126,30 @@ impl Hooks for RiftBleedMod {
                         acc.wrapping_mul(131).wrapping_add(i64::from(b))
                     })
                 });
+                let mut local = RiftState::new();
+                local.reset_for_world(world_dir, seed_hint);
+                let cells: Vec<[i32; 3]> = local
+                    .corrupted_quart_cols
+                    .iter()
+                    .map(|[qx, qz]| [*qx, 16, *qz])
+                    .collect();
+                rift_bridge::record_quart_cells(&cells);
+                manage_rift_chunk_tickets(host, &mut local);
                 if let Ok(mut rt) = runtime().lock() {
-                    rt.server.reset_for_world(world_dir, seed_hint);
-                    let cells: Vec<[i32; 3]> = rt.server.corrupted_quarts.iter().copied().collect();
-                    rift_bridge::record_quart_cells(&cells);
+                    rt.server = local;
                 }
             }
             WorldPhase::WorldCloseFinal | WorldPhase::WorldOpenFailed | WorldPhase::WorldCloseFailed => {
-                if let Ok(mut rt) = runtime().lock() {
-                    rt.server.dirty = true;
-                    rt.server.save_to_disk();
+                let mut local = {
+                    let Ok(mut rt) = runtime().lock() else {
+                        return;
+                    };
                     rt.client.reset();
-                }
+                    std::mem::replace(&mut rt.server, RiftState::new())
+                };
+                release_all_chunk_tickets(host, &mut local);
+                local.dirty = true;
+                local.save_to_disk();
                 rift_bridge::reset_world_state();
             }
             _ => {}
@@ -155,6 +170,8 @@ impl Hooks for RiftBleedMod {
             rt.server.pending_portals.push_back(event.pos);
         }
     }
+
+    fn chunk_load(&self, _host: &mut dyn Host, _event: &mut ChunkLoadEvent<'_>) {}
 
     fn block_changed(&self, level: &dyn LevelHost, event: &mut BlockChangedEvent) {
         if level.is_client_side() || event.dimension != LevelDimension::Overworld {
@@ -177,7 +194,6 @@ impl Hooks for RiftBleedMod {
             }
         }
 
-        // Watch any change within 22 blocks of an existing source (for doors, seals, broken portals).
         let near_source = rt
             .server
             .rifts
@@ -282,6 +298,26 @@ impl Hooks for RiftBleedMod {
         }
     }
 
+    fn living_death(&self, host: &mut dyn Host, event: &mut LivingDeathEvent<'_>) -> Flow {
+        let mut local_server = {
+            let Ok(mut rt) = runtime().lock() else {
+                return Flow::Continue;
+            };
+            std::mem::replace(&mut rt.server, RiftState::new())
+        };
+        handle_living_death(host, &mut local_server, event);
+        if let Ok(mut rt) = runtime().lock() {
+            let extra_portals = std::mem::take(&mut rt.server.pending_portals);
+            let extra_checks = std::mem::take(&mut rt.server.pending_containment_checks);
+            let extra_water = std::mem::take(&mut rt.server.pending_water_evap);
+            local_server.pending_portals.extend(extra_portals);
+            local_server.pending_containment_checks.extend(extra_checks);
+            local_server.pending_water_evap.extend(extra_water);
+            rt.server = local_server;
+        }
+        Flow::Continue
+    }
+
     fn potential_spawns(&self, _host: &dyn Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {
         if let Ok(rt) = runtime().lock() {
             augment_potential_spawns(&rt.server, event);
@@ -321,6 +357,9 @@ impl Hooks for RiftBleedMod {
             scan_near_players_for_untracked_portals(host, &mut local_server);
         }
         process_containment_checks(host, &mut local_server);
+        if local_server.tick % 10 == 1 {
+            manage_rift_chunk_tickets(host, &mut local_server);
+        }
         process_water_evaporation(host, &mut local_server);
         spread_corruption_step(host, &mut local_server);
         emit_rift_ambient_effects(host, &local_server);
@@ -332,7 +371,6 @@ impl Hooks for RiftBleedMod {
         }
 
         if let Ok(mut rt) = runtime().lock() {
-            // Merge any items pushed to queues during this tick while local_server ran.
             let extra_portals = std::mem::take(&mut rt.server.pending_portals);
             let extra_checks = std::mem::take(&mut rt.server.pending_containment_checks);
             let extra_water = std::mem::take(&mut rt.server.pending_water_evap);
@@ -409,7 +447,7 @@ impl Hooks for RiftBleedMod {
         if parts.is_empty() {
             let _ = host.tell(
                 event.player.uuid,
-                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <4..128>"),
+                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <16..600>"),
             );
             return Flow::Cancel;
         }
@@ -435,11 +473,10 @@ impl Hooks for RiftBleedMod {
                     for r in &s.rifts {
                         let status = if r.contained { "CONTAINED" } else { "LEAKING" };
                         let kind = if r.active_portal { "Portal" } else { "Scar" };
-                        let radius = ((r.max_radius_sq as f64).sqrt()) as i32;
                         let _ = host.tell(
                             event.player.uuid,
                             Text::literal(format!(
-                                "  #{} [{} | {} | {}] at ({},{},{}) radius={} blocks={}",
+                                "  #{} [{} | {} | {}] at ({},{},{}) ring={} deep={} blocks={}",
                                 r.id,
                                 status,
                                 kind,
@@ -447,7 +484,8 @@ impl Hooks for RiftBleedMod {
                                 r.center[0],
                                 r.center[1],
                                 r.center[2],
-                                radius,
+                                r.ring_radius,
+                                r.deepen_radius,
                                 r.corrupted_blocks
                             )),
                         );
@@ -488,25 +526,104 @@ impl Hooks for RiftBleedMod {
             }
             "speed" if event.player.permission >= 2 && parts.len() >= 2 => {
                 if let Ok(val) = parts[1].parse::<usize>() {
-                    let clamped = val.clamp(4, 128);
+                    let clamped = val.clamp(16, 600);
                     if let Ok(mut rt) = runtime().lock() {
                         rt.server.spread_budget = clamped;
                         rt.server.dirty = true;
                     }
                     let _ = host.tell(
                         event.player.uuid,
-                        Text::literal(format!("[Rift Bleed] Spread budget set to {clamped} blocks/tick.")),
+                        Text::literal(format!("[Rift Bleed] Spread budget set to {clamped} ops/tick.")),
                     );
                 } else {
                     let _ = host.tell(
                         event.player.uuid,
-                        Text::literal("[Rift Bleed] Usage: /rift speed <4..128>"),
+                        Text::literal("[Rift Bleed] Usage: /rift speed <16..600>"),
                     );
                 }
                 Flow::Cancel
             }
             _ => Flow::Continue,
         }
+    }
+}
+
+fn manage_rift_chunk_tickets(host: &mut dyn Host, state: &mut RiftState) {
+    let mut desired_cores = HashSet::new();
+    let mut desired_frontiers: Vec<[i32; 2]> = Vec::new();
+
+    for rift in &state.rifts {
+        if rift.contained {
+            continue;
+        }
+        desired_cores.insert([rift.center[0] >> 4, rift.center[2] >> 4]);
+        if let Some((col, _, _)) = rift.active_column {
+            let chunk = [col[0] >> 4, col[1] >> 4];
+            if !desired_frontiers.contains(&chunk) {
+                desired_frontiers.push(chunk);
+            }
+        }
+        // Look ahead along the current ring and deepen queues so upcoming chunks
+        // are already loaded before the cursor steps onto them.
+        for col in rift.ring_columns.iter().rev().take(48) {
+            let chunk = [col[0] >> 4, col[1] >> 4];
+            if !desired_frontiers.contains(&chunk) {
+                desired_frontiers.push(chunk);
+                if desired_frontiers.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        if desired_frontiers.len() < 4 {
+            for col in rift.deepen_columns.iter().rev().take(24) {
+                let chunk = [col[0] >> 4, col[1] >> 4];
+                if !desired_frontiers.contains(&chunk) {
+                    desired_frontiers.push(chunk);
+                    if desired_frontiers.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Release unneeded core tickets (for sealed rifts).
+    let old_cores: Vec<[i32; 2]> = state.core_tickets.difference(&desired_cores).copied().collect();
+    for c in old_cores {
+        let _ = host.chunk_load_release(OWNER_CORE_TICKET, OVERWORLD, c);
+        state.core_tickets.remove(&c);
+    }
+    for c in desired_cores {
+        if state.core_tickets.insert(c) {
+            let _ = host.chunk_load_request(OWNER_CORE_TICKET, OVERWORLD, c);
+        }
+    }
+
+    // Update bounded sliding window (max 4 frontier chunks at a time).
+    let desired_set: HashSet<[i32; 2]> = desired_frontiers.iter().copied().collect();
+    while let Some(front) = state.frontier_tickets.front().copied() {
+        if state.frontier_tickets.len() > 4 || !desired_set.contains(&front) {
+            state.frontier_tickets.pop_front();
+            let _ = host.chunk_load_release(OWNER_FRONTIER_TICKET, OVERWORLD, front);
+        } else {
+            break;
+        }
+    }
+    for c in desired_frontiers {
+        if !state.frontier_tickets.contains(&c) && state.frontier_tickets.len() < 4 {
+            if host.chunk_load_request(OWNER_FRONTIER_TICKET, OVERWORLD, c) {
+                state.frontier_tickets.push_back(c);
+            }
+        }
+    }
+}
+
+fn release_all_chunk_tickets(host: &mut dyn Host, state: &mut RiftState) {
+    for c in state.core_tickets.drain() {
+        let _ = host.chunk_load_release(OWNER_CORE_TICKET, OVERWORLD, c);
+    }
+    while let Some(c) = state.frontier_tickets.pop_front() {
+        let _ = host.chunk_load_release(OWNER_FRONTIER_TICKET, OVERWORLD, c);
     }
 }
 
@@ -529,12 +646,8 @@ fn drain_pending_portals(host: &mut dyn Host, state: &mut RiftState) {
         state.next_id += 1;
         let flavor = NetherFlavor::pick_for_region(centroid[0], centroid[2], state.seed ^ id);
         let contained = matches!(evaluate_chamber(&view, &seeds), ContainmentOutcome::Contained);
-        let mut frontier = Vec::new();
-        if !contained {
-            for s in &seeds {
-                frontier.extend(neighbors_6(*s));
-            }
-        }
+        let ring_columns = build_ring_columns(centroid[0], centroid[2], 1);
+
         state.rifts.push(RiftSource {
             id,
             center: centroid,
@@ -544,7 +657,11 @@ fn drain_pending_portals(host: &mut dyn Host, state: &mut RiftState) {
             age_ticks: 0,
             corrupted_blocks: 0,
             max_radius_sq: 0,
-            frontier,
+            ring_radius: 1,
+            ring_columns,
+            active_column: None,
+            deepen_radius: 1,
+            deepen_columns: Vec::new(),
             bastions_placed: 0,
         });
         state.dirty = true;
@@ -567,6 +684,7 @@ fn drain_pending_portals(host: &mut dyn Host, state: &mut RiftState) {
         broadcast_overworld(host, &msg);
     }
     if registered_any {
+        manage_rift_chunk_tickets(host, state);
         state.save_to_disk();
     }
 }
@@ -582,8 +700,6 @@ fn scan_near_players_for_untracked_portals(host: &mut dyn Host, state: &mut Rift
             player.position[1].floor() as i32,
             player.position[2].floor() as i32,
         ];
-        // Lightweight spiral probe of up to 48 columns per cycle around player to catch
-        // pre-existing or plugin-lit active portals without lagging.
         for i in 0..48u64 {
             let h = spatial_hash(bp[0], bp[1], bp[2], state.tick.wrapping_add(i));
             let dx = ((h & 31) as i32) - 16;
@@ -643,6 +759,7 @@ fn process_containment_checks(host: &mut dyn Host, state: &mut RiftState) {
 
     let triggers = std::mem::take(&mut state.pending_containment_checks);
     let mut alerts: Vec<(String, Option<([i32; 3], &'static str, f32)>)> = Vec::new();
+    let mut ticket_change = false;
 
     {
         let view = HostContainmentView { host };
@@ -674,6 +791,7 @@ fn process_containment_checks(host: &mut dyn Host, state: &mut RiftState) {
                     if !prev_contained {
                         state.rifts[idx].contained = true;
                         state.dirty = true;
+                        ticket_change = true;
                         let kind = if lit { "Portal" } else { "Rift Scar" };
                         let msg = format!(
                             "[Rift Bleed] {kind} at ({}, {}, {}) has been sealed inside Crying Obsidian! Corruption halted.",
@@ -689,8 +807,11 @@ fn process_containment_checks(host: &mut dyn Host, state: &mut RiftState) {
                     if prev_contained {
                         state.rifts[idx].contained = false;
                         state.dirty = true;
-                        for s in &seeds {
-                            state.rifts[idx].frontier.extend(neighbors_6(*s));
+                        ticket_change = true;
+                        if state.rifts[idx].ring_columns.is_empty() {
+                            let r = state.rifts[idx].ring_radius;
+                            state.rifts[idx].ring_columns =
+                                build_ring_columns(updated_center[0], updated_center[2], r);
                         }
                         let msg = format!(
                             "[Rift Bleed] Containment breached at ({}, {}, {})! Corruption resumes bleeding into the Overworld!",
@@ -711,6 +832,10 @@ fn process_containment_checks(host: &mut dyn Host, state: &mut RiftState) {
                 }
             }
         }
+    }
+
+    if ticket_change {
+        manage_rift_chunk_tickets(host, state);
     }
 
     for (msg, sound) in alerts {
@@ -780,6 +905,9 @@ fn evaporate_fx(host: &mut dyn Host, pos: [i32; 3]) {
     }
 }
 
+/// Continuously expands every uncontained Rift in concentric 360-degree circles,
+/// corrupting both the surface and full underground rock/cave columns down toward
+/// bedrock `-63`, even while no player is nearby.
 fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
     if state.paused {
         return;
@@ -796,22 +924,8 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
         return;
     }
 
-    // Feed Hoglin-trampled coordinates into the nearest active rift frontier.
-    while let Some(p) = state.pending_frontier_injections.pop_front() {
-        if let Some(rift) = state
-            .rifts
-            .iter_mut()
-            .filter(|r| !r.contained)
-            .min_by_key(|r| dist_sq(r.center, p))
-        {
-            for n in neighbors_6(p) {
-                rift.frontier.push(n);
-            }
-        }
-    }
-
-    let total_budget = state.spread_budget.max(4);
-    let per_rift_budget = (total_budget / active_indices.len()).max(4);
+    let total_budget = state.spread_budget.max(16);
+    let per_rift_budget = (total_budget / active_indices.len()).max(16);
     let mut edit = NativeBlockEdit {
         palette: Vec::new(),
         filters: Vec::new(),
@@ -823,137 +937,175 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
     let mut biome_updates: Vec<([i32; 3], u8)> = Vec::new();
     let mut quart_records: Vec<[i32; 3]> = Vec::new();
     let mut lava_nudges: Vec<([i32; 3], String)> = Vec::new();
-    let mut staged_positions: HashSet<[i32; 3]> = HashSet::new();
 
     for rift_idx in active_indices {
         state.rifts[rift_idx].age_ticks += 1;
-
-        if state.rifts[rift_idx].frontier.is_empty() {
-            seed_fallback_frontier(host, &mut state.rifts[rift_idx]);
-        }
 
         let rift_id = state.rifts[rift_idx].id;
         let rift_center = state.rifts[rift_idx].center;
         let rift_flavor = state.rifts[rift_idx].flavor;
         let rift_age = state.rifts[rift_idx].age_ticks;
-        let rift_mature = state.rifts[rift_idx].corrupted_blocks >= 4_000;
+        let rift_mature = state.rifts[rift_idx].corrupted_blocks >= 2_000;
         let seed = state.seed;
 
-        let mut remaining = per_rift_budget;
-        let mut attempts = per_rift_budget * 5;
-        let mut deferred = Vec::new();
+        let mut remaining_writes = per_rift_budget;
+        let mut scan_budget = per_rift_budget * 8;
 
-        while remaining > 0 && attempts > 0 {
-            attempts -= 1;
-            let len = state.rifts[rift_idx].frontier.len();
-            if len == 0 {
-                break;
-            }
-            // Pick pseudo-randomly from the frontier tail/middle for organic jagged tendrils.
-            let pick = if len <= 16 {
-                len - 1
-            } else {
-                let window = len.min(48);
-                let h = spatial_hash(
-                    rift_center[0],
-                    attempts as i32,
-                    rift_center[2],
-                    rift_age ^ rift_id,
-                );
-                len - 1 - ((h as usize) % window)
-            };
-            let pos = state.rifts[rift_idx].frontier.swap_remove(pick);
-            if pos[1] < BEDROCK_FLOOR_Y || pos[1] >= OVERWORLD_MAX_Y || !staged_positions.insert(pos)
-            {
-                continue;
-            }
+        while remaining_writes > 0 && scan_budget > 0 {
+            // Pull next column if no active vertical column is currently in progress.
+            if state.rifts[rift_idx].active_column.is_none() {
+                let is_deepen_turn = state.tick % 4 == 0
+                    && state.rifts[rift_idx].deepen_radius < state.rifts[rift_idx].ring_radius
+                    && rift_mature;
 
-            let hdist = (horiz_dist_sq(pos, rift_center) as f64).sqrt() as i32;
-            let min_y = allowed_min_y(
-                rift_center[1],
-                rift_age,
-                hdist,
-                state.rifts[rift_idx].corrupted_blocks,
-            );
-            if pos[1] < min_y {
-                continue;
-            }
+                let next_col = if is_deepen_turn {
+                    if state.rifts[rift_idx].deepen_columns.is_empty() {
+                        state.rifts[rift_idx].deepen_radius += 1;
+                        let dr = state.rifts[rift_idx].deepen_radius;
+                        state.rifts[rift_idx].deepen_columns =
+                            build_ring_columns(rift_center[0], rift_center[2], dr);
+                    }
+                    state.rifts[rift_idx].deepen_columns.pop()
+                } else if let Some(hcol) = state.pending_frontier_columns.pop_front() {
+                    Some(hcol)
+                } else {
+                    if state.rifts[rift_idx].ring_columns.is_empty() {
+                        state.rifts[rift_idx].ring_radius += 1;
+                        let r = state.rifts[rift_idx].ring_radius;
+                        state.rifts[rift_idx].ring_columns =
+                            build_ring_columns(rift_center[0], rift_center[2], r);
+                        state.dirty = true;
+                    }
+                    state.rifts[rift_idx].ring_columns.pop()
+                };
 
-            if host.biome(pos).is_none() {
-                if deferred.len() < 256 {
-                    deferred.push(pos);
+                let Some(col) = next_col else {
+                    break;
+                };
+
+                // Require column chunk to be loaded (or wait a tick for ticketed chunk to load).
+                if host.biome([col[0], 64, col[1]]).is_none() {
+                    let chunk = [col[0] >> 4, col[1] >> 4];
+                    let _ = host.chunk_load_request(OWNER_FRONTIER_TICKET, OVERWORLD, chunk);
+                    if is_deepen_turn {
+                        state.rifts[rift_idx].deepen_columns.push(col);
+                    } else {
+                        state.rifts[rift_idx].ring_columns.push(col);
+                    }
+                    break;
                 }
-                continue;
-            }
 
-            let cur = host.block(pos);
-            let above = host.block([pos[0], pos[1] + 1, pos[2]]);
-            let below = host.block([pos[0], pos[1] - 1, pos[2]]);
-            let local_flavor = if hdist < 26 {
-                rift_flavor
-            } else {
-                NetherFlavor::pick_for_region(pos[0], pos[2], seed ^ rift_id)
-            };
+                let hdist = (horiz_dist_sq(
+                    [col[0], rift_center[1], col[1]],
+                    rift_center,
+                ) as f64)
+                    .sqrt() as i32;
+                let min_y = allowed_min_y(
+                    rift_center[1],
+                    rift_age,
+                    hdist,
+                    state.rifts[rift_idx].corrupted_blocks,
+                );
 
-            let outcome = transform_block(pos, &cur, &above, &below, local_flavor, rift_mature);
+                let top_y = host
+                    .surface_heights(OVERWORLD, &[(col[0], col[1])], NativeHeightmap::WorldSurface)
+                    .ok()
+                    .and_then(|v| v.into_iter().next().flatten())
+                    .map(|y| (y + 1).clamp(min_y, OVERWORLD_MAX_Y - 1))
+                    .unwrap_or_else(|| (rift_center[1] + 24).clamp(min_y, OVERWORLD_MAX_Y - 1));
 
-            if let Some(new_block) = outcome.block {
-                push_edit(&mut edit, &mut palette_map, pos, new_block);
-                remaining -= 1;
-                state.rifts[rift_idx].corrupted_blocks += 1;
-                let r_sq = horiz_dist_sq(pos, rift_center);
+                let start_y = if is_deepen_turn {
+                    top_y.min(rift_center[1] - 12).max(min_y)
+                } else {
+                    top_y
+                };
+
+                // Paint the full 4x4x4 quart biome column for this `(x, z)` immediately.
+                let local_flavor = if hdist < 28 {
+                    rift_flavor
+                } else {
+                    NetherFlavor::pick_for_region(col[0], col[1], seed ^ rift_id)
+                };
+                if state.mark_quart_corrupted([col[0], start_y, col[1]]) {
+                    biome_updates.push((
+                        quart_block_origin([col[0], start_y, col[1]]),
+                        local_flavor.to_u8(),
+                    ));
+                    quart_records.push(quart_coords([col[0], start_y, col[1]]));
+                }
+
+                let r_sq = horiz_dist_sq([col[0], 0, col[1]], rift_center);
                 if r_sq > state.rifts[rift_idx].max_radius_sq {
                     state.rifts[rift_idx].max_radius_sq = r_sq;
                 }
-                state.dirty = true;
-            }
-            if let Some(above_block) = outcome.above
-                && is_air_like(&above)
-            {
-                push_edit(
-                    &mut edit,
-                    &mut palette_map,
-                    [pos[0], pos[1] + 1, pos[2]],
-                    above_block,
-                );
-            }
-            if let Some(below_block) = outcome.below
-                && is_air_like(&below)
-            {
-                push_edit(
-                    &mut edit,
-                    &mut palette_map,
-                    [pos[0], pos[1] - 1, pos[2]],
-                    below_block,
-                );
+
+                state.rifts[rift_idx].active_column = Some((col, start_y, min_y));
             }
 
-            if outcome.is_corrupt {
-                if matches!(strip_ns(&cur), "lava" | "flowing_lava") {
-                    lava_nudges.push((pos, cur));
+            let Some((col, mut cur_y, min_y)) = state.rifts[rift_idx].active_column else {
+                break;
+            };
+            if host.biome([col[0], 64, col[1]]).is_none() {
+                break;
+            }
+
+            let hdist = (horiz_dist_sq([col[0], rift_center[1], col[1]], rift_center) as f64).sqrt()
+                as i32;
+            let local_flavor = if hdist < 28 {
+                rift_flavor
+            } else {
+                NetherFlavor::pick_for_region(col[0], col[1], seed ^ rift_id)
+            };
+
+            while cur_y >= min_y && remaining_writes > 0 && scan_budget > 0 {
+                scan_budget -= 1;
+                let pos = [col[0], cur_y, col[1]];
+                let cur = host.block(pos);
+
+                if !is_air_like(&cur) {
+                    let above = host.block([pos[0], pos[1] + 1, pos[2]]);
+                    let below = host.block([pos[0], pos[1] - 1, pos[2]]);
+                    let outcome =
+                        transform_block(pos, &cur, &above, &below, local_flavor, rift_mature);
+
+                    if let Some(new_block) = outcome.block {
+                        push_edit(&mut edit, &mut palette_map, pos, new_block);
+                        remaining_writes -= 1;
+                        state.rifts[rift_idx].corrupted_blocks += 1;
+                        state.dirty = true;
+                    }
+                    if let Some(above_block) = outcome.above
+                        && is_air_like(&above)
+                    {
+                        push_edit(
+                            &mut edit,
+                            &mut palette_map,
+                            [pos[0], pos[1] + 1, pos[2]],
+                            above_block,
+                        );
+                    }
+                    if let Some(below_block) = outcome.below
+                        && is_air_like(&below)
+                    {
+                        push_edit(
+                            &mut edit,
+                            &mut palette_map,
+                            [pos[0], pos[1] - 1, pos[2]],
+                            below_block,
+                        );
+                    }
+                    if outcome.is_corrupt && matches!(strip_ns(&cur), "lava" | "flowing_lava") {
+                        lava_nudges.push((pos, cur));
+                    }
                 }
-                if state.mark_quart_corrupted(pos) {
-                    biome_updates.push((quart_block_origin(pos), local_flavor.to_u8()));
-                    quart_records.push(quart_coords(pos));
-                }
-                expand_frontier(
-                    host,
-                    &mut state.rifts[rift_idx].frontier,
-                    &staged_positions,
-                    pos,
-                    min_y,
-                    rift_age ^ (attempts as u64),
-                );
+                cur_y -= 1;
             }
-        }
 
-        if !deferred.is_empty() {
-            state.rifts[rift_idx].frontier.extend(deferred);
-        }
-
-        if state.rifts[rift_idx].frontier.len() > MAX_FRONTIER_PER_RIFT {
-            let excess = state.rifts[rift_idx].frontier.len() - MAX_FRONTIER_PER_RIFT;
-            state.rifts[rift_idx].frontier.drain(0..excess);
+            if cur_y < min_y {
+                state.rifts[rift_idx].active_column = None;
+            } else {
+                state.rifts[rift_idx].active_column = Some((col, cur_y, min_y));
+            }
         }
     }
 
@@ -992,76 +1144,6 @@ fn push_edit(
         block: idx,
         only: None,
     });
-}
-
-fn expand_frontier(
-    host: &dyn Host,
-    frontier: &mut Vec<[i32; 3]>,
-    staged: &HashSet<[i32; 3]>,
-    origin: [i32; 3],
-    min_y: i32,
-    salt: u64,
-) {
-    for n in neighbors_6(origin) {
-        if n[1] < min_y || n[1] >= OVERWORLD_MAX_Y || staged.contains(&n) {
-            continue;
-        }
-        let nb = host.block(n);
-        // Never waste frontier slots on open sky; hug solid terrain & surface vegetation.
-        if !is_air_like(&nb) {
-            frontier.push(n);
-        }
-    }
-
-    // Also probe horizontal step-ups / step-downs (+/- 1..2 Y) so hillsides,
-    // shallow streams, and forest canopies never block the creeping spread.
-    let h = spatial_hash(origin[0], origin[1], origin[2], salt);
-    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-        if let Ok(heights) = host.surface_heights(
-            OVERWORLD,
-            &[(origin[0] + dx, origin[2] + dz)],
-            NativeHeightmap::WorldSurface,
-        ) && let Some(Some(top)) = heights.first().copied()
-        {
-            let surf = [origin[0] + dx, (top - 1).max(min_y), origin[2] + dz];
-            if !staged.contains(&surf) {
-                frontier.push(surf);
-            }
-        }
-        let step = ((h & 3) as i32) - 1;
-        let diag = [
-            origin[0] + dx * 2,
-            (origin[1] + step).clamp(min_y, OVERWORLD_MAX_Y - 1),
-            origin[2] + dz * 2,
-        ];
-        if !staged.contains(&diag) && !is_air_like(&host.block(diag)) {
-            frontier.push(diag);
-        }
-    }
-}
-
-fn seed_fallback_frontier(host: &dyn Host, rift: &mut RiftSource) {
-    let rad = ((rift.max_radius_sq as f64).sqrt() as i32).max(8);
-    let min_y = allowed_min_y(rift.center[1], rift.age_ticks, rad / 2, rift.corrupted_blocks);
-
-    for i in 0..24u64 {
-        let h = spatial_hash(rift.center[0], i as i32, rift.center[2], rift.age_ticks ^ rift.id);
-        let angle = ((h & 0xFFFF) as f64 / 65535.0) * std::f64::consts::TAU;
-        let r = (((h >> 16) % ((rad as u64).max(12) + 8)) as f64).max(4.0);
-        let x = rift.center[0] + (angle.cos() * r).round() as i32;
-        let z = rift.center[2] + (angle.sin() * r).round() as i32;
-        if let Ok(heights) =
-            host.surface_heights(OVERWORLD, &[(x, z)], NativeHeightmap::MotionBlockingNoLeaves)
-            && let Some(Some(sy)) = heights.first().copied()
-        {
-            let p = [x, (sy - 1).max(min_y), z];
-            rift.frontier.push(p);
-        }
-        // Also seed underground probe at min_y..center_y so caves continue deeper.
-        let y_range = (rift.center[1] - min_y).max(1) as u64;
-        let uy = min_y + ((h >> 32) % y_range) as i32;
-        rift.frontier.push([x, uy, z]);
-    }
 }
 
 fn emit_rift_ambient_effects(host: &mut dyn Host, state: &RiftState) {

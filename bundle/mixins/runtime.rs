@@ -1,3 +1,4 @@
+use crate::mobs::{Species, Who};
 use horizon_core::position::BlockPos;
 use horizon_world::level::LevelAccess as _;
 use horizon_world::worldgen::structure::{Mirror, Rotation};
@@ -20,6 +21,7 @@ pub(super) fn apply_pending(game: &mut super::Game<'_>, dimension: &str) {
     apply_biomes(game);
     apply_fast_lava(game);
     apply_mob_buffs(game);
+    apply_mob_targets(game);
     apply_bastion_pieces(game);
 }
 
@@ -37,12 +39,17 @@ fn apply_biomes(game: &mut super::Game<'_>) {
         FLAVOR_BIOMES.map(|name| biomes.list.iter().position(|b| b.name == name))
     };
 
-    let bottom_y = game.world.bottom_y();
-    let max_qy = (game.world.layout().height() / 4 - 1).max(0);
+    let q_height = (game.world.layout().height() / 4).max(1);
     let sections = game.world.layout().sections() as i32;
     let mut touched = HashSet::new();
+    let mut visited_cols = HashSet::new();
 
     for (pos, flavor) in pending {
+        let qx_world = pos[0] >> 2;
+        let qz_world = pos[2] >> 2;
+        if !visited_cols.insert((qx_world, qz_world)) {
+            continue;
+        }
         let Some(target) = biome_indices
             .get(usize::from(flavor))
             .copied()
@@ -52,14 +59,22 @@ fn apply_biomes(game: &mut super::Game<'_>) {
             continue;
         };
         let key = (pos[0] >> 4, pos[2] >> 4);
-        let qy = ((pos[1] - bottom_y) >> 2).clamp(0, max_qy);
         let Some(chunk) = game.world.chunks.get_mut(&key) else {
             continue;
         };
-        if usize::from(chunk.biome(pos[0], pos[1], pos[2])) == target {
+        let qx = (pos[0] & 15) >> 2;
+        let qz = (pos[2] & 15) >> 2;
+        // Paint the full vertical column (bedrock to sky ceiling) so flying above
+        // corrupted terrain keeps the Nether biome sky haze, spawns, and music.
+        if usize::from(chunk.biome(pos[0], 64, pos[2])) == target
+            && usize::from(chunk.biome(pos[0], 160, pos[2])) == target
+        {
             continue;
         }
-        Arc::make_mut(chunk).set_biome_cell((pos[0] & 15) >> 2, qy, (pos[2] & 15) >> 2, target as u16);
+        let chunk_mut = Arc::make_mut(chunk);
+        for qy in 0..q_height {
+            chunk_mut.set_biome_cell(qx, qy, qz, target as u16);
+        }
         touched.insert(key);
     }
 
@@ -129,6 +144,45 @@ fn apply_mob_buffs(game: &mut super::Game<'_>) {
             }
             mob.needs_sync = true;
         }
+    }
+}
+
+fn apply_mob_targets(game: &mut super::Game<'_>) {
+    let pending = crate::entry::rift_bridge::drain_mob_targets();
+    if pending.is_empty() {
+        return;
+    }
+
+    let alive_ids: HashSet<u32> = game
+        .mobs
+        .iter()
+        .filter(|m| !m.removed && m.alive())
+        .map(|m| m.id)
+        .collect();
+
+    for (hunter_id, victim_id) in pending {
+        if !alive_ids.contains(&victim_id) {
+            continue;
+        }
+        let Some(mob) = game
+            .mobs
+            .iter_mut()
+            .find(|m| m.id == hunter_id && !m.removed && m.alive())
+        else {
+            continue;
+        };
+        if mob.ai.target.is_some() {
+            continue;
+        }
+        mob.ai.target = Some(Who::Mob(victim_id));
+        mob.ai.aggressive = true;
+        if matches!(
+            mob.species(),
+            Species::Piglin | Species::PiglinBrute | Species::Hoglin
+        ) {
+            mob.extra.anger = mob.extra.anger.max(400);
+        }
+        mob.needs_sync = true;
     }
 }
 

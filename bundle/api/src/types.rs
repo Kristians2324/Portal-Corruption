@@ -118,7 +118,15 @@ pub struct RiftSource {
     pub age_ticks: u64,
     pub corrupted_blocks: u64,
     pub max_radius_sq: i64,
-    pub frontier: Vec<[i32; 3]>,
+    /// Current expanding circular shell radius (1, 2, 3, ... indefinitely while uncontained).
+    pub ring_radius: i32,
+    /// Remaining `[x, z]` columns in the current circular shell.
+    pub ring_columns: Vec<[i32; 2]>,
+    /// Active column vertical sweep: `([x, z], next_y_down, min_y)`.
+    pub active_column: Option<([i32; 2], i32, i32)>,
+    /// Inner-ring deepening pass so underground zones sink all the way to bedrock `-63`.
+    pub deepen_radius: i32,
+    pub deepen_columns: Vec<[i32; 2]>,
     pub bastions_placed: u32,
 }
 
@@ -174,4 +182,57 @@ pub fn neighbors_6(pos: [i32; 3]) -> [[i32; 3]; 6] {
         [pos[0], pos[1], pos[2] + 1],
         [pos[0], pos[1], pos[2] - 1],
     ]
+}
+
+/// Generates all integer `(x, z)` columns in the exact annulus `(R - 1)^2 < d^2 <= R^2`
+/// around `(cx, cz)`, sorted radially/by-chunk so the entire 360-degree circle
+/// expands evenly with minimal chunk-loading thrash.
+pub fn build_ring_columns(cx: i32, cz: i32, radius: i32) -> Vec<[i32; 2]> {
+    if radius <= 0 {
+        return vec![[cx, cz]];
+    }
+    let r2 = i64::from(radius) * i64::from(radius);
+    let prev_r2 = if radius == 1 {
+        -1i64
+    } else {
+        let p = i64::from(radius - 1);
+        p * p
+    };
+
+    let mut cols = Vec::with_capacity((radius as usize) * 7 + 8);
+    for dx in -radius..=radius {
+        let dx2 = i64::from(dx) * i64::from(dx);
+        let max_dz = ((r2 - dx2) as f64).sqrt().floor() as i32;
+        if prev_r2 < dx2 {
+            for dz in -max_dz..=max_dz {
+                cols.push([cx + dx, cz + dz]);
+            }
+        } else {
+            let mut min_dz = (((prev_r2 - dx2) as f64).sqrt().floor() as i32) + 1;
+            while i64::from(min_dz) * i64::from(min_dz) + dx2 <= prev_r2 {
+                min_dz += 1;
+            }
+            for dz in min_dz..=max_dz {
+                cols.push([cx + dx, cz + dz]);
+                if dz != 0 {
+                    cols.push([cx + dx, cz - dz]);
+                }
+            }
+        }
+    }
+
+    // Group by chunk while ordering around the ring angle so loaded chunks are
+    // reused cleanly before moving to the next chunk along the circle.
+    cols.sort_by(|a, b| {
+        let ac = (a[0] >> 4, a[1] >> 4);
+        let bc = (b[0] >> 4, b[1] >> 4);
+        let a_ang = f64::from(ac.1 * 16 + 8 - cz).atan2(f64::from(ac.0 * 16 + 8 - cx));
+        let b_ang = f64::from(bc.1 * 16 + 8 - cz).atan2(f64::from(bc.0 * 16 + 8 - cx));
+        a_ang
+            .total_cmp(&b_ang)
+            .then_with(|| ac.cmp(&bc))
+            .then_with(|| a[0].cmp(&b[0]))
+            .then_with(|| a[1].cmp(&b[1]))
+    });
+    cols
 }

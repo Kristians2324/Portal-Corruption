@@ -224,15 +224,16 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
     )
 }
 
-/// Computes how deep corruption can currently sink at horizontal distance
-/// `horiz_dist` from a rift at `center_y`, sinking toward bedrock over time.
+/// Computes how deep corruption reaches at horizontal distance `horiz_dist`
+/// from a rift at `center_y`, immediately penetrating underground caves near the
+/// core and boring all the way to Bedrock (`-63`) as the rift matures.
 pub fn allowed_min_y(center_y: i32, age_ticks: u64, horiz_dist: i32, corrupted_blocks: u64) -> i32 {
-    if corrupted_blocks >= 4_000 {
+    if corrupted_blocks >= 2_000 || age_ticks >= 1_200 {
         return BEDROCK_FLOOR_Y;
     }
-    let sink_bonus = (age_ticks / 40).min(130) as i32;
-    let cone_rise = (horiz_dist / 3).min(48);
-    (center_y - 16 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
+    let sink_bonus = (age_ticks / 10).min(160) as i32;
+    let cone_rise = (horiz_dist / 4).min(36);
+    (center_y - 26 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
 }
 
 fn scar_roll(pos: [i32; 3], salt: u64) -> u64 {
@@ -744,12 +745,43 @@ mod tests {
 
     #[test]
     fn min_y_sinks_to_bedrock_with_maturity_and_near_core() {
-        let early_far = allowed_min_y(64, 0, 90, 20);
+        let early_far = allowed_min_y(64, 0, 120, 20);
         let early_core = allowed_min_y(64, 0, 0, 20);
-        let late_core = allowed_min_y(64, 4_500, 0, 3_900);
-        let mature = allowed_min_y(64, 1_000, 200, 4_000);
+        let late_core = allowed_min_y(64, 1_500, 0, 1_500);
+        let mature = allowed_min_y(64, 100, 200, 2_000);
         assert!(early_far > early_core);
         assert_eq!(late_core, BEDROCK_FLOOR_Y);
         assert_eq!(mature, BEDROCK_FLOOR_Y);
+    }
+
+    #[test]
+    fn circular_rings_cover_full_360_disk_with_zero_gaps() {
+        use crate::types::build_ring_columns;
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        for r in 1..=12 {
+            let cols = build_ring_columns(10, -20, r);
+            assert!(!cols.is_empty());
+            for c in cols {
+                assert!(seen.insert(c), "duplicate column {c:?} at ring {r}");
+                let dx = c[0] - 10;
+                let dz = c[1] + 20;
+                let d2 = dx * dx + dz * dz;
+                assert!(d2 <= r * r, "column {c:?} exceeded ring {r}");
+            }
+        }
+        for dx in -12..=12 {
+            for dz in -12..=12 {
+                if dx * dx + dz * dz <= 144 {
+                    assert!(
+                        seen.contains(&[10 + dx, -20 + dz]),
+                        "missing column ({}, {})",
+                        10 + dx,
+                        -20 + dz
+                    );
+                }
+            }
+        }
     }
 }
