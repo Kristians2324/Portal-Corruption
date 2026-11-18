@@ -497,7 +497,7 @@ impl Hooks for RiftBleedMod {
         if parts.is_empty() {
             let _ = host.tell(
                 event.player.uuid,
-                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <16..1200>"),
+                Text::literal("[Rift Bleed] Usage: /rift status | scan | pause | resume | speed <4..1200>"),
             );
             return Flow::Cancel;
         }
@@ -576,7 +576,7 @@ impl Hooks for RiftBleedMod {
             }
             "speed" if event.player.permission >= 2 && parts.len() >= 2 => {
                 if let Ok(val) = parts[1].parse::<usize>() {
-                    let clamped = val.clamp(16, 1200);
+                    let clamped = val.clamp(4, 1200);
                     if let Ok(mut rt) = runtime().lock() {
                         rt.server.spread_budget = clamped;
                         rt.server.dirty = true;
@@ -588,7 +588,7 @@ impl Hooks for RiftBleedMod {
                 } else {
                     let _ = host.tell(
                         event.player.uuid,
-                        Text::literal("[Rift Bleed] Usage: /rift speed <16..1200>"),
+                        Text::literal("[Rift Bleed] Usage: /rift speed <4..1200>"),
                     );
                 }
                 Flow::Cancel
@@ -1120,8 +1120,8 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
         return;
     }
 
-    let total_budget = state.spread_budget.max(16);
-    let per_rift_budget = (total_budget / active_indices.len()).max(24);
+    let total_budget = state.spread_budget.max(4);
+    let per_rift_budget = (total_budget / active_indices.len()).max(4);
     let mut edit = NativeBlockEdit {
         palette: Vec::new(),
         filters: Vec::new(),
@@ -1145,9 +1145,9 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
         let seed = state.seed;
 
         let mut remaining_writes = per_rift_budget;
-        let mut water_budget = per_rift_budget * 3;
+        let mut water_budget = per_rift_budget.max(16) * 4;
         let mut water_cleared = 0usize;
-        let mut scan_budget = per_rift_budget * 10;
+        let mut scan_budget = per_rift_budget.max(24) * 12;
 
         while remaining_writes > 0 && scan_budget > 0 {
             // Pull next column if no active vertical column is currently in progress.
@@ -1216,10 +1216,10 @@ fn spread_corruption_step(host: &mut dyn Host, state: &mut RiftState) {
 
                 let (start_y, col_min_y) = if is_deepen_turn {
                     (top_y.min(rift_center[1] - 12).max(full_min_y), full_min_y)
-                } else if hdist <= 28 || !rift_mature {
+                } else if hdist <= 12 || !rift_mature {
                     (top_y, full_min_y)
                 } else {
-                    (top_y, full_min_y.max(top_y - 36))
+                    (top_y, full_min_y.max(top_y - 28))
                 };
 
                 // Paint the full 4x4x4 quart biome column for this `(x, z)` immediately.

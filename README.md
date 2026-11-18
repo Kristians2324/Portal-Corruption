@@ -38,7 +38,7 @@
 
 - `/rift status` — Show all tracked Portals/Rift Scars, containment status, flavor, ring radius, block count, and Bastions.
 - `/rift scan` — Scan nearby loaded blocks for active Nether Portals.
-- `/rift speed <16..1200>` *(OP level 2)* — Adjust block spread budget per tick (default `420`).
+- `/rift speed <4..1200>` *(OP level 2)* — Adjust block spread budget per tick (default `14`, giving ~10 minutes before spreading beyond ~30 blocks).
 - `/rift pause` / `/rift resume` *(OP level 2)* — Pause or resume Rift Bleed expansion.
 
 ## Layout & Building

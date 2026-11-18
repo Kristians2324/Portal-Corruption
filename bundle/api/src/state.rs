@@ -43,7 +43,7 @@ impl RiftState {
             next_id: 1,
             tick: 0,
             paused: false,
-            spread_budget: 420,
+            spread_budget: 14,
             dirty: false,
             rifts: Vec::new(),
             bastions: Vec::new(),
@@ -143,7 +143,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(3));
+        root.insert("version".into(), Value::from(4));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -221,8 +221,12 @@ impl RiftState {
         }
         let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
         if let Some(b) = doc.get("spread_budget").and_then(|v| v.as_u64()) {
-            let upgraded = if version < 3 && b == 140 { 420 } else { b };
-            self.spread_budget = (upgraded as usize).clamp(16, 1200);
+            let upgraded = if version < 4 && matches!(b, 140 | 420) {
+                14
+            } else {
+                b
+            };
+            self.spread_budget = (upgraded as usize).clamp(4, 1200);
         }
 
         self.rifts.clear();
