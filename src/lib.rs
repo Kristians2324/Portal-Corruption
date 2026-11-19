@@ -27,14 +27,24 @@ use mod_api::{
     ServerStartedEvent, ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase,
     WorldSavedEvent,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 const MAX_CORE_FORCED_CHUNKS: usize = 8;
 const MAX_FRONTIER_FORCED_CHUNKS: usize = 8;
 
+/// Re-entrancy-safe ingress queues populated by hooks (`block_changed`, `portal_create`, etc.)
+/// without ever holding this lock across a host call.
+#[derive(Default)]
+struct HookQueues {
+    pending_portals: VecDeque<[i32; 3]>,
+    pending_containment_checks: Vec<[i32; 3]>,
+    pending_water_evap: Vec<[i32; 3]>,
+}
+
 #[derive(Default)]
 pub struct Mod {
+    queues: Mutex<HookQueues>,
     state: Mutex<RiftState>,
     atmo: Mutex<ClientAtmosphere>,
     particles: Mutex<Option<ParticlePalette>>,
@@ -675,13 +685,13 @@ impl Hooks for Mod {
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _event: &mut ServerStartedEvent) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.try_lock() {
             ensure_world_initialized(host, &mut state);
         }
     }
 
     fn world_saved(&self, host: &mut dyn ServerHost, _event: &mut WorldSavedEvent) {
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.try_lock() {
             ensure_world_initialized(host, &mut state);
             state.save_to_host(host);
         }
@@ -689,7 +699,7 @@ impl Hooks for Mod {
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let ow = host.level(OVERWORLD);
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.try_lock() {
             state.save_to_host(host);
             if let Some(level) = ow {
                 release_all_forced_chunks(host, level, &mut state);
@@ -700,7 +710,7 @@ impl Hooks for Mod {
     fn world_lifecycle(&self, host: &mut dyn ServerHost, event: &mut WorldLifecycleEvent<'_>) {
         if matches!(event.phase, WorldPhase::WorldCloseFinal | WorldPhase::WorldCloseFailed) {
             let ow = host.level(OVERWORLD);
-            if let Ok(mut state) = self.state.lock() {
+            if let Ok(mut state) = self.state.try_lock() {
                 state.save_to_host(host);
                 if let Some(level) = ow {
                     release_all_forced_chunks(host, level, &mut state);
@@ -709,13 +719,12 @@ impl Hooks for Mod {
         }
     }
 
-    fn portal_create(&self, host: &mut dyn ServerHost, event: &mut PortalCreateEvent<'_>) {
+    fn portal_create(&self, _host: &mut dyn ServerHost, event: &mut PortalCreateEvent<'_>) {
         if event.dimension != OVERWORLD {
             return;
         }
-        if let Ok(mut state) = self.state.lock() {
-            ensure_world_initialized(host, &mut state);
-            state.pending_portals.push_back(event.pos);
+        if let Ok(mut q) = self.queues.lock() {
+            q.pending_portals.push_back(event.pos);
         }
     }
 
@@ -729,23 +738,35 @@ impl Hooks for Mod {
         let new_short = strip_ns(new_name);
         let old_short = strip_ns(old_name);
 
-        if let Ok(mut state) = self.state.lock() {
-            if new_short == "nether_portal" {
-                state.pending_portals.push_back(pos);
+        let is_portal = new_short == "nether_portal";
+        let is_seal_change = containment::is_seal_block(new_name, None)
+            || containment::is_seal_block(old_name, None)
+            || matches!(new_short, "iron_door" | "iron_trapdoor")
+            || matches!(old_short, "iron_door" | "iron_trapdoor" | "nether_portal");
+
+        if (is_portal || is_seal_change)
+            && let Ok(mut q) = self.queues.lock()
+        {
+            if is_portal {
+                q.pending_portals.push_back(pos);
             }
-            if containment::is_seal_block(new_name, None)
-                || containment::is_seal_block(old_name, None)
-                || matches!(new_short, "iron_door" | "iron_trapdoor")
-                || matches!(old_short, "iron_door" | "iron_trapdoor" | "nether_portal")
-            {
-                state.pending_containment_checks.push(pos);
+            if is_seal_change {
+                q.pending_containment_checks.push(pos);
             }
+        }
+
+        // Non-blocking try_lock prevents same-thread re-entrant deadlock when our own
+        // `level.set_block` / `edit_blocks` calls synchronously fire `block_changed`.
+        if let Ok(state) = self.state.try_lock() {
             let has_water = is_water_like(new_name)
                 || level
                     .state_fluid_state(event.new)
                     .is_some_and(|f| !f.is_empty() && !matches!(new_short, "lava" | "flowing_lava"));
-            if has_water && near_corruption_or_active_rift(&state, pos) {
-                state.queue_water_evap(pos);
+            if has_water
+                && near_corruption_or_active_rift(&state, pos)
+                && let Ok(mut q) = self.queues.lock()
+            {
+                q.pending_water_evap.push(pos);
             }
         }
     }
@@ -755,11 +776,13 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         let to = [event.to.x, event.to.y, event.to.z];
-        if let Ok(mut state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && near_corruption_or_active_rift(&state, to)
         {
             if is_water_like(event.kind) {
-                state.queue_water_evap(to);
+                if let Ok(mut q) = self.queues.lock() {
+                    q.pending_water_evap.push(to);
+                }
                 return Flow::Cancel;
             }
             if matches!(
@@ -784,10 +807,12 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         let pos = [event.pos.x, event.pos.y, event.pos.z];
-        if let Ok(mut state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && near_corruption_or_active_rift(&state, pos)
         {
-            state.queue_water_evap(pos);
+            if let Ok(mut q) = self.queues.lock() {
+                q.pending_water_evap.push(pos);
+            }
             return Flow::Cancel;
         }
         Flow::Continue
@@ -802,11 +827,13 @@ impl Hooks for Mod {
             return;
         }
         let pos = [event.pos.x, event.pos.y, event.pos.z];
-        if let Ok(mut state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && near_corruption_or_active_rift(&state, pos)
         {
             event.can_convert = false;
-            state.queue_water_evap(pos);
+            if let Ok(mut q) = self.queues.lock() {
+                q.pending_water_evap.push(pos);
+            }
         }
     }
 
@@ -832,11 +859,13 @@ impl Hooks for Mod {
         let Some(ow) = host.level(OVERWORLD) else {
             return Flow::Continue;
         };
-        if let Ok(mut state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && (near_corruption_or_active_rift(&state, event.pos)
                 || mobs::pos_is_corrupted(host, ow, &state, event.pos))
         {
-            state.queue_water_evap(event.pos);
+            if let Ok(mut q) = self.queues.lock() {
+                q.pending_water_evap.push(event.pos);
+            }
             return Flow::Cancel;
         }
         Flow::Continue
@@ -847,7 +876,7 @@ impl Hooks for Mod {
         host: &mut dyn ServerHost,
         event: &mut LivingConversionPreEvent<'_>,
     ) -> Flow {
-        if let Ok(state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && mobs::should_block_zombification(host, &state, event.entity, event.kind, event.outcome)
         {
             return Flow::Cancel;
@@ -857,7 +886,7 @@ impl Hooks for Mod {
 
     fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
         let pal = self.particles.lock().ok().and_then(|g| *g);
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.try_lock() {
             mobs::handle_living_death(host, &mut state, event, pal.as_ref());
         }
         Flow::Continue
@@ -868,7 +897,7 @@ impl Hooks for Mod {
         _host: &dyn mod_api::Host,
         event: &mut FinalizeSpawnEvent<'_>,
     ) -> Flow {
-        if let Ok(state) = self.state.lock()
+        if let Ok(state) = self.state.try_lock()
             && mobs::should_cancel_finalize_spawn(&state, event)
         {
             event.spawn_cancelled = true;
@@ -877,7 +906,7 @@ impl Hooks for Mod {
     }
 
     fn potential_spawns(&self, host: &dyn mod_api::Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {
-        if let Ok(state) = self.state.lock() {
+        if let Ok(state) = self.state.try_lock() {
             mobs::augment_potential_spawns(host, &state, event);
         }
         Flow::Continue
@@ -890,7 +919,7 @@ impl Hooks for Mod {
         let Some((eid, kind)) = event.context.entity else {
             return;
         };
-        if let Ok(state) = self.state.lock() {
+        if let Ok(state) = self.state.try_lock() {
             mobs::append_nether_touched_drops(
                 host,
                 &state,
@@ -924,7 +953,7 @@ impl Hooks for Mod {
         }
 
         let sub = event.command.literals.get(1).map(String::as_str);
-        let msg = if let Ok(mut state) = self.state.lock() {
+        let msg = if let Ok(mut state) = self.state.try_lock() {
             ensure_world_initialized(host, &mut state);
             match sub {
                 None | Some("status") => {
@@ -1054,10 +1083,20 @@ impl Hooks for Mod {
         }
 
         let pal = self.particles.lock().ok().and_then(|g| *g);
-        let Ok(mut state) = self.state.lock() else {
+        let drained = self.queues.lock().ok().map(|mut q| std::mem::take(&mut *q));
+        let Ok(mut state) = self.state.try_lock() else {
             return;
         };
         ensure_world_initialized(server, &mut state);
+        if let Some(q) = drained {
+            state.pending_portals.extend(q.pending_portals);
+            state
+                .pending_containment_checks
+                .extend(q.pending_containment_checks);
+            for wp in q.pending_water_evap {
+                state.queue_water_evap(wp);
+            }
+        }
         state.tick = state.tick.wrapping_add(1);
 
         while let Some(pos) = state.pending_portals.pop_front() {
@@ -1081,7 +1120,7 @@ impl Hooks for Mod {
     }
 
     fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
-        if let Ok(mut atmo) = self.atmo.lock() {
+        if let Ok(mut atmo) = self.atmo.try_lock() {
             *atmo = ClientAtmosphere::default();
         }
     }
@@ -1091,33 +1130,59 @@ impl Hooks for Mod {
         _host: &mut dyn ClientHost,
         _event: &mut ClientLevelUnloadEvent<'_>,
     ) {
-        if let Ok(mut atmo) = self.atmo.lock() {
+        if let Ok(mut atmo) = self.atmo.try_lock() {
             *atmo = ClientAtmosphere::default();
         }
     }
 
     fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
         let pal = self.particles.lock().ok().and_then(|g| *g);
-        if let Ok(mut atmo) = self.atmo.lock() {
+        if let Ok(mut atmo) = self.atmo.try_lock() {
             atmosphere::tick_client_atmosphere(&mut atmo, host, pal.as_ref());
         }
     }
 
     fn compute_fog_color(&self, _host: &dyn ClientHost, event: &mut ComputeFogColorEvent<'_>) {
-        if let Ok(atmo) = self.atmo.lock() {
+        if let Ok(atmo) = self.atmo.try_lock() {
             atmosphere::apply_fog_color(&atmo, event);
         }
     }
 
     fn render_fog(&self, _host: &dyn ClientHost, event: &mut RenderFogEvent<'_>) {
-        if let Ok(atmo) = self.atmo.lock() {
+        if let Ok(atmo) = self.atmo.try_lock() {
             atmosphere::apply_render_fog(&atmo, event);
         }
     }
 
     fn music(&self, _host: &dyn ClientHost, event: &mut MusicEvent<'_>) {
-        if let Ok(atmo) = self.atmo.lock() {
+        if let Ok(atmo) = self.atmo.try_lock() {
             atmosphere::apply_nether_music(&atmo, event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reentrant_hook_access_never_deadlocks() {
+        let m = Mod::default();
+        let state_guard = m.state.try_lock().expect("initial state lock");
+        assert_eq!(state_guard.spread_budget, 14);
+
+        // Simulate a synchronous re-entrant `block_changed` / `finalize_spawn` callback
+        // while `level_tick_post` holds `state`: queues stay writable and `try_lock` never hangs.
+        assert!(m.state.try_lock().is_err());
+        {
+            let mut q = m.queues.lock().expect("ingress queue lock");
+            q.pending_portals.push_back([10, 70, 20]);
+            q.pending_water_evap.push([12, 64, 22]);
+        }
+        drop(state_guard);
+
+        let q = m.queues.lock().expect("drain queue");
+        assert_eq!(q.pending_portals.len(), 1);
+        assert_eq!(q.pending_water_evap.len(), 1);
     }
 }
