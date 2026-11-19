@@ -9,8 +9,8 @@ mod types;
 use atmosphere::{ClientAtmosphere, ParticlePalette};
 use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
 use corruption::{
-    SURFACE_CRUST_DEPTH, allowed_min_y, is_air_like, is_water_like, surface_column_y_range,
-    transform_block,
+    SURFACE_CRUST_DEPTH, allowed_min_y, effective_rift_budget, is_air_like, is_snow_or_ice,
+    is_water_like, surface_column_y_range, transform_block,
 };
 use mobs::paint_biome_column;
 use state::RiftState;
@@ -459,27 +459,162 @@ fn pop_next_loaded_column(
     None
 }
 
-/// Maximum underground block conversions per deepening column visit so
-/// underground corruption trails gently (~10% of budget) while ~90% of the
-/// budget continuously pushes the surface circular biome outward.
-const DEEPEN_EDIT_CAP: usize = 5;
-
-fn query_column_heights(host: &mut dyn ServerHost, col: [i32; 2], fallback_y: i32) -> (i32, i32) {
+fn query_surface_and_cliff_heights(
+    host: &mut dyn ServerHost,
+    col: [i32; 2],
+    fallback_y: i32,
+) -> (i32, i32, i32) {
     let fallback = (fallback_y + 24).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 3);
     let world_surface = host
         .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
         .ok()
         .and_then(|hs| hs.first().copied().flatten())
         .unwrap_or(fallback);
-    let ocean_floor = host
-        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::OceanFloor)
-        .ok()
-        .and_then(|hs| hs.first().copied().flatten())
+    let probes = [
+        (col[0], col[1]),
+        (col[0] + 1, col[1]),
+        (col[0] - 1, col[1]),
+        (col[0], col[1] + 1),
+        (col[0], col[1] - 1),
+    ];
+    let floors = host
+        .surface_heights(OVERWORLD, &probes, Heightmap::OceanFloor)
+        .unwrap_or_default();
+    let ocean_floor = floors
+        .first()
+        .copied()
+        .flatten()
         .unwrap_or(world_surface);
-    (world_surface, ocean_floor)
+    let min_neighbor_floor = floors
+        .iter()
+        .skip(1)
+        .filter_map(|h| *h)
+        .min()
+        .unwrap_or(ocean_floor);
+    (world_surface, ocean_floor, min_neighbor_floor)
 }
 
-fn corrupt_column_step(
+fn portal_is_underground(host: &mut dyn ServerHost, rift_center: [i32; 3]) -> bool {
+    let portal_floor = host
+        .surface_heights(
+            OVERWORLD,
+            &[(rift_center[0], rift_center[2])],
+            Heightmap::OceanFloor,
+        )
+        .ok()
+        .and_then(|hs| hs.first().copied().flatten());
+    portal_floor.is_some_and(|ground| rift_center[1] < ground - 14)
+}
+
+/// Applies one block corruption step at `pos` and returns `true` if a block changed.
+#[allow(clippy::too_many_arguments)]
+fn apply_corruption_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+    rift_id: u64,
+    rift_center: [i32; 3],
+    rift_flavor: NetherFlavor,
+    mature: bool,
+    pos: [i32; 3],
+    current: &str,
+) -> bool {
+    let y = pos[1];
+    let above = if y + 1 <= OVERWORLD_MAX_Y {
+        level
+            .block(host, [pos[0], y + 1, pos[2]])
+            .map(|k| k.id(host))
+            .unwrap_or_else(|| "minecraft:air".to_owned())
+    } else {
+        "minecraft:air".to_owned()
+    };
+    let below = if y - 1 >= OVERWORLD_MIN_Y {
+        level
+            .block(host, [pos[0], y - 1, pos[2]])
+            .map(|k| k.id(host))
+            .unwrap_or_else(|| "minecraft:air".to_owned())
+    } else {
+        "minecraft:bedrock".to_owned()
+    };
+
+    let d2 = horiz_dist_sq(rift_center, pos);
+    let local_flavor = if d2 <= 40 * 40 {
+        rift_flavor
+    } else {
+        NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
+    };
+
+    if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+        let _ = host.set_block_property(pos, "waterlogged", "false");
+        state.queue_water_evap(pos);
+    }
+
+    let out = transform_block(pos, current, &above, &below, local_flavor, mature);
+
+    if is_water_like(current) {
+        state.queue_water_evap(pos);
+    }
+
+    let mut changed = false;
+    if let Some(target_id) = out.block
+        && let Some(block_state) = resolve_block(host, target_id)
+    {
+        let flags = if target_id == "minecraft:air" {
+            BlockUpdateFlags::CLIENTS
+                | BlockUpdateFlags::KNOWN_SHAPE
+                | BlockUpdateFlags::SUPPRESS_DROPS
+        } else {
+            BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS
+        };
+        if level.set_block(host, pos, block_state, flags).unwrap_or(false) {
+            changed = true;
+            state.rifts[rift_idx].corrupted_blocks += 1;
+            if d2 > state.rifts[rift_idx].max_radius_sq {
+                state.rifts[rift_idx].max_radius_sq = d2;
+            }
+            state.dirty = true;
+
+            if let Some(above_id) = out.above
+                && y + 1 < OVERWORLD_MAX_Y
+                && is_air_like(&above)
+                && let Some(above_state) = resolve_block(host, above_id)
+            {
+                let _ = level.set_block(
+                    host,
+                    [pos[0], y + 1, pos[2]],
+                    above_state,
+                    BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                );
+            }
+
+            if let Some(below_id) = out.below
+                && y - 1 > OVERWORLD_MIN_Y
+                && is_air_like(&below)
+                && let Some(below_state) = resolve_block(host, below_id)
+            {
+                let _ = level.set_block(
+                    host,
+                    [pos[0], y - 1, pos[2]],
+                    below_state,
+                    BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                );
+            }
+        }
+    }
+
+    if out.is_corrupt && state.mark_quart_corrupted(pos) {
+        paint_biome_column(level, host, pos[0], pos[2], local_flavor);
+        state.dirty = true;
+    }
+
+    changed
+}
+
+/// Expands the 360-degree surface crust (including mountain peaks, snow/ice caps,
+/// steep cliff faces, trees, and rivers) continuously outward without blocking on
+/// deep underground stone.
+fn corrupt_surface_step(
     host: &mut dyn ServerHost,
     level: LevelRef,
     state: &mut RiftState,
@@ -487,36 +622,137 @@ fn corrupt_column_step(
     budget: &mut usize,
 ) {
     let mut skips = 0usize;
-    let mut deepened_this_tick = false;
-    while *budget > 0 {
-        let rift_id = state.rifts[rift_idx].id;
-        let is_deepen = state.active_deepen_edits.contains_key(&rift_id);
-        let max_skips = if is_deepen { 160 } else { 48 };
-        if skips >= max_skips {
-            break;
-        }
+    let rift_id = state.rifts[rift_idx].id;
+    let rift_center = state.rifts[rift_idx].center;
+    let rift_flavor = state.rifts[rift_idx].flavor;
+    let is_cave_portal = portal_is_underground(host, rift_center);
 
-        let rift_center = state.rifts[rift_idx].center;
-        let rift_flavor = state.rifts[rift_idx].flavor;
+    while *budget > 0 && skips < 64 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
-        let mature = rift_blocks >= 40_000 || rift_age >= 6_000;
+        let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
 
         if state.rifts[rift_idx].active_column.is_none() {
-            state.active_deepen_edits.remove(&rift_id);
-            let mut chosen_deepen = false;
-            // Prioritize 360-degree surface crust expansion; run capped underground deepening
-            // every 3rd tick once the surface circle is established.
-            let mut next_col = if let Some(col) = state.pending_frontier_columns.pop_front() {
+            let next_col = if let Some(col) = state.pending_frontier_columns.pop_front() {
                 if level.is_loaded(host, [col[0], 64, col[1]]) {
                     Some(col)
                 } else {
                     None
                 }
-            } else if !deepened_this_tick
-                && state.tick % 4 == 1
-                && state.rifts[rift_idx].ring_radius > 4
+            } else {
+                let r = &mut state.rifts[rift_idx];
+                let mut ring_r = r.ring_radius;
+                let picked = pop_next_loaded_column(
+                    host,
+                    level,
+                    &mut r.ring_columns,
+                    &mut ring_r,
+                    rift_center,
+                );
+                r.ring_radius = ring_r;
+                picked
+            };
+
+            let Some(col) = next_col else {
+                break;
+            };
+            let (world_surface, ocean_floor, min_neighbor_floor) =
+                query_surface_and_cliff_heights(host, col, rift_center[1]);
+            let (top_y, min_y) = surface_column_y_range(
+                rift_center[1],
+                is_cave_portal,
+                world_surface,
+                ocean_floor,
+                min_neighbor_floor,
+            );
+            state.rifts[rift_idx].active_column = Some((col, top_y, min_y));
+        }
+
+        let Some((col, y, mut min_y)) = state.rifts[rift_idx].active_column else {
+            break;
+        };
+        if y < min_y {
+            state.rifts[rift_idx].active_column = None;
+            continue;
+        }
+
+        let pos = [col[0], y, col[1]];
+        if !level.is_loaded(host, pos) {
+            state.rifts[rift_idx].active_column = None;
+            break;
+        }
+
+        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
+
+        // Extend column depth cleanly through thick snow/ice caps, deep ponds, and tall trees
+        // so the rock/soil underneath always converts completely too.
+        if !current.is_empty() {
+            let s = strip_ns(&current);
+            if is_water_like(&current)
+                || is_snow_or_ice(&current)
+                || s.ends_with("_log")
+                || s.ends_with("_wood")
+                || s.ends_with("_leaves")
             {
+                min_y = min_y.min((y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y));
+            }
+        }
+
+        state.rifts[rift_idx].active_column = if y - 1 >= min_y {
+            Some((col, y - 1, min_y))
+        } else {
+            None
+        };
+
+        if current.is_empty() || is_air_like(&current) {
+            skips += 1;
+            continue;
+        }
+
+        if apply_corruption_at(
+            host,
+            level,
+            state,
+            rift_idx,
+            rift_id,
+            rift_center,
+            rift_flavor,
+            mature,
+            pos,
+            &current,
+        ) {
+            *budget = budget.saturating_sub(1);
+        } else {
+            skips += 1;
+        }
+    }
+}
+
+/// Simultaneously sweeps inner rings underground (from just below the surface crust
+/// down through caves, deepslate, and Bedrock) using its own cursor so surface and
+/// underground corruption always spread together in parallel.
+fn corrupt_deepen_step(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+    budget: &mut usize,
+) {
+    let mut skips = 0usize;
+    let rift_id = state.rifts[rift_idx].id;
+    let rift_center = state.rifts[rift_idx].center;
+    let rift_flavor = state.rifts[rift_idx].flavor;
+
+    while *budget > 0 && skips < 160 {
+        let rift_age = state.rifts[rift_idx].age_ticks;
+        let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
+        let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
+
+        if !state.active_deepen_columns.contains_key(&rift_id) {
+            if state.rifts[rift_idx].ring_radius <= 2 {
+                break;
+            }
+            let next_col = {
                 let r = &mut state.rifts[rift_idx];
                 if r.deepen_columns.is_empty() {
                     r.deepen_radius = if r.deepen_radius + 1 >= r.ring_radius {
@@ -536,202 +772,69 @@ fn corrupt_column_step(
                     rift_center,
                 );
                 r.deepen_radius = d_rad;
-                chosen_deepen = picked.is_some();
-                picked
-            } else {
-                let r = &mut state.rifts[rift_idx];
-                let mut ring_r = r.ring_radius;
-                let picked = pop_next_loaded_column(
-                    host,
-                    level,
-                    &mut r.ring_columns,
-                    &mut ring_r,
-                    rift_center,
-                );
-                r.ring_radius = ring_r;
                 picked
             };
-
-            if chosen_deepen && let Some(col) = next_col {
-                let (world_surface, ocean_floor) = query_column_heights(host, col, rift_center[1]);
-                let (_, crust_bottom) =
-                    surface_column_y_range(rift_center[1], world_surface, ocean_floor);
-                let hdist =
-                    (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
-                let target_min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
-                if target_min_y < crust_bottom {
-                    deepened_this_tick = true;
-                    state.active_deepen_edits.insert(rift_id, DEEPEN_EDIT_CAP);
-                    state.rifts[rift_idx].active_column =
-                        Some((col, crust_bottom, target_min_y));
-                    next_col = None;
-                } else {
-                    // Underground depth hasn't reached below the surface crust here yet —
-                    // fall back to expanding the surface circle instead of wasting the turn.
-                    chosen_deepen = false;
-                    let r = &mut state.rifts[rift_idx];
-                    let mut ring_r = r.ring_radius;
-                    next_col = pop_next_loaded_column(
-                        host,
-                        level,
-                        &mut r.ring_columns,
-                        &mut ring_r,
-                        rift_center,
-                    );
-                    r.ring_radius = ring_r;
-                }
+            let Some(col) = next_col else {
+                break;
+            };
+            let (world_surface, ocean_floor, _) =
+                query_surface_and_cliff_heights(host, col, rift_center[1]);
+            let ground = ocean_floor.min(world_surface);
+            let start_y = (ground - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
+            let hdist = (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
+            let target_min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
+            if target_min_y >= start_y {
+                skips += 8;
+                continue;
             }
-
-            if !chosen_deepen {
-                let Some(col) = next_col else {
-                    break;
-                };
-                let (world_surface, ocean_floor) = query_column_heights(host, col, rift_center[1]);
-                let (top_y, min_y) =
-                    surface_column_y_range(rift_center[1], world_surface, ocean_floor);
-                state.rifts[rift_idx].active_column = Some((col, top_y, min_y));
-            }
+            state
+                .active_deepen_columns
+                .insert(rift_id, (col, start_y, target_min_y));
         }
 
-        let Some((col, y, mut min_y)) = state.rifts[rift_idx].active_column else {
+        let Some((col, y, min_y)) = state.active_deepen_columns.get(&rift_id).copied() else {
             break;
         };
         if y < min_y {
-            state.rifts[rift_idx].active_column = None;
-            state.active_deepen_edits.remove(&rift_id);
+            state.active_deepen_columns.remove(&rift_id);
             continue;
         }
 
-        let is_deepen = state.active_deepen_edits.contains_key(&rift_id);
-
         let pos = [col[0], y, col[1]];
         if !level.is_loaded(host, pos) {
-            state.rifts[rift_idx].active_column = None;
-            state.active_deepen_edits.remove(&rift_id);
+            state.active_deepen_columns.remove(&rift_id);
             break;
         }
 
-        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
-
-        // On surface passes, if we are stepping through a tall tree trunk or deep water,
-        // extend the column bottom so the entire trunk/pool and soil beneath convert cleanly.
-        if !is_deepen && !current.is_empty() {
-            let s = strip_ns(&current);
-            if is_water_like(&current)
-                || s.ends_with("_log")
-                || s.ends_with("_wood")
-                || s.ends_with("_leaves")
-            {
-                min_y = min_y.min((y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y));
-            }
+        if y - 1 >= min_y {
+            state
+                .active_deepen_columns
+                .insert(rift_id, (col, y - 1, min_y));
+        } else {
+            state.active_deepen_columns.remove(&rift_id);
         }
 
-        // Advance active column cursor cleanly before inspecting/mutating blocks.
-        state.rifts[rift_idx].active_column = if y - 1 >= min_y {
-            Some((col, y - 1, min_y))
-        } else {
-            None
-        };
-
+        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
         if current.is_empty() || is_air_like(&current) {
             skips += 1;
             continue;
         }
 
-        let above = if y + 1 <= OVERWORLD_MAX_Y {
-            level
-                .block(host, [pos[0], pos[1] + 1, pos[2]])
-                .map(|k| k.id(host))
-                .unwrap_or_else(|| "minecraft:air".to_owned())
-        } else {
-            "minecraft:air".to_owned()
-        };
-        let below = if y - 1 >= OVERWORLD_MIN_Y {
-            level
-                .block(host, [pos[0], pos[1] - 1, pos[2]])
-                .map(|k| k.id(host))
-                .unwrap_or_else(|| "minecraft:air".to_owned())
-        } else {
-            "minecraft:bedrock".to_owned()
-        };
-
-        let d2 = horiz_dist_sq(rift_center, pos);
-        let local_flavor = if d2 <= 40 * 40 {
-            rift_flavor
-        } else {
-            NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
-        };
-
-        if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
-            let _ = host.set_block_property(pos, "waterlogged", "false");
-            state.queue_water_evap(pos);
-        }
-
-        let out = transform_block(pos, &current, &above, &below, local_flavor, mature);
-
-        if is_water_like(&current) {
-            state.queue_water_evap(pos);
-        }
-
-        if let Some(target_id) = out.block
-            && let Some(block_state) = resolve_block(host, target_id)
-        {
-            let flags = if target_id == "minecraft:air" {
-                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS
-            } else {
-                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS
-            };
-            if level.set_block(host, pos, block_state, flags).unwrap_or(false) {
-                *budget = budget.saturating_sub(1);
-                state.rifts[rift_idx].corrupted_blocks += 1;
-                if d2 > state.rifts[rift_idx].max_radius_sq {
-                    state.rifts[rift_idx].max_radius_sq = d2;
-                }
-                state.dirty = true;
-
-                if is_deepen
-                    && let Some(left) = state.active_deepen_edits.get_mut(&rift_id)
-                {
-                    *left = left.saturating_sub(1);
-                    if *left == 0 {
-                        state.active_deepen_edits.remove(&rift_id);
-                        state.rifts[rift_idx].active_column = None;
-                    }
-                }
-
-                if let Some(above_id) = out.above
-                    && y + 1 < OVERWORLD_MAX_Y
-                    && is_air_like(&above)
-                    && let Some(above_state) = resolve_block(host, above_id)
-                {
-                    let _ = level.set_block(
-                        host,
-                        [pos[0], pos[1] + 1, pos[2]],
-                        above_state,
-                        BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
-                    );
-                }
-
-                if let Some(below_id) = out.below
-                    && y - 1 > OVERWORLD_MIN_Y
-                    && is_air_like(&below)
-                    && let Some(below_state) = resolve_block(host, below_id)
-                {
-                    let _ = level.set_block(
-                        host,
-                        [pos[0], pos[1] - 1, pos[2]],
-                        below_state,
-                        BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
-                    );
-                }
-            }
+        if apply_corruption_at(
+            host,
+            level,
+            state,
+            rift_idx,
+            rift_id,
+            rift_center,
+            rift_flavor,
+            mature,
+            pos,
+            &current,
+        ) {
+            *budget = budget.saturating_sub(1);
         } else {
             skips += 1;
-        }
-
-        if out.is_corrupt && state.mark_quart_corrupted(pos) {
-            paint_biome_column(level, host, pos[0], pos[2], local_flavor);
-            state.dirty = true;
         }
     }
 }
@@ -756,20 +859,39 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         state.rifts[idx].age_ticks += 1;
     }
 
-    let mut remaining = state.spread_budget;
+    // Compute smooth radius-scaled budgets so outward pace stays steady and urgent
+    // across all radii, capped server-wide at 64 ops/tick when many portals are open.
+    let raw_budgets: Vec<usize> = uncontained_indices
+        .iter()
+        .map(|&idx| effective_rift_budget(state.spread_budget, state.rifts[idx].ring_radius))
+        .collect();
+    let total_raw: usize = raw_budgets.iter().sum();
+    let global_cap = (state.spread_budget * 5).clamp(48, 84);
+
     let count = uncontained_indices.len();
     let start = (state.tick as usize) % count;
 
     for offset in 0..count {
-        if remaining == 0 {
-            break;
+        let pos_i = (start + offset) % count;
+        let r_idx = uncontained_indices[pos_i];
+        let rift_budget = if total_raw > global_cap {
+            ((raw_budgets[pos_i] * global_cap) / total_raw).max(2)
+        } else {
+            raw_budgets[pos_i]
+        };
+
+        if state.rifts[r_idx].ring_radius <= 2 {
+            let mut surf = rift_budget;
+            corrupt_surface_step(host, level, state, r_idx, &mut surf);
+        } else {
+            // ~55% surface circular spread + ~45% simultaneous underground spread every tick.
+            let mut surface_budget = ((rift_budget * 55) + 50) / 100;
+            let mut deepen_budget = rift_budget.saturating_sub(surface_budget);
+            corrupt_deepen_step(host, level, state, r_idx, &mut deepen_budget);
+            // Roll any unused underground budget straight into surface so zero budget is wasted.
+            surface_budget += deepen_budget;
+            corrupt_surface_step(host, level, state, r_idx, &mut surface_budget);
         }
-        let r_idx = uncontained_indices[(start + offset) % count];
-        let slice = (remaining / (count - offset)).max(1);
-        let mut sub_budget = slice;
-        corrupt_column_step(host, level, state, r_idx, &mut sub_budget);
-        let spent = slice.saturating_sub(sub_budget);
-        remaining = remaining.saturating_sub(spent);
     }
 }
 

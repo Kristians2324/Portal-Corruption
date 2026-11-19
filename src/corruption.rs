@@ -96,6 +96,19 @@ pub fn is_open_space(name: &str) -> bool {
         )
 }
 
+pub fn is_snow_or_ice(name: &str) -> bool {
+    matches!(
+        strip_ns(name),
+        "snow"
+            | "snow_block"
+            | "powder_snow"
+            | "ice"
+            | "packed_ice"
+            | "blue_ice"
+            | "frosted_ice"
+    )
+}
+
 pub fn is_water_like(name: &str) -> bool {
     matches!(
         strip_ns(name),
@@ -257,43 +270,56 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
 
 /// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
 /// pass converts before moving to the next column on the circular ring.
-/// Keeping the leading edge to a thin surface crust (~4 blocks: grass/soil + top stone)
-/// lets the circular biome push outward continuously without stalling on deep rock.
-pub const SURFACE_CRUST_DEPTH: i32 = 4;
+pub const SURFACE_CRUST_DEPTH: i32 = 5;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
-/// Normal surface portals sweep from tree/surface top down through the surface crust;
-/// deep cave portals sweep a local vertical band around the portal's cave elevation.
+/// Normal surface/mountain portals sweep from the column's highest block down through
+/// the surface crust AND any sheer cliff face (`min_neighbor_floor`) so steep mountains
+/// never leave untouched stone walls behind. Only portals actually lit inside a deep
+/// underground cave (`portal_is_underground = true`) stay centered on cave elevation.
 pub fn surface_column_y_range(
     rift_center_y: i32,
+    portal_is_underground: bool,
     world_surface: i32,
     ocean_floor: i32,
+    min_neighbor_floor: i32,
 ) -> (i32, i32) {
     let ground = ocean_floor.min(world_surface);
     let top_cap = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
-    if rift_center_y < ground - 12 {
+    if portal_is_underground {
         let top_y = (rift_center_y + 12).min(top_cap);
-        let min_y = (rift_center_y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
+        let min_y = (rift_center_y - 8).max(BEDROCK_FLOOR_Y);
         (top_y, min_y)
     } else {
-        let min_y = (ground - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
+        let cliff_bottom = (min_neighbor_floor - 2).max(ground - 28);
+        let min_y = (ground - SURFACE_CRUST_DEPTH)
+            .min(cliff_bottom)
+            .max(BEDROCK_FLOOR_Y);
         (top_cap, min_y)
     }
 }
 
+/// Scales a rift's per-tick block budget gently with `ring_radius` so radial outward
+/// expansion keeps a consistent, urgent pace — neither exploding at tiny radii nor
+/// grinding to a halt once the circle circumference grows large.
+pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
+    let scaled = (6usize + ((ring_radius.max(1) as usize) * 2) / 5).clamp(6, 42);
+    ((scaled * base_budget.max(1) + 7) / 14).max(2)
+}
+
 /// Computes how deep the underground deepening pass can sink at horizontal
-/// distance `horiz_dist` from a rift at `center_y`. Starts shallow so surface
-/// expansion leads, deepens in a cone beneath the rift over time, and reaches
-/// Bedrock (`-63`) once the rift truly matures.
+/// distance `horiz_dist` from a rift at `center_y`. Immediately penetrates shallow
+/// caves underneath, sinks steadily in a cone over time, and reaches Bedrock (`-63`)
+/// as the rift matures.
 pub fn allowed_min_y(center_y: i32, age_ticks: u64, horiz_dist: i32, corrupted_blocks: u64) -> i32 {
-    if corrupted_blocks >= 120_000 || age_ticks >= 18_000 {
+    if corrupted_blocks >= 75_000 || age_ticks >= 9_000 {
         return BEDROCK_FLOOR_Y;
     }
-    let age_sink = (age_ticks / 120).min(140) as i32;
-    let block_sink = (corrupted_blocks / 1_200).min(140) as i32;
+    let age_sink = (age_ticks / 45).min(150) as i32;
+    let block_sink = (corrupted_blocks / 600).min(150) as i32;
     let sink_bonus = age_sink.max(block_sink);
-    let cone_rise = (horiz_dist / 2).min(48);
-    (center_y - 12 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
+    let cone_rise = (horiz_dist / 3).min(40);
+    (center_y - 24 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
 }
 
 fn scar_roll(pos: [i32; 3], salt: u64) -> u64 {
@@ -388,8 +414,8 @@ fn transform_wood_and_foliage(
     h: u64,
 ) -> Option<TransformOutcome> {
     if short.ends_with("_log") || short.ends_with("_wood") {
-        // Leave ~10% dead/stripped Overworld trunks scarred rather than uniform stems.
-        if in_remnant_cluster(pos, 0x712E_A501, 10) {
+        // Leave ~6% dead/stripped Overworld trunks scarred rather than uniform stems.
+        if in_remnant_cluster(pos, 0x712E_A501, 6) {
             return Some(TransformOutcome::replace("minecraft:stripped_oak_log"));
         }
         let stem = match flavor {
@@ -450,8 +476,9 @@ fn transform_stone_family(
         return None;
     }
 
-    // Leave ~12% scarred Overworld stone/cobble pockets so terrain visibly feels native Overworld.
-    if in_remnant_cluster(pos, 0x5CA2_1001, 12) {
+    // Leave ~6% subtle scarred Overworld stone/cobble pockets so terrain still hints
+    // at its Overworld origin without leaving large uncorrupted stone blotches.
+    if in_remnant_cluster(pos, 0x5CA2_1001, 6) {
         if short == "stone" && h % 2 == 0 {
             return Some(TransformOutcome::replace("minecraft:cobblestone"));
         }
@@ -559,11 +586,8 @@ pub fn transform_block(
         return TransformOutcome::replace("minecraft:air");
     }
 
-    if matches!(short, "ice" | "packed_ice" | "blue_ice" | "frosted_ice") {
-        return TransformOutcome::replace("minecraft:air");
-    }
-
-    if matches!(short, "snow" | "snow_block") {
+    // All snow (including powder snow and snow blocks) and ice melt completely away.
+    if is_snow_or_ice(current) {
         return TransformOutcome::replace("minecraft:air");
     }
 
@@ -592,7 +616,7 @@ pub fn transform_block(
             | "muddy_mangrove_roots"
             | "clay"
     ) {
-        if short != "coarse_dirt" && in_remnant_cluster(pos, 0x5CA2_2002, 12) {
+        if short != "coarse_dirt" && in_remnant_cluster(pos, 0x5CA2_2002, 6) {
             if h % 4 == 0 && matches!(short, "grass_block" | "dirt") {
                 return TransformOutcome::unchanged(true);
             }
@@ -620,7 +644,7 @@ pub fn transform_block(
     }
 
     if matches!(short, "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel") {
-        if in_remnant_cluster(pos, 0x5CA2_3003, 12) {
+        if in_remnant_cluster(pos, 0x5CA2_3003, 6) {
             return TransformOutcome::unchanged(true);
         }
         let block = match flavor {
@@ -631,15 +655,15 @@ pub fn transform_block(
         return TransformOutcome::replace(block);
     }
 
-    // Overworld common ores (partially preserved, rest converted into Nether ores/rack).
+    // Overworld common ores (mostly converted into Nether ores, small fraction left scarred).
     if matches!(short, "coal_ore" | "deepslate_coal_ore" | "copper_ore" | "deepslate_copper_ore") {
-        if h % 3 == 0 {
+        if h % 3 != 0 {
             return TransformOutcome::replace("minecraft:nether_quartz_ore");
         }
         return TransformOutcome::unchanged(true);
     }
     if matches!(short, "iron_ore" | "deepslate_iron_ore" | "gold_ore" | "deepslate_gold_ore") {
-        if h % 2 == 0 {
+        if h % 3 != 0 {
             return TransformOutcome::replace("minecraft:nether_gold_ore");
         }
         return TransformOutcome::unchanged(true);
@@ -657,7 +681,7 @@ pub fn transform_block(
             | "deepslate_bricks"
             | "deepslate_tiles"
     ) {
-        if in_remnant_cluster(pos, 0x5CA2_4004, 12) {
+        if in_remnant_cluster(pos, 0x5CA2_4004, 6) {
             return TransformOutcome::replace("minecraft:cracked_stone_bricks");
         }
         let block = match h % 24 {
@@ -828,39 +852,78 @@ mod tests {
                 Some(_) => warped += 1,
             }
         }
-        assert!(kept_or_cobble > 10 && warped > 150);
+        assert!(kept_or_cobble >= 5 && kept_or_cobble <= 40 && warped > 240);
+    }
+
+    #[test]
+    fn snow_powder_snow_and_ice_all_melt_into_air() {
+        for block in [
+            "minecraft:snow",
+            "minecraft:snow_block",
+            "minecraft:powder_snow",
+            "minecraft:ice",
+            "minecraft:packed_ice",
+            "minecraft:blue_ice",
+            "minecraft:frosted_ice",
+        ] {
+            let out = transform_block(
+                [10, 150, 20],
+                block,
+                "minecraft:air",
+                "minecraft:stone",
+                NetherFlavor::CrimsonForest,
+                true,
+            );
+            assert_eq!(out.block, Some("minecraft:air"), "{block} must melt to air");
+        }
     }
 
     #[test]
     fn min_y_sinks_to_bedrock_with_maturity_and_near_core() {
         let early_far = allowed_min_y(64, 0, 40, 20);
         let early_core = allowed_min_y(64, 0, 0, 20);
-        let mid_core = allowed_min_y(64, 3_600, 0, 40_000);
-        let late_core = allowed_min_y(64, 18_000, 0, 10_000);
-        let mature = allowed_min_y(64, 100, 200, 120_000);
+        let mid_core = allowed_min_y(64, 2_400, 0, 30_000);
+        let late_core = allowed_min_y(64, 9_000, 0, 10_000);
+        let mature = allowed_min_y(64, 100, 200, 75_000);
         assert!(early_far > early_core, "rim should stay shallower than core");
-        assert!(early_core > 30, "fresh rift must not immediately bore to bedrock");
+        assert!(early_core < 45 && early_core > 20, "fresh rift starts reaching shallow caves");
         assert!(mid_core < early_core && mid_core > BEDROCK_FLOOR_Y);
         assert_eq!(late_core, BEDROCK_FLOOR_Y);
         assert_eq!(mature, BEDROCK_FLOOR_Y);
     }
 
     #[test]
-    fn surface_column_y_range_keeps_surface_spread_shallow_and_handles_underground_portals() {
-        // Open plains: surface=64, ocean_floor=64 -> shallow crust [66..56], not down to -63.
-        let (top_y, min_y) = surface_column_y_range(64, 64, 64);
+    fn surface_column_y_range_covers_mountain_peaks_cliffs_and_underground_portals() {
+        // Open plains: surface=64, ocean_floor=64, neighbors=64 -> shallow crust [66..59].
+        let (top_y, min_y) = surface_column_y_range(64, false, 64, 64, 64);
         assert_eq!(top_y, 66);
         assert_eq!(min_y, 64 - SURFACE_CRUST_DEPTH);
 
+        // Portal on mountain base (y=90) expanding UP onto a y=170 snowy peak:
+        // must NOT clip top_y at 90+12, and must sweep down sheer cliff face to neighbor y=155!
+        let (peak_top, peak_min) = surface_column_y_range(90, false, 170, 170, 155);
+        assert_eq!(peak_top, 172);
+        assert_eq!(peak_min, 153);
+
         // Tall tree canopy: WorldSurface=82, OceanFloor=64 -> sweeps canopy AND reaches ground crust.
-        let (tree_top, tree_min) = surface_column_y_range(64, 82, 64);
+        let (tree_top, tree_min) = surface_column_y_range(64, false, 82, 64, 64);
         assert_eq!(tree_top, 84);
         assert_eq!(tree_min, 64 - SURFACE_CRUST_DEPTH);
 
-        // Deep underground cave portal at y=10 -> stays centered on cave elevation.
-        let (cave_top, cave_min) = surface_column_y_range(10, 64, 64);
+        // Portal genuinely lit inside a deep cave at y=10 -> stays centered on cave elevation.
+        let (cave_top, cave_min) = surface_column_y_range(10, true, 64, 64, 64);
         assert_eq!(cave_top, 22);
-        assert_eq!(cave_min, 10 - SURFACE_CRUST_DEPTH);
+        assert_eq!(cave_min, 2);
+    }
+
+    #[test]
+    fn effective_budget_scales_smoothly_for_consistent_radial_pace() {
+        let b_small = effective_rift_budget(14, 3);
+        let b_mid = effective_rift_budget(14, 30);
+        let b_large = effective_rift_budget(14, 90);
+        assert!(b_small < b_mid && b_mid < b_large);
+        assert!(b_small <= 8, "small radius should start steady, not explosive");
+        assert!(b_large <= 44, "large radius stays server-friendly");
     }
 
     #[test]

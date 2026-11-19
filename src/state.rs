@@ -64,9 +64,9 @@ pub struct RiftState {
     pub pending_water_evap_set: HashSet<[i32; 3]>,
     pub pending_frontier_columns: VecDeque<[i32; 2]>,
     pub water_sweep_cursor: usize,
-    /// Runtime cap on remaining block conversions for an active underground deepening column
-    /// (keyed by rift id) so underground passes never starve surface circular expansion.
-    pub active_deepen_edits: HashMap<u64, usize>,
+    /// Independent runtime vertical cursor `([x, z], next_y_down, min_y)` for each
+    /// rift's simultaneous underground deepening pass, keyed by rift id.
+    pub active_deepen_columns: HashMap<u64, ([i32; 2], i32, i32)>,
 }
 
 impl Default for RiftState {
@@ -103,7 +103,7 @@ impl RiftState {
             pending_water_evap_set: HashSet::new(),
             pending_frontier_columns: VecDeque::new(),
             water_sweep_cursor: 0,
-            active_deepen_edits: HashMap::new(),
+            active_deepen_columns: HashMap::new(),
         }
     }
 
