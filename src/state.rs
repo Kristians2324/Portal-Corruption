@@ -1,5 +1,6 @@
 use crate::types::{BastionSite, NetherFlavor, RiftSource, build_ring_columns, quart_coords};
 use mod_api::serde_json::{self, Map, Value};
+use mod_api::{ConfigPath, ServerHost, WorldEpoch};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,8 +34,8 @@ pub struct PendingBastion {
     pub queued_tick: u64,
 }
 
-#[derive(Default)]
 pub struct RiftState {
+    pub world_epoch: Option<WorldEpoch>,
     pub world_dir: Option<PathBuf>,
     pub seed: u64,
     pub next_id: u64,
@@ -65,9 +66,16 @@ pub struct RiftState {
     pub water_sweep_cursor: usize,
 }
 
+impl Default for RiftState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RiftState {
     pub fn new() -> Self {
         Self {
+            world_epoch: None,
             world_dir: None,
             seed: 0x51F7_2630,
             next_id: 1,
@@ -176,6 +184,32 @@ impl RiftState {
             }
         }
         summary
+    }
+
+    pub fn load_from_host(&mut self, host: &dyn ServerHost) {
+        if let Ok(path) = ConfigPath::new(SAVE_FILE_NAME)
+            && let Ok(bytes) = host.world_data_files().read(&path)
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+        {
+            self.apply_json(&doc);
+            return;
+        }
+        self.load_from_disk();
+    }
+
+    pub fn save_to_host(&mut self, host: &dyn ServerHost) {
+        if !self.dirty {
+            return;
+        }
+        let json = self.to_json();
+        if let Ok(path) = ConfigPath::new(SAVE_FILE_NAME)
+            && let Ok(bytes) = serde_json::to_vec(&json)
+            && host.world_data_files().write(&path, &bytes).is_ok()
+        {
+            self.dirty = false;
+            return;
+        }
+        self.save_to_disk();
     }
 
     pub fn load_from_disk(&mut self) {
@@ -506,5 +540,13 @@ mod tests {
         let legacy = serde_json::json!({ "version": 1, "spread_budget": 28 });
         loaded.apply_json(&legacy);
         assert_eq!(loaded.spread_budget, 14);
+    }
+
+    #[test]
+    fn default_state_has_nonzero_spread_budget_and_seed() {
+        let d = RiftState::default();
+        assert_eq!(d.spread_budget, 14);
+        assert_eq!(d.next_id, 1);
+        assert_ne!(d.seed, 0);
     }
 }

@@ -45,10 +45,10 @@
 
 ## Package Layout & Building (Horizon Launcher `>= 0.2.78`)
 
-Built as a flat native `.hmod` package targeting `horizon-mod-api` (`nightly-2026-11-18-0b14f8a`, zero mixins):
-- Manifest: [`horizon-mod.toml`](horizon-mod.toml) (`id = "rift_bleed"`, `api = "0.2"`, `horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"`)
+Built as a flat native `.hmod` package targeting `horizon-mod-api` (`nightly-2026-11-18-dd67b76`, zero mixins):
+- Manifest: [`horizon-mod.toml`](horizon-mod.toml) (`id = "rift_bleed"`, `api = "0.2"`, `horizon = "dd67b76ff23e28c6d8e21859df600d31572f81a0"`)
 - Crate & Mod Entry: [`Cargo.toml`](Cargo.toml), [`src/lib.rs`](src/lib.rs)
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Horizon Launcher\horizon-launcher.exe" native-build . --instance Horizon --version nightly-2026-11-18-0b14f8a --trust-native-code --profile optimized
+& "$env:LOCALAPPDATA\Programs\Horizon Launcher\horizon-launcher.exe" native-build . --instance Horizon --version nightly-2026-11-18-dd67b76 --trust-native-code --profile optimized
 ```

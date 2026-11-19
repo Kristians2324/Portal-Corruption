@@ -349,7 +349,9 @@ pub fn select_nether_music(atmo: &ClientAtmosphere, current: Option<&str>) -> Op
         return None;
     }
     let flavor = atmo.dominant_flavor?;
-    Some(Music::new(flavor.music_event(), 900, 3200, true))
+    let desired = flavor.music_event();
+    let replace = current != Some(desired);
+    Some(Music::new(desired, 900, 3200, replace))
 }
 
 pub fn apply_nether_music(atmo: &ClientAtmosphere, event: &mut MusicEvent<'_>) {

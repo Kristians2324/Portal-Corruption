@@ -70,13 +70,18 @@ impl ContainmentView for ServerContainmentView<'_> {
 }
 
 fn ensure_world_initialized(host: &dyn ServerHost, state: &mut RiftState) {
+    let epoch = host.level(OVERWORLD).map(|l| l.epoch());
     let dir = host.world_dir();
-    if dir.is_some() && state.world_dir != dir {
+    let needs_init = match (state.world_epoch, epoch) {
+        (Some(prev), Some(cur)) => prev != cur,
+        (None, Some(_)) => true,
+        _ => dir.is_some() && state.world_dir != dir,
+    };
+    if needs_init {
         let seed = host.level(OVERWORLD).and_then(|l| l.seed(host));
         state.reset_for_world(dir, seed);
-    } else if state.world_dir.is_none() && dir.is_some() {
-        let seed = host.level(OVERWORLD).and_then(|l| l.seed(host));
-        state.reset_for_world(dir, seed);
+        state.world_epoch = epoch;
+        state.load_from_host(host);
     }
 }
 
@@ -415,6 +420,7 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
 
 fn resolve_block(host: &dyn ServerHost, id: &str) -> Option<mod_api::BlockState> {
     host.block_state_id(id)
+        .or_else(|| host.block_key(id).and_then(|k| host.block_state_default(k)))
 }
 
 fn pop_next_loaded_column(
@@ -489,12 +495,11 @@ fn corrupt_column_step(
             let Some(col) = next_col else {
                 break;
             };
-            let Ok(hs) = host.surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface) else {
-                break;
-            };
-            let Some(Some(top)) = hs.first().copied() else {
-                break;
-            };
+            let top = host
+                .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+                .ok()
+                .and_then(|hs| hs.first().copied().flatten())
+                .unwrap_or_else(|| (rift_center[1] + 24).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 3));
             let top_y = (top + 2).min(OVERWORLD_MAX_Y - 1);
             let hdist = (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
             let min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
@@ -678,14 +683,14 @@ impl Hooks for Mod {
     fn world_saved(&self, host: &mut dyn ServerHost, _event: &mut WorldSavedEvent) {
         if let Ok(mut state) = self.state.lock() {
             ensure_world_initialized(host, &mut state);
-            state.save_to_disk();
+            state.save_to_host(host);
         }
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         let ow = host.level(OVERWORLD);
         if let Ok(mut state) = self.state.lock() {
-            state.save_to_disk();
+            state.save_to_host(host);
             if let Some(level) = ow {
                 release_all_forced_chunks(host, level, &mut state);
             }
@@ -696,7 +701,7 @@ impl Hooks for Mod {
         if matches!(event.phase, WorldPhase::WorldCloseFinal | WorldPhase::WorldCloseFailed) {
             let ow = host.level(OVERWORLD);
             if let Ok(mut state) = self.state.lock() {
-                state.save_to_disk();
+                state.save_to_host(host);
                 if let Some(level) = ow {
                     release_all_forced_chunks(host, level, &mut state);
                 }
@@ -1071,7 +1076,7 @@ impl Hooks for Mod {
         bastion::tick_bastion_emergence(server, event.level, &mut state);
 
         if state.tick % 200 == 0 {
-            state.save_to_disk();
+            state.save_to_host(server);
         }
     }
 
