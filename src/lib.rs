@@ -8,12 +8,15 @@ mod types;
 
 use atmosphere::{ClientAtmosphere, ParticlePalette};
 use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
-use corruption::{allowed_min_y, is_air_like, is_water_like, transform_block};
+use corruption::{
+    SURFACE_CRUST_DEPTH, allowed_min_y, is_air_like, is_water_like, surface_column_y_range,
+    transform_block,
+};
 use mobs::paint_biome_column;
 use state::RiftState;
 use types::{
-    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, build_ring_columns,
-    dist_sq, horiz_dist_sq, neighbors_6, strip_ns,
+    BEDROCK_FLOOR_Y, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource,
+    build_ring_columns, dist_sq, horiz_dist_sq, neighbors_6, strip_ns,
 };
 
 use mod_api::{
@@ -456,6 +459,26 @@ fn pop_next_loaded_column(
     None
 }
 
+/// Maximum underground block conversions per deepening column visit so
+/// underground corruption sinks gradually (~20-25% of budget) while the
+/// surface circular biome expands smoothly (~75-80% of budget).
+const DEEPEN_EDIT_CAP: usize = 8;
+
+fn query_column_heights(host: &mut dyn ServerHost, col: [i32; 2], fallback_y: i32) -> (i32, i32) {
+    let fallback = (fallback_y + 24).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 3);
+    let world_surface = host
+        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+        .ok()
+        .and_then(|hs| hs.first().copied().flatten())
+        .unwrap_or(fallback);
+    let ocean_floor = host
+        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::OceanFloor)
+        .ok()
+        .and_then(|hs| hs.first().copied().flatten())
+        .unwrap_or(world_surface);
+    (world_surface, ocean_floor)
+}
+
 fn corrupt_column_step(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -464,23 +487,36 @@ fn corrupt_column_step(
     budget: &mut usize,
 ) {
     let mut skips = 0usize;
-    while *budget > 0 && skips < 48 {
+    let mut deepened_this_tick = false;
+    while *budget > 0 {
         let rift_id = state.rifts[rift_idx].id;
+        let is_deepen = state.active_deepen_edits.contains_key(&rift_id);
+        let max_skips = if is_deepen { 160 } else { 48 };
+        if skips >= max_skips {
+            break;
+        }
+
         let rift_center = state.rifts[rift_idx].center;
         let rift_flavor = state.rifts[rift_idx].flavor;
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
-        let mature = rift_blocks >= 2_000 || rift_age >= 1_200;
+        let mature = rift_blocks >= 40_000 || rift_age >= 6_000;
 
         if state.rifts[rift_idx].active_column.is_none() {
-            // Alternate 360-degree expansion ring with periodic inner-ring deepening down to bedrock.
-            let next_col = if let Some(col) = state.pending_frontier_columns.pop_front() {
+            state.active_deepen_edits.remove(&rift_id);
+            let mut chosen_deepen = false;
+            // Prioritize 360-degree surface crust expansion; run capped underground deepening
+            // every 3rd tick once the surface circle is established.
+            let mut next_col = if let Some(col) = state.pending_frontier_columns.pop_front() {
                 if level.is_loaded(host, [col[0], 64, col[1]]) {
                     Some(col)
                 } else {
                     None
                 }
-            } else if state.tick % 4 == 1 && state.rifts[rift_idx].ring_radius > 2 {
+            } else if !deepened_this_tick
+                && state.tick % 3 == 1
+                && state.rifts[rift_idx].ring_radius > 4
+            {
                 let r = &mut state.rifts[rift_idx];
                 if r.deepen_columns.is_empty() {
                     r.deepen_radius = if r.deepen_radius + 1 >= r.ring_radius {
@@ -488,56 +524,115 @@ fn corrupt_column_step(
                     } else {
                         r.deepen_radius + 1
                     };
-                    r.deepen_columns = build_ring_columns(rift_center[0], rift_center[2], r.deepen_radius);
+                    r.deepen_columns =
+                        build_ring_columns(rift_center[0], rift_center[2], r.deepen_radius);
                 }
                 let mut d_rad = r.deepen_radius;
-                let picked = pop_next_loaded_column(host, level, &mut r.deepen_columns, &mut d_rad, rift_center);
+                let picked = pop_next_loaded_column(
+                    host,
+                    level,
+                    &mut r.deepen_columns,
+                    &mut d_rad,
+                    rift_center,
+                );
                 r.deepen_radius = d_rad;
+                chosen_deepen = picked.is_some();
                 picked
             } else {
                 let r = &mut state.rifts[rift_idx];
                 let mut ring_r = r.ring_radius;
-                let picked = pop_next_loaded_column(host, level, &mut r.ring_columns, &mut ring_r, rift_center);
+                let picked = pop_next_loaded_column(
+                    host,
+                    level,
+                    &mut r.ring_columns,
+                    &mut ring_r,
+                    rift_center,
+                );
                 r.ring_radius = ring_r;
                 picked
             };
 
-            let Some(col) = next_col else {
-                break;
-            };
-            let top = host
-                .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
-                .ok()
-                .and_then(|hs| hs.first().copied().flatten())
-                .unwrap_or_else(|| (rift_center[1] + 24).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 3));
-            let top_y = (top + 2).min(OVERWORLD_MAX_Y - 1);
-            let hdist = (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
-            let min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
-            state.rifts[rift_idx].active_column = Some((col, top_y, min_y));
+            if chosen_deepen && let Some(col) = next_col {
+                let (world_surface, ocean_floor) = query_column_heights(host, col, rift_center[1]);
+                let (_, crust_bottom) =
+                    surface_column_y_range(rift_center[1], world_surface, ocean_floor);
+                let hdist =
+                    (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
+                let target_min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
+                if target_min_y < crust_bottom {
+                    deepened_this_tick = true;
+                    state.active_deepen_edits.insert(rift_id, DEEPEN_EDIT_CAP);
+                    state.rifts[rift_idx].active_column =
+                        Some((col, crust_bottom, target_min_y));
+                    next_col = None;
+                } else {
+                    // Underground depth hasn't reached below the surface crust here yet —
+                    // fall back to expanding the surface circle instead of wasting the turn.
+                    chosen_deepen = false;
+                    let r = &mut state.rifts[rift_idx];
+                    let mut ring_r = r.ring_radius;
+                    next_col = pop_next_loaded_column(
+                        host,
+                        level,
+                        &mut r.ring_columns,
+                        &mut ring_r,
+                        rift_center,
+                    );
+                    r.ring_radius = ring_r;
+                }
+            }
+
+            if !chosen_deepen {
+                let Some(col) = next_col else {
+                    break;
+                };
+                let (world_surface, ocean_floor) = query_column_heights(host, col, rift_center[1]);
+                let (top_y, min_y) =
+                    surface_column_y_range(rift_center[1], world_surface, ocean_floor);
+                state.rifts[rift_idx].active_column = Some((col, top_y, min_y));
+            }
         }
 
-        let Some((col, y, min_y)) = state.rifts[rift_idx].active_column else {
+        let Some((col, y, mut min_y)) = state.rifts[rift_idx].active_column else {
             break;
         };
         if y < min_y {
             state.rifts[rift_idx].active_column = None;
+            state.active_deepen_edits.remove(&rift_id);
             continue;
         }
 
-        // Advance active column cursor cleanly before inspecting blocks.
+        let is_deepen = state.active_deepen_edits.contains_key(&rift_id);
+
+        let pos = [col[0], y, col[1]];
+        if !level.is_loaded(host, pos) {
+            state.rifts[rift_idx].active_column = None;
+            state.active_deepen_edits.remove(&rift_id);
+            break;
+        }
+
+        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
+
+        // On surface passes, if we are stepping through a tall tree trunk or deep water,
+        // extend the column bottom so the entire trunk/pool and soil beneath convert cleanly.
+        if !is_deepen && !current.is_empty() {
+            let s = strip_ns(&current);
+            if is_water_like(&current)
+                || s.ends_with("_log")
+                || s.ends_with("_wood")
+                || s.ends_with("_leaves")
+            {
+                min_y = min_y.min((y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y));
+            }
+        }
+
+        // Advance active column cursor cleanly before inspecting/mutating blocks.
         state.rifts[rift_idx].active_column = if y - 1 >= min_y {
             Some((col, y - 1, min_y))
         } else {
             None
         };
 
-        let pos = [col[0], y, col[1]];
-        if !level.is_loaded(host, pos) {
-            state.rifts[rift_idx].active_column = None;
-            break;
-        }
-
-        let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
         if current.is_empty() || is_air_like(&current) {
             skips += 1;
             continue;
@@ -593,6 +688,16 @@ fn corrupt_column_step(
                     state.rifts[rift_idx].max_radius_sq = d2;
                 }
                 state.dirty = true;
+
+                if is_deepen
+                    && let Some(left) = state.active_deepen_edits.get_mut(&rift_id)
+                {
+                    *left = left.saturating_sub(1);
+                    if *left == 0 {
+                        state.active_deepen_edits.remove(&rift_id);
+                        state.rifts[rift_idx].active_column = None;
+                    }
+                }
 
                 if let Some(above_id) = out.above
                     && y + 1 < OVERWORLD_MAX_Y

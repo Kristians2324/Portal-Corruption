@@ -255,16 +255,45 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
     )
 }
 
-/// Computes how deep corruption reaches at horizontal distance `horiz_dist`
-/// from a rift at `center_y`, immediately penetrating underground caves near the
-/// core and boring all the way to Bedrock (`-63`) as the rift matures.
+/// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
+/// pass converts before moving to the next column on the circular ring.
+/// Keeping the outer ring focused on the surface crust lets the circular biome
+/// expand smoothly while inner deepening passes sink underground separately.
+pub const SURFACE_CRUST_DEPTH: i32 = 8;
+
+/// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
+/// Normal surface portals sweep from tree/surface top down through the surface crust;
+/// deep cave portals sweep a local vertical band around the portal's cave elevation.
+pub fn surface_column_y_range(
+    rift_center_y: i32,
+    world_surface: i32,
+    ocean_floor: i32,
+) -> (i32, i32) {
+    let ground = ocean_floor.min(world_surface);
+    let top_cap = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
+    if rift_center_y < ground - 12 {
+        let top_y = (rift_center_y + 12).min(top_cap);
+        let min_y = (rift_center_y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
+        (top_y, min_y)
+    } else {
+        let min_y = (ground - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
+        (top_cap, min_y)
+    }
+}
+
+/// Computes how deep the underground deepening pass can sink at horizontal
+/// distance `horiz_dist` from a rift at `center_y`. Starts shallow so surface
+/// expansion leads, deepens in a cone beneath the rift over time, and reaches
+/// Bedrock (`-63`) once the rift truly matures.
 pub fn allowed_min_y(center_y: i32, age_ticks: u64, horiz_dist: i32, corrupted_blocks: u64) -> i32 {
-    if corrupted_blocks >= 2_000 || age_ticks >= 1_200 {
+    if corrupted_blocks >= 120_000 || age_ticks >= 18_000 {
         return BEDROCK_FLOOR_Y;
     }
-    let sink_bonus = (age_ticks / 10).min(160) as i32;
-    let cone_rise = (horiz_dist / 4).min(36);
-    (center_y - 26 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
+    let age_sink = (age_ticks / 120).min(140) as i32;
+    let block_sink = (corrupted_blocks / 1_200).min(140) as i32;
+    let sink_bonus = age_sink.max(block_sink);
+    let cone_rise = (horiz_dist / 2).min(48);
+    (center_y - 12 - sink_bonus + cone_rise).clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 8)
 }
 
 fn scar_roll(pos: [i32; 3], salt: u64) -> u64 {
@@ -804,13 +833,34 @@ mod tests {
 
     #[test]
     fn min_y_sinks_to_bedrock_with_maturity_and_near_core() {
-        let early_far = allowed_min_y(64, 0, 120, 20);
+        let early_far = allowed_min_y(64, 0, 40, 20);
         let early_core = allowed_min_y(64, 0, 0, 20);
-        let late_core = allowed_min_y(64, 1_500, 0, 1_500);
-        let mature = allowed_min_y(64, 100, 200, 2_000);
-        assert!(early_far > early_core);
+        let mid_core = allowed_min_y(64, 3_600, 0, 40_000);
+        let late_core = allowed_min_y(64, 18_000, 0, 10_000);
+        let mature = allowed_min_y(64, 100, 200, 120_000);
+        assert!(early_far > early_core, "rim should stay shallower than core");
+        assert!(early_core > 30, "fresh rift must not immediately bore to bedrock");
+        assert!(mid_core < early_core && mid_core > BEDROCK_FLOOR_Y);
         assert_eq!(late_core, BEDROCK_FLOOR_Y);
         assert_eq!(mature, BEDROCK_FLOOR_Y);
+    }
+
+    #[test]
+    fn surface_column_y_range_keeps_surface_spread_shallow_and_handles_underground_portals() {
+        // Open plains: surface=64, ocean_floor=64 -> shallow crust [66..56], not down to -63.
+        let (top_y, min_y) = surface_column_y_range(64, 64, 64);
+        assert_eq!(top_y, 66);
+        assert_eq!(min_y, 64 - SURFACE_CRUST_DEPTH);
+
+        // Tall tree canopy: WorldSurface=82, OceanFloor=64 -> sweeps canopy AND reaches ground crust.
+        let (tree_top, tree_min) = surface_column_y_range(64, 82, 64);
+        assert_eq!(tree_top, 84);
+        assert_eq!(tree_min, 64 - SURFACE_CRUST_DEPTH);
+
+        // Deep underground cave portal at y=10 -> stays centered on cave elevation.
+        let (cave_top, cave_min) = surface_column_y_range(10, 64, 64);
+        assert_eq!(cave_top, 22);
+        assert_eq!(cave_min, 10 - SURFACE_CRUST_DEPTH);
     }
 
     #[test]

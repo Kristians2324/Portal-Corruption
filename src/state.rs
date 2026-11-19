@@ -1,7 +1,7 @@
 use crate::types::{BastionSite, NetherFlavor, RiftSource, build_ring_columns, quart_coords};
 use mod_api::serde_json::{self, Map, Value};
 use mod_api::{ConfigPath, ServerHost, WorldEpoch};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,9 @@ pub struct RiftState {
     pub pending_water_evap_set: HashSet<[i32; 3]>,
     pub pending_frontier_columns: VecDeque<[i32; 2]>,
     pub water_sweep_cursor: usize,
+    /// Runtime cap on remaining block conversions for an active underground deepening column
+    /// (keyed by rift id) so underground passes never starve surface circular expansion.
+    pub active_deepen_edits: HashMap<u64, usize>,
 }
 
 impl Default for RiftState {
@@ -100,6 +103,7 @@ impl RiftState {
             pending_water_evap_set: HashSet::new(),
             pending_frontier_columns: VecDeque::new(),
             water_sweep_cursor: 0,
+            active_deepen_edits: HashMap::new(),
         }
     }
 
