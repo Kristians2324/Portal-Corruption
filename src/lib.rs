@@ -460,9 +460,9 @@ fn pop_next_loaded_column(
 }
 
 /// Maximum underground block conversions per deepening column visit so
-/// underground corruption sinks gradually (~20-25% of budget) while the
-/// surface circular biome expands smoothly (~75-80% of budget).
-const DEEPEN_EDIT_CAP: usize = 8;
+/// underground corruption trails gently (~10% of budget) while ~90% of the
+/// budget continuously pushes the surface circular biome outward.
+const DEEPEN_EDIT_CAP: usize = 5;
 
 fn query_column_heights(host: &mut dyn ServerHost, col: [i32; 2], fallback_y: i32) -> (i32, i32) {
     let fallback = (fallback_y + 24).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 3);
@@ -514,7 +514,7 @@ fn corrupt_column_step(
                     None
                 }
             } else if !deepened_this_tick
-                && state.tick % 3 == 1
+                && state.tick % 4 == 1
                 && state.rifts[rift_idx].ring_radius > 4
             {
                 let r = &mut state.rifts[rift_idx];

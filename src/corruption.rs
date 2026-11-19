@@ -257,9 +257,9 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
 
 /// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
 /// pass converts before moving to the next column on the circular ring.
-/// Keeping the outer ring focused on the surface crust lets the circular biome
-/// expand smoothly while inner deepening passes sink underground separately.
-pub const SURFACE_CRUST_DEPTH: i32 = 8;
+/// Keeping the leading edge to a thin surface crust (~4 blocks: grass/soil + top stone)
+/// lets the circular biome push outward continuously without stalling on deep rock.
+pub const SURFACE_CRUST_DEPTH: i32 = 4;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
 /// Normal surface portals sweep from tree/surface top down through the surface crust;
