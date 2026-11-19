@@ -77,6 +77,22 @@ pub fn is_open_space(name: &str) -> bool {
                 | "sugar_cane"
                 | "leaf_litter"
                 | "wildflowers"
+                | "bush"
+                | "firefly_bush"
+                | "short_dry_grass"
+                | "tall_dry_grass"
+                | "cactus_flower"
+                | "closed_eyeblossom"
+                | "open_eyeblossom"
+                | "pale_moss_carpet"
+                | "pale_hanging_moss"
+                | "torchflower"
+                | "pitcher_plant"
+                | "wither_rose"
+                | "hanging_roots"
+                | "spore_blossom"
+                | "cave_vines"
+                | "cave_vines_plant"
         )
 }
 
@@ -299,21 +315,39 @@ fn flavor_surface_block(flavor: NetherFlavor, h: u64) -> &'static str {
     }
 }
 
+/// Vanilla Nether flora (`crimson_roots`, `warped_roots`, `nether_sprouts`,
+/// `crimson_fungus`, `warped_fungus`) only stays planted on nylium or soul soil —
+/// placing them on `netherrack`, `soul_sand`, `basalt`, or `blackstone` pops them
+/// off as dropped items on the next neighbor update.
+pub fn can_support_nether_flora(surface_block: &str) -> bool {
+    matches!(
+        strip_ns(surface_block),
+        "crimson_nylium" | "warped_nylium" | "soul_soil"
+    )
+}
+
 fn flavor_surface_flora(flavor: NetherFlavor, surface_block: &str, h: u64) -> Option<&'static str> {
-    if matches!(surface_block, "minecraft:coarse_dirt" | "minecraft:magma_block") {
-        return None;
+    let roll = h % 100;
+    if can_support_nether_flora(surface_block) {
+        match (flavor, roll) {
+            (NetherFlavor::CrimsonForest, 0..=13) => return Some("minecraft:crimson_roots"),
+            (NetherFlavor::CrimsonForest, 14..=17) => return Some("minecraft:crimson_fungus"),
+            (NetherFlavor::WarpedForest, 0..=12) => return Some("minecraft:warped_roots"),
+            (NetherFlavor::WarpedForest, 13..=17) => return Some("minecraft:nether_sprouts"),
+            (NetherFlavor::WarpedForest, 18..=21) => return Some("minecraft:warped_fungus"),
+            _ => {}
+        }
     }
-    match (flavor, h % 100) {
-        (NetherFlavor::CrimsonForest, 0..=11) => Some("minecraft:crimson_roots"),
-        (NetherFlavor::CrimsonForest, 12..=14) => Some("minecraft:crimson_fungus"),
-        (NetherFlavor::CrimsonForest, 15) => Some("minecraft:fire"),
-        (NetherFlavor::WarpedForest, 0..=10) => Some("minecraft:warped_roots"),
-        (NetherFlavor::WarpedForest, 11..=14) => Some("minecraft:nether_sprouts"),
-        (NetherFlavor::WarpedForest, 15..=17) => Some("minecraft:warped_fungus"),
-        (NetherFlavor::SoulSandValley, 0..=3) => Some("minecraft:soul_fire"),
-        (NetherFlavor::BasaltDeltas, 0..=1) => Some("minecraft:fire"),
-        (NetherFlavor::NetherWastes, 0..=2) => Some("minecraft:fire"),
-        (NetherFlavor::NetherWastes, 3..=5) => Some("minecraft:crimson_roots"),
+
+    match (flavor, strip_ns(surface_block), roll) {
+        (NetherFlavor::SoulSandValley, "soul_sand" | "soul_soil", 0..=3) => {
+            Some("minecraft:soul_fire")
+        }
+        (NetherFlavor::CrimsonForest, "netherrack" | "magma_block", 0..=2) => {
+            Some("minecraft:fire")
+        }
+        (NetherFlavor::BasaltDeltas, "magma_block", 0..=3) => Some("minecraft:fire"),
+        (NetherFlavor::NetherWastes, "netherrack" | "magma_block", 0..=2) => Some("minecraft:fire"),
         _ => None,
     }
 }
@@ -504,16 +538,10 @@ pub fn transform_block(
         return TransformOutcome::replace("minecraft:air");
     }
 
-    // Soft Overworld foliage / flowers -> scorched flora or air.
+    // Soft Overworld foliage / flowers / vines / snow -> clear cleanly to air so
+    // Nether roots & fungi are only ever planted AFTER the ground beneath becomes nylium.
     if is_open_space(current) {
-        let flora = match (flavor, h % 12) {
-            (NetherFlavor::CrimsonForest, 0..=4) => "minecraft:crimson_roots",
-            (NetherFlavor::CrimsonForest, 5) => "minecraft:crimson_fungus",
-            (NetherFlavor::WarpedForest, 0..=3) => "minecraft:warped_roots",
-            (NetherFlavor::WarpedForest, 4..=5) => "minecraft:nether_sprouts",
-            _ => "minecraft:air",
-        };
-        return TransformOutcome::replace(flora);
+        return TransformOutcome::replace("minecraft:air");
     }
 
     if let Some(wood_out) = transform_wood_and_foliage(short, pos, flavor, h) {
@@ -810,6 +838,79 @@ mod tests {
                         "missing column ({}, {})",
                         10 + dx,
                         -20 + dz
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nether_flora_only_plants_on_supporting_nether_blocks() {
+        let is_nether_plant = |b: &str| {
+            matches!(
+                strip_ns(b),
+                "crimson_roots"
+                    | "warped_roots"
+                    | "nether_sprouts"
+                    | "crimson_fungus"
+                    | "warped_fungus"
+            )
+        };
+
+        // Clearing Overworld foliage/vines/tall grass must produce air, never floating Nether plants.
+        for weed in [
+            "minecraft:short_grass",
+            "minecraft:tall_grass",
+            "minecraft:fern",
+            "minecraft:vine",
+            "minecraft:dandelion",
+            "minecraft:snow",
+        ] {
+            for flavor in [
+                NetherFlavor::CrimsonForest,
+                NetherFlavor::WarpedForest,
+                NetherFlavor::NetherWastes,
+            ] {
+                for x in 0..40 {
+                    let out = transform_block(
+                        [x, 70, x * 3],
+                        weed,
+                        "minecraft:air",
+                        "minecraft:stone",
+                        flavor,
+                        true,
+                    );
+                    assert_eq!(out.block, Some("minecraft:air"));
+                    assert_eq!(out.above, None);
+                }
+            }
+        }
+
+        // Whenever a soil block spawns a Nether plant above it, the ground block itself
+        // must support Nether flora (crimson_nylium / warped_nylium / soul_soil), never netherrack.
+        for flavor in [
+            NetherFlavor::CrimsonForest,
+            NetherFlavor::WarpedForest,
+            NetherFlavor::SoulSandValley,
+            NetherFlavor::BasaltDeltas,
+            NetherFlavor::NetherWastes,
+        ] {
+            for x in 0..300 {
+                let out = transform_block(
+                    [x, 64, x * 5],
+                    "minecraft:grass_block",
+                    "minecraft:air",
+                    "minecraft:dirt",
+                    flavor,
+                    true,
+                );
+                if let Some(above) = out.above
+                    && is_nether_plant(above)
+                {
+                    let base = out.block.expect("plant must have converted base block");
+                    assert!(
+                        can_support_nether_flora(base),
+                        "placed {above} on unsupported base {base} in {flavor:?}"
                     );
                 }
             }

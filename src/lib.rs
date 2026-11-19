@@ -603,7 +603,7 @@ fn corrupt_column_step(
                         host,
                         [pos[0], pos[1] + 1, pos[2]],
                         above_state,
-                        BlockUpdateFlags::CLIENTS,
+                        BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
                     );
                 }
 
@@ -616,7 +616,7 @@ fn corrupt_column_step(
                         host,
                         [pos[0], pos[1] - 1, pos[2]],
                         below_state,
-                        BlockUpdateFlags::CLIENTS,
+                        BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
                     );
                 }
             }

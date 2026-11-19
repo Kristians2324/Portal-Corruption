@@ -1,5 +1,5 @@
 use crate::atmosphere::ParticlePalette;
-use crate::corruption::is_air_like;
+use crate::corruption::{is_air_like, is_open_space};
 use crate::state::RiftState;
 use crate::types::{
     NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, dist_sq, horiz_dist_sq,
@@ -472,6 +472,7 @@ fn process_hoglin_edge_spreading(
     let Some(netherrack) = host.block_state_id("minecraft:netherrack") else {
         return;
     };
+    let air = host.block_state_id("minecraft:air");
     let roots = host.block_state_id("minecraft:crimson_roots");
 
     let mut total_trampled = 0usize;
@@ -526,11 +527,29 @@ fn process_hoglin_edge_spreading(
                     ) {
                         continue;
                     }
+                    let above_pos = [p[0], p[1] + 1, p[2]];
                     let above = level
-                        .block(host, [p[0], p[1] + 1, p[2]])
+                        .block(host, above_pos)
                         .map(|k| k.id(host))
                         .unwrap_or_default();
-                    let use_nylium = is_air_like(&above)
+                    let cleared_above = if !is_air_like(&above) && is_open_space(&above) {
+                        if let Some(air_state) = air {
+                            let _ = level.set_block(
+                                host,
+                                above_pos,
+                                air_state,
+                                BlockUpdateFlags::CLIENTS
+                                    | BlockUpdateFlags::KNOWN_SHAPE
+                                    | BlockUpdateFlags::SUPPRESS_DROPS,
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        is_air_like(&above)
+                    };
+                    let use_nylium = cleared_above
                         && spatial_hash(p[0], p[1], p[2], state.tick ^ u64::from(*id)) % 3 != 0;
                     let chosen = if use_nylium { nylium } else { netherrack };
                     if level
@@ -538,7 +557,7 @@ fn process_hoglin_edge_spreading(
                             host,
                             p,
                             chosen,
-                            BlockUpdateFlags::CLIENTS | BlockUpdateFlags::NEIGHBORS,
+                            BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
                         )
                         .unwrap_or(false)
                     {
@@ -547,14 +566,14 @@ fn process_hoglin_edge_spreading(
                         trampled_any = true;
                         if use_nylium
                             && let Some(r_state) = roots
-                            && is_air_like(&above)
+                            && cleared_above
                             && spatial_hash(p[0], p[1] + 1, p[2], 0x4061) % 4 == 0
                         {
                             let _ = level.set_block(
                                 host,
-                                [p[0], p[1] + 1, p[2]],
+                                above_pos,
                                 r_state,
-                                BlockUpdateFlags::CLIENTS,
+                                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
                             );
                         }
                         state.pending_frontier_columns.push_back([p[0], p[2]]);
