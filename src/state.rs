@@ -51,6 +51,9 @@ pub struct RiftState {
     pub nether_touched_mobs: HashSet<u32>,
     /// Tracks known living Nether predator entity IDs so `living_death` recognizes attackers cleanly.
     pub known_nether_mobs: HashSet<u32>,
+    /// Tracks Piglins/Brutes/Hoglins already stabilized with `IsImmuneToZombification: 1b`
+    /// so vanilla Overworld zombification never triggers repeated conversion sounds.
+    pub zombification_immune_mobs: HashSet<u32>,
     /// Active chunk tickets held by Rift Bleed via `ChunkRef::set_forced`.
     pub core_chunks: HashSet<[i32; 2]>,
     pub frontier_chunks: VecDeque<[i32; 2]>,
@@ -92,6 +95,7 @@ impl RiftState {
             corrupted_quart_cols: HashSet::new(),
             nether_touched_mobs: HashSet::new(),
             known_nether_mobs: HashSet::new(),
+            zombification_immune_mobs: HashSet::new(),
             core_chunks: HashSet::new(),
             frontier_chunks: VecDeque::new(),
             pending_bastion: None,

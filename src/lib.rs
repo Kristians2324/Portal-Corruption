@@ -1103,9 +1103,25 @@ impl Hooks for Mod {
         host: &mut dyn ServerHost,
         event: &mut LivingConversionPreEvent<'_>,
     ) -> Flow {
-        if let Ok(state) = self.state.try_lock()
-            && mobs::should_block_zombification(host, &state, event.entity, event.kind, event.outcome)
-        {
+        let should_block = self
+            .state
+            .try_lock()
+            .is_ok_and(|state| {
+                mobs::should_block_zombification(
+                    host,
+                    &state,
+                    event.entity,
+                    event.kind,
+                    event.outcome,
+                )
+            });
+        if should_block {
+            // Immediately set IsImmuneToZombification=1 & TimeInOverworld=0 so vanilla
+            // never re-triggers playConvertedSound() every single tick after cancellation.
+            mobs::stabilize_zombification_immune(host, event.entity);
+            if let Ok(mut state) = self.state.try_lock() {
+                state.zombification_immune_mobs.insert(event.entity);
+            }
             return Flow::Cancel;
         }
         Flow::Continue

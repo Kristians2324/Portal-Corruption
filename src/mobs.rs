@@ -162,6 +162,18 @@ pub fn pos_is_corrupted(
     state.is_quart_corrupted(pos) || local_corrupt_flavor(host, level, pos).is_some()
 }
 
+/// Marks a Piglin, Piglin Brute, or Hoglin immune to Overworld zombification and resets
+/// `TimeInOverworld` to 0 so vanilla never enters a repeated shaking / `playConvertedSound` loop.
+pub fn stabilize_zombification_immune(host: &mut dyn ServerHost, entity_id: u32) {
+    let Some(ent) = host.entity(entity_id) else {
+        return;
+    };
+    let mut nbt = Compound::new();
+    nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+    nbt.insert("TimeInOverworld".into(), Tag::Int(0));
+    let _ = ent.merge_nbt(host, nbt);
+}
+
 pub fn should_block_zombification(
     host: &dyn Host,
     state: &RiftState,
@@ -285,10 +297,17 @@ fn process_predator_hunting_and_buffs(
     let mut hunters: Vec<(EntityRef, [f64; 3])> = Vec::new();
     let mut prey: Vec<(EntityRef, [f64; 3])> = Vec::new();
     let mut fire_buffs: Vec<EntityRef> = Vec::new();
+    let mut immunize_mobs: Vec<u32> = Vec::new();
     let mut touched_buffs: Vec<(EntityRef, [f64; 3])> = Vec::new();
 
     state.known_nether_mobs.clear();
     for (ent, id, kind, pos) in entities {
+        let bp = [
+            pos[0].floor() as i32,
+            pos[1].floor() as i32,
+            pos[2].floor() as i32,
+        ];
+
         if is_nether_predator(kind) {
             state.known_nether_mobs.insert(*id);
             if matches!(
@@ -297,18 +316,20 @@ fn process_predator_hunting_and_buffs(
             ) {
                 hunters.push((*ent, *pos));
             }
-            if is_piglin_or_hoglin(kind) && (state.tick + u64::from(*id)) % 80 < MOB_TICK_INTERVAL {
-                fire_buffs.push(*ent);
+            if is_piglin_or_hoglin(kind) {
+                if (state.tick + u64::from(*id)) % 80 < MOB_TICK_INTERVAL {
+                    fire_buffs.push(*ent);
+                }
+                if pos_is_corrupted(host, level, state, bp)
+                    && state.zombification_immune_mobs.insert(*id)
+                {
+                    immunize_mobs.push(*id);
+                }
             }
         } else if nether_death_conversion_target(kind).is_some() {
             prey.push((*ent, *pos));
         }
 
-        let bp = [
-            pos[0].floor() as i32,
-            pos[1].floor() as i32,
-            pos[2].floor() as i32,
-        ];
         if is_nether_touched_candidate(kind) && location_unlocks_nether_mobs(state, bp) {
             let newly_touched = state.nether_touched_mobs.insert(*id);
             if newly_touched {
@@ -327,7 +348,13 @@ fn process_predator_hunting_and_buffs(
             }
         }
     }
+    state
+        .zombification_immune_mobs
+        .retain(|id| state.known_nether_mobs.contains(id));
 
+    for id in immunize_mobs {
+        stabilize_zombification_immune(host, id);
+    }
     for ent in fire_buffs {
         apply_mob_effects(host, ent, 20 * 90, 0);
     }
@@ -342,6 +369,14 @@ fn process_predator_hunting_and_buffs(
     let hunt_range_sq = 32.0 * 32.0;
 
     for (hunter_ent, h_pos) in hunters {
+        let Some(mob) = host.mob(hunter_ent) else {
+            continue;
+        };
+        // Skip hunters that already have an active target so we don't re-trigger
+        // aggro / angry sounds every second.
+        if mob.target(host).is_some() {
+            continue;
+        }
         let mut best: Option<(EntityRef, f64)> = None;
         for (prey_ent, p_pos) in &prey {
             let dx = h_pos[0] - p_pos[0];
@@ -353,12 +388,13 @@ fn process_predator_hunting_and_buffs(
             }
         }
         if let Some((victim_ent, _)) = best
-            && let Some(mob) = host.mob(hunter_ent)
             && let Some(target_living) = host.living(victim_ent)
         {
             let _ = mob.set_target(host, Some(target_living));
             let _ = mob.set_brain_target(host, Some(target_living));
-            let _ = mob.set_aggressive(host, true);
+            if mob.is_aggressive(host) != Some(true) {
+                let _ = mob.set_aggressive(host, true);
+            }
         }
     }
 }
@@ -412,12 +448,16 @@ pub fn handle_living_death(
     }
 
     let mut nbt = Compound::new();
-    if matches!(target_kind, "minecraft:piglin" | "minecraft:hoglin") {
+    if is_piglin_or_hoglin(target_kind) {
         nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+        nbt.insert("TimeInOverworld".into(), Tag::Int(0));
     }
 
     if let Some(new_id) = host.summon(OVERWORLD, target_kind, pos, nbt) {
         state.known_nether_mobs.insert(new_id);
+        if is_piglin_or_hoglin(target_kind) {
+            state.zombification_immune_mobs.insert(new_id);
+        }
         if let Some(new_ent) = host.entity(new_id) {
             apply_mob_effects(host, new_ent, 20 * 180, 20 * 120);
         }
@@ -445,11 +485,11 @@ pub fn handle_living_death(
     }
     let _ = level.play_sound(
         host,
-        "minecraft:entity.zombie_villager.converted",
+        "minecraft:block.fire.extinguish",
         pos,
         SoundSource::Hostile,
+        0.3,
         0.85,
-        0.9,
     );
 }
 
@@ -586,25 +626,15 @@ fn process_hoglin_edge_spreading(
             }
         }
 
-        if trampled_here {
-            if let Some(pal) = particles {
-                let _ = level.send_particles(
-                    host,
-                    &ParticleOptions::simple(pal.crimson_spore),
-                    None,
-                    [pos[0], pos[1] + 0.3, pos[2]],
-                    [0.8, 0.3, 0.8],
-                    0.02,
-                    8,
-                );
-            }
-            let _ = level.play_sound(
+        if trampled_here && let Some(pal) = particles {
+            let _ = level.send_particles(
                 host,
-                "minecraft:entity.hoglin.angry",
-                *pos,
-                SoundSource::Hostile,
-                0.55,
-                0.85,
+                &ParticleOptions::simple(pal.crimson_spore),
+                None,
+                [pos[0], pos[1] + 0.3, pos[2]],
+                [0.8, 0.3, 0.8],
+                0.02,
+                8,
             );
         }
     }
@@ -738,8 +768,9 @@ fn process_supplemental_spawns(
         f64::from(sy)
     };
     let mut nbt = Compound::new();
-    if matches!(mob_kind, "minecraft:piglin" | "minecraft:hoglin") {
+    if is_piglin_or_hoglin(mob_kind) {
         nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+        nbt.insert("TimeInOverworld".into(), Tag::Int(0));
     }
     if let Some(id) = host.summon(
         OVERWORLD,
