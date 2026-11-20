@@ -270,13 +270,16 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
 
 /// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
 /// pass converts before moving to the next column on the circular ring.
-pub const SURFACE_CRUST_DEPTH: i32 = 5;
+/// Penetrates solidly past soil into bedrock-facing mountain/surface stone so
+/// the leading surface edge never stops right where stone begins.
+pub const SURFACE_CRUST_DEPTH: i32 = 10;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
-/// Normal surface/mountain portals sweep from the column's highest block down through
-/// the surface crust AND any sheer cliff face (`min_neighbor_floor`) so steep mountains
-/// never leave untouched stone walls behind. Only portals actually lit inside a deep
-/// underground cave (`portal_is_underground = true`) stay centered on cave elevation.
+/// Normal surface/mountain portals sweep from the column's highest block (up to `Y = 319`)
+/// down through the surface crust AND any sheer cliff face (`min_neighbor_floor`) so steep
+/// mountains never leave untouched stone walls behind. Only young portals lit inside a deep
+/// underground cave (`portal_is_underground = true`) start centered on cave elevation before
+/// breaking out to the surface.
 pub fn surface_column_y_range(
     rift_center_y: i32,
     portal_is_underground: bool,
@@ -287,11 +290,11 @@ pub fn surface_column_y_range(
     let ground = ocean_floor.min(world_surface);
     let top_cap = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
     if portal_is_underground {
-        let top_y = (rift_center_y + 12).min(top_cap);
-        let min_y = (rift_center_y - 8).max(BEDROCK_FLOOR_Y);
+        let top_y = (rift_center_y + 16).min(top_cap);
+        let min_y = (rift_center_y - 10).max(BEDROCK_FLOOR_Y);
         (top_y, min_y)
     } else {
-        let cliff_bottom = (min_neighbor_floor - 2).max(ground - 28);
+        let cliff_bottom = (min_neighbor_floor - 2).max(ground - 36);
         let min_y = (ground - SURFACE_CRUST_DEPTH)
             .min(cliff_bottom)
             .max(BEDROCK_FLOOR_Y);
@@ -300,10 +303,10 @@ pub fn surface_column_y_range(
 }
 
 /// Scales a rift's per-tick block budget gently with `ring_radius` so radial outward
-/// expansion keeps a consistent, urgent pace — neither exploding at tiny radii nor
-/// grinding to a halt once the circle circumference grows large.
+/// expansion and full-depth underground boring both keep a steady, urgent pace across
+/// all radii — neither exploding at tiny radii nor stalling as the circle grows.
 pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
-    let scaled = (6usize + ((ring_radius.max(1) as usize) * 2) / 5).clamp(6, 42);
+    let scaled = (8usize + (ring_radius.max(1) as usize) / 2).clamp(8, 52);
     ((scaled * base_budget.max(1) + 7) / 14).max(2)
 }
 
@@ -311,6 +314,7 @@ pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
 /// distance `horiz_dist` from a rift at `center_y`. Immediately penetrates shallow
 /// caves underneath, sinks steadily in a cone over time, and reaches Bedrock (`-63`)
 /// as the rift matures.
+#[cfg(test)]
 pub fn allowed_min_y(center_y: i32, age_ticks: u64, horiz_dist: i32, corrupted_blocks: u64) -> i32 {
     if corrupted_blocks >= 75_000 || age_ticks >= 9_000 {
         return BEDROCK_FLOOR_Y;
@@ -458,17 +462,25 @@ fn transform_stone_family(
     rift_mature: bool,
     h: u64,
 ) -> Option<TransformOutcome> {
-    let deep_rock = matches!(short, "deepslate" | "cobbled_deepslate" | "tuff");
+    let deep_rock = matches!(
+        short,
+        "deepslate" | "cobbled_deepslate" | "infested_deepslate" | "tuff"
+    );
     let normal_rock = matches!(
         short,
         "stone"
+            | "infested_stone"
+            | "infested_cobblestone"
+            | "infested_stone_bricks"
             | "granite"
             | "diorite"
             | "andesite"
             | "calcite"
             | "dripstone_block"
+            | "pointed_dripstone"
             | "sandstone"
             | "red_sandstone"
+            | "packed_mud"
             | "terracotta"
     ) || short.ends_with("_terracotta");
 
@@ -476,9 +488,9 @@ fn transform_stone_family(
         return None;
     }
 
-    // Leave ~6% subtle scarred Overworld stone/cobble pockets so terrain still hints
-    // at its Overworld origin without leaving large uncorrupted stone blotches.
-    if in_remnant_cluster(pos, 0x5CA2_1001, 6) {
+    // Leave ~3% tiny scarred Overworld stone/cobble remnants so terrain still hints
+    // at its Overworld origin while stone overwhelmingly transforms into Nether rock.
+    if in_remnant_cluster(pos, 0x5CA2_1001, 3) {
         if short == "stone" && h % 2 == 0 {
             return Some(TransformOutcome::replace("minecraft:cobblestone"));
         }
@@ -852,7 +864,44 @@ mod tests {
                 Some(_) => warped += 1,
             }
         }
-        assert!(kept_or_cobble >= 5 && kept_or_cobble <= 40 && warped > 240);
+        assert!(kept_or_cobble >= 2 && kept_or_cobble <= 30 && warped > 260);
+    }
+
+    #[test]
+    fn mountain_and_cave_stone_variants_convert_cleanly() {
+        for block in [
+            "minecraft:stone",
+            "minecraft:infested_stone",
+            "minecraft:deepslate",
+            "minecraft:infested_deepslate",
+            "minecraft:calcite",
+            "minecraft:tuff",
+            "minecraft:granite",
+            "minecraft:diorite",
+            "minecraft:andesite",
+            "minecraft:dripstone_block",
+            "minecraft:pointed_dripstone",
+            "minecraft:packed_mud",
+        ] {
+            let mut converted = 0;
+            for x in 0..40 {
+                let out = transform_block(
+                    [x, 195, x * 2],
+                    block,
+                    "minecraft:air",
+                    "minecraft:stone",
+                    NetherFlavor::SoulSandValley,
+                    true,
+                );
+                if out.block.is_some() {
+                    converted += 1;
+                }
+            }
+            assert!(
+                converted >= 32,
+                "{block} should overwhelmingly convert even at high mountain Y=195 (got {converted}/40)"
+            );
+        }
     }
 
     #[test]
@@ -899,21 +948,21 @@ mod tests {
         assert_eq!(top_y, 66);
         assert_eq!(min_y, 64 - SURFACE_CRUST_DEPTH);
 
-        // Portal on mountain base (y=90) expanding UP onto a y=170 snowy peak:
-        // must NOT clip top_y at 90+12, and must sweep down sheer cliff face to neighbor y=155!
-        let (peak_top, peak_min) = surface_column_y_range(90, false, 170, 170, 155);
-        assert_eq!(peak_top, 172);
-        assert_eq!(peak_min, 153);
+        // Portal on mountain base (y=90) expanding UP onto a y=240 snowy peak:
+        // must NOT clip top_y at 128 or 90+12, and must sweep down sheer cliff face to neighbor y=215!
+        let (peak_top, peak_min) = surface_column_y_range(90, false, 240, 240, 215);
+        assert_eq!(peak_top, 242);
+        assert_eq!(peak_min, 213);
 
         // Tall tree canopy: WorldSurface=82, OceanFloor=64 -> sweeps canopy AND reaches ground crust.
         let (tree_top, tree_min) = surface_column_y_range(64, false, 82, 64, 64);
         assert_eq!(tree_top, 84);
         assert_eq!(tree_min, 64 - SURFACE_CRUST_DEPTH);
 
-        // Portal genuinely lit inside a deep cave at y=10 -> stays centered on cave elevation.
+        // Portal genuinely lit inside a deep cave at y=10 -> starts centered on cave elevation.
         let (cave_top, cave_min) = surface_column_y_range(10, true, 64, 64, 64);
-        assert_eq!(cave_top, 22);
-        assert_eq!(cave_min, 2);
+        assert_eq!(cave_top, 26);
+        assert_eq!(cave_min, 0);
     }
 
     #[test]
@@ -922,8 +971,8 @@ mod tests {
         let b_mid = effective_rift_budget(14, 30);
         let b_large = effective_rift_budget(14, 90);
         assert!(b_small < b_mid && b_mid < b_large);
-        assert!(b_small <= 8, "small radius should start steady, not explosive");
-        assert!(b_large <= 44, "large radius stays server-friendly");
+        assert!(b_small <= 10, "small radius should start steady, not explosive");
+        assert!(b_large <= 56, "large radius stays server-friendly");
     }
 
     #[test]

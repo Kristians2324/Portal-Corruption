@@ -253,7 +253,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(5));
+        root.insert("version".into(), Value::from(6));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -368,16 +368,25 @@ impl RiftState {
                 if ring_columns.is_empty() {
                     ring_columns = build_ring_columns(center[0], center[2], ring_radius);
                 }
-                let deepen_radius = item
-                    .get("deepen_radius")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| (v as i32).max(1))
-                    .unwrap_or(1);
-                let deepen_columns: Vec<[i32; 2]> = item
-                    .get("deepen_columns")
-                    .and_then(|v| v.as_array())
-                    .map(|list| list.iter().filter_map(col_from_json).collect())
-                    .unwrap_or_default();
+                let (deepen_radius, deepen_columns) = if version < 6 {
+                    // Older saves had shallow/frozen early deepening passes and skipped
+                    // high mountain peaks; reset deepen sweep to ring 1 so full-height
+                    // peak-to-bedrock deepening immediately fills in any skipped rock.
+                    self.dirty = true;
+                    (1, build_ring_columns(center[0], center[2], 1))
+                } else {
+                    let dr = item
+                        .get("deepen_radius")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v as i32).max(1))
+                        .unwrap_or(1);
+                    let dc: Vec<[i32; 2]> = item
+                        .get("deepen_columns")
+                        .and_then(|v| v.as_array())
+                        .map(|list| list.iter().filter_map(col_from_json).collect())
+                        .unwrap_or_default();
+                    (dr, dc)
+                };
                 let active_column = item.get("active_column").and_then(active_col_from_json);
 
                 self.rifts.push(RiftSource {

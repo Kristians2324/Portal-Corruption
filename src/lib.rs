@@ -9,8 +9,8 @@ mod types;
 use atmosphere::{ClientAtmosphere, ParticlePalette};
 use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
 use corruption::{
-    SURFACE_CRUST_DEPTH, allowed_min_y, effective_rift_budget, is_air_like, is_snow_or_ice,
-    is_water_like, surface_column_y_range, transform_block,
+    SURFACE_CRUST_DEPTH, effective_rift_budget, is_air_like, is_snow_or_ice, is_water_like,
+    surface_column_y_range, transform_block,
 };
 use mobs::paint_biome_column;
 use state::RiftState;
@@ -625,9 +625,10 @@ fn corrupt_surface_step(
     let rift_id = state.rifts[rift_idx].id;
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
-    let is_cave_portal = portal_is_underground(host, rift_center);
+    let is_cave_portal =
+        state.rifts[rift_idx].corrupted_blocks < 4_000 && portal_is_underground(host, rift_center);
 
-    while *budget > 0 && skips < 64 {
+    while *budget > 0 && skips < 96 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
@@ -728,9 +729,9 @@ fn corrupt_surface_step(
     }
 }
 
-/// Simultaneously sweeps inner rings underground (from just below the surface crust
-/// down through caves, deepslate, and Bedrock) using its own cursor so surface and
-/// underground corruption always spread together in parallel.
+/// Simultaneously sweeps inner rings from the highest mountain surface (`WorldSurface + 2`)
+/// all the way down to Bedrock (`-63`) using its own cursor so deep stone, underground caves,
+/// overhangs, and tall peaks never stop corrupting at shallow depth.
 fn corrupt_deepen_step(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -743,7 +744,7 @@ fn corrupt_deepen_step(
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
 
-    while *budget > 0 && skips < 160 {
+    while *budget > 0 && skips < 384 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
@@ -777,19 +778,12 @@ fn corrupt_deepen_step(
             let Some(col) = next_col else {
                 break;
             };
-            let (world_surface, ocean_floor, _) =
+            let (world_surface, _, _) =
                 query_surface_and_cliff_heights(host, col, rift_center[1]);
-            let ground = ocean_floor.min(world_surface);
-            let start_y = (ground - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y);
-            let hdist = (horiz_dist_sq(rift_center, [col[0], 64, col[1]]) as f64).sqrt() as i32;
-            let target_min_y = allowed_min_y(rift_center[1], rift_age, hdist, rift_blocks);
-            if target_min_y >= start_y {
-                skips += 8;
-                continue;
-            }
+            let start_y = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
             state
                 .active_deepen_columns
-                .insert(rift_id, (col, start_y, target_min_y));
+                .insert(rift_id, (col, start_y, BEDROCK_FLOOR_Y));
         }
 
         let Some((col, y, min_y)) = state.active_deepen_columns.get(&rift_id).copied() else {
@@ -884,8 +878,8 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
             let mut surf = rift_budget;
             corrupt_surface_step(host, level, state, r_idx, &mut surf);
         } else {
-            // ~55% surface circular spread + ~45% simultaneous underground spread every tick.
-            let mut surface_budget = ((rift_budget * 55) + 50) / 100;
+            // 50% surface circular spread + 50% simultaneous peak-to-bedrock deepening every tick.
+            let mut surface_budget = rift_budget.div_ceil(2);
             let mut deepen_budget = rift_budget.saturating_sub(surface_budget);
             corrupt_deepen_step(host, level, state, r_idx, &mut deepen_budget);
             // Roll any unused underground budget straight into surface so zero budget is wasted.

@@ -45,16 +45,16 @@ pub fn fog_target_rgb(flavor: NetherFlavor) -> [f32; 3] {
     }
 }
 
-/// Keeps thick Nether sky/fog taint active while the player is below the cloud layer,
-/// only clearing smoothly between `Y = 188` and `Y = 222` (up in the clouds).
+/// Keeps thick Nether sky/fog taint active on corrupted terrain at ANY altitude
+/// (including high Y=200+ mountains) and while below the cloud layer, only clearing
+/// smoothly when flying high above BOTH clouds (`Y = 188..222`) AND terrain (`> 48` blocks up).
 pub fn altitude_smog_factor(camera_y: f32, height_above_ground: f32) -> f32 {
-    if camera_y <= CLOUD_FADE_START_Y {
+    if height_above_ground <= 48.0 || camera_y <= CLOUD_FADE_START_Y {
         return 1.0;
     }
     if camera_y >= CLOUD_FADE_END_Y {
         return 0.0;
     }
-    let _ = height_above_ground;
     let t = (camera_y - CLOUD_FADE_START_Y) / (CLOUD_FADE_END_Y - CLOUD_FADE_START_Y);
     let smooth = t * t * (3.0 - 2.0 * t);
     (1.0 - smooth).clamp(0.0, 1.0)
@@ -424,6 +424,8 @@ mod tests {
         assert_eq!(altitude_smog_factor(70.0, 6.0), 1.0);
         assert_eq!(altitude_smog_factor(140.0, 76.0), 1.0);
         assert_eq!(altitude_smog_factor(185.0, 120.0), 1.0);
+        // Standing on a high corrupted mountain peak (Y=240, 2 blocks off ground) keeps full sky!
+        assert_eq!(altitude_smog_factor(240.0, 2.0), 1.0);
         let mid_cloud = altitude_smog_factor(205.0, 140.0);
         assert!(mid_cloud > 0.1 && mid_cloud < 0.9);
         assert_eq!(altitude_smog_factor(225.0, 160.0), 0.0);
