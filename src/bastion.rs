@@ -141,6 +141,7 @@ pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWas
     true
 }
 
+#[cfg(test)]
 pub fn rift_eligible_for_bastion(rift: &RiftSource) -> bool {
     wasteland_eligible_for_bastion(
         rift,

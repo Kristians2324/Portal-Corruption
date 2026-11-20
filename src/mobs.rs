@@ -20,6 +20,7 @@ const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
 pub const MIN_RIFT_BLOCKS_FOR_MOBS: u64 = 55_000;
 pub const MIN_RADIUS_SQ_FOR_MOBS: i64 = 32 * 32;
 
+#[cfg(test)]
 pub fn rift_mobs_unlocked(rift: &RiftSource) -> bool {
     rift.corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS && rift.max_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
 }

@@ -23,12 +23,12 @@ use mod_api::{
     BlockChangedEvent, BlockSpreadEvent, BlockUpdateFlags, BucketEmptyEvent, ClientHost,
     ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientTickPostEvent, Command,
     CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, FillBucketEvent,
-    FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide, LevelDimension,
-    LevelHost, LevelRef, LevelTickPostEvent, LivingConversionPreEvent, LivingDeathEvent,
-    LootDropsEvent, MusicEvent, PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent,
-    Registrar, RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase,
-    WorldSavedEvent,
+    FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide, Identifier,
+    ItemStack, LevelDimension, LevelHost, LevelRef, LevelTickPostEvent, LivingConversionPreEvent,
+    LivingDeathEvent, LootDropsEvent, MusicEvent, ParticleOptions, PortalCreateEvent,
+    PotentialSpawnsEvent, RegisterCommandsEvent, Registrar, RegistrationContext, RenderFogEvent,
+    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, SoundSource, Text,
+    WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -43,6 +43,25 @@ struct HookQueues {
     pending_portals: VecDeque<[i32; 3]>,
     pending_containment_checks: Vec<[i32; 3]>,
     pending_water_evap: Vec<[i32; 3]>,
+    pending_bucket_evap: Vec<(u128, [i32; 3])>,
+}
+
+impl HookQueues {
+    fn queue_bucket_evap(&mut self, player: u128, pos: [i32; 3]) {
+        // Coalesce multiple `bucket_empty` checks from the same click (e.g. waterloggable
+        // block + adjacent face block) so only one bucket empties and smoke pops cleanly on top.
+        if let Some((_, existing_pos)) = self
+            .pending_bucket_evap
+            .iter_mut()
+            .find(|(uuid, _)| *uuid == player)
+        {
+            if pos[1] > existing_pos[1] {
+                *existing_pos = pos;
+            }
+        } else {
+            self.pending_bucket_evap.push((player, pos));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -335,17 +354,227 @@ fn evaluate_rift_containment(host: &mut dyn ServerHost, level: LevelRef, state: 
     }
 }
 
-fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool {
+pub fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool {
     if state.is_quart_corrupted(pos) {
         return true;
     }
     for rift in &state.rifts {
+        if rift.contained {
+            continue;
+        }
         let limit = (rift.max_radius_sq + 256).max(16 * 16);
         if horiz_dist_sq(rift.center, pos) <= limit {
             return true;
         }
     }
     false
+}
+
+pub fn is_water_bucket_item(item_id: &str) -> bool {
+    matches!(
+        strip_ns(item_id),
+        "water_bucket"
+            | "cod_bucket"
+            | "salmon_bucket"
+            | "pufferfish_bucket"
+            | "tropical_fish_bucket"
+            | "axolotl_bucket"
+            | "tadpole_bucket"
+    )
+}
+
+/// Picks the main-hand hotbar slot first (if it holds a water bucket), or falls back to
+/// offhand slot `40`, returning `(slot_index, stack_count)`.
+pub fn select_water_bucket_slot(
+    selected_hotbar_slot: Option<usize>,
+    slots: &[(u32, &str, u32)],
+) -> Option<(u32, u32)> {
+    if let Some(sel) = selected_hotbar_slot.and_then(|s| u32::try_from(s).ok())
+        && let Some((slot, _, count)) = slots
+            .iter()
+            .find(|(slot, id, count)| *slot == sel && *count > 0 && is_water_bucket_item(id))
+    {
+        return Some((*slot, *count));
+    }
+    slots
+        .iter()
+        .find(|(slot, id, count)| *slot == 40 && *count > 0 && is_water_bucket_item(id))
+        .map(|(slot, _, count)| (*slot, *count))
+}
+
+fn emit_bucket_evap_fx(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    particles: Option<&ParticlePalette>,
+) {
+    let fx_pos = [
+        f64::from(pos[0]) + 0.5,
+        f64::from(pos[1]) + 0.65,
+        f64::from(pos[2]) + 0.5,
+    ];
+    let top_pos = [
+        f64::from(pos[0]) + 0.5,
+        f64::from(pos[1]) + 0.92,
+        f64::from(pos[2]) + 0.5,
+    ];
+    let _ = level.play_sound(
+        host,
+        "minecraft:block.fire.extinguish",
+        fx_pos,
+        SoundSource::Blocks,
+        0.5,
+        2.35,
+    );
+    if let Some(pal) = particles {
+        let _ = level.send_particles(
+            host,
+            &ParticleOptions::simple(pal.large_smoke),
+            None,
+            fx_pos,
+            [0.25, 0.22, 0.25],
+            0.02,
+            8,
+        );
+        let _ = level.send_particles(
+            host,
+            &ParticleOptions::simple(pal.smoke),
+            None,
+            top_pos,
+            [0.20, 0.18, 0.20],
+            0.025,
+            5,
+        );
+    }
+}
+
+fn drain_bucket_evaporations(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    bucket_evap: Vec<(u128, [i32; 3])>,
+    particles: Option<&ParticlePalette>,
+) {
+    if bucket_evap.is_empty() {
+        return;
+    }
+
+    let empty_bucket_key = Identifier::parse("minecraft:bucket")
+        .ok()
+        .and_then(|id| host.item_key(&id));
+
+    for (player_uuid, pos) in bucket_evap {
+        if pos[1] >= OVERWORLD_MIN_Y && pos[1] <= OVERWORLD_MAX_Y && level.is_loaded(host, pos) {
+            emit_bucket_evap_fx(host, level, pos, particles);
+            state.queue_water_evap(pos);
+        }
+
+        let Some(bucket_key) = empty_bucket_key else {
+            continue;
+        };
+        let Some(player) = host
+            .players()
+            .server_players()
+            .into_iter()
+            .find(|p| p.uuid() == player_uuid)
+        else {
+            continue;
+        };
+        if player.is_creative(host).unwrap_or(false) || player.is_spectator(host).unwrap_or(false) {
+            continue;
+        }
+        let selected = player.selected_slot(host);
+        let Some(raw_slots) = player.inventory_slots(host) else {
+            continue;
+        };
+        let resolved: Vec<(u32, String, u32)> = raw_slots
+            .iter()
+            .map(|(s, st)| (*s, st.item().id(host), st.count()))
+            .collect();
+        let slot_views: Vec<(u32, &str, u32)> = resolved
+            .iter()
+            .map(|(s, id, c)| (*s, id.as_str(), *c))
+            .collect();
+
+        let Some((slot, count)) = select_water_bucket_slot(selected, &slot_views) else {
+            continue;
+        };
+
+        if count <= 1 {
+            let _ = player.set_inventory_slot(host, slot, Some(ItemStack::of(bucket_key)));
+        } else if let Some(orig_key) = raw_slots
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, st)| st.item())
+        {
+            let _ = player.set_inventory_slot(host, slot, ItemStack::new(orig_key, count - 1));
+            let _ = player.give_stack(host, ItemStack::of(bucket_key));
+        }
+    }
+}
+
+fn emit_melt_evap_fx(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    particles: Option<&ParticlePalette>,
+) {
+    if state.pending_melt_fx.is_empty() {
+        return;
+    }
+    let positions: Vec<[i32; 3]> = state.pending_melt_fx.drain(..).collect();
+    let max_fx = 6usize;
+    let step = (positions.len() / max_fx).max(1);
+    let mut sound_pos = None;
+
+    for pos in positions.iter().step_by(step).take(max_fx) {
+        if sound_pos.is_none() {
+            sound_pos = Some(*pos);
+        }
+        if let Some(pal) = particles {
+            let top_pos = [
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]) + 0.85,
+                f64::from(pos[2]) + 0.5,
+            ];
+            let _ = level.send_particles(
+                host,
+                &ParticleOptions::simple(pal.large_smoke),
+                None,
+                top_pos,
+                [0.24, 0.18, 0.24],
+                0.02,
+                3,
+            );
+            let _ = level.send_particles(
+                host,
+                &ParticleOptions::simple(pal.smoke),
+                None,
+                top_pos,
+                [0.20, 0.16, 0.20],
+                0.025,
+                2,
+            );
+        }
+    }
+
+    if let Some(spos) = sound_pos
+        && state.tick.saturating_sub(state.last_melt_sound_tick) >= 12
+    {
+        state.last_melt_sound_tick = state.tick;
+        let _ = level.play_sound(
+            host,
+            "minecraft:block.fire.extinguish",
+            [
+                f64::from(spos[0]) + 0.5,
+                f64::from(spos[1]) + 0.7,
+                f64::from(spos[2]) + 0.5,
+            ],
+            SoundSource::Blocks,
+            0.18,
+            2.15,
+        );
+    }
 }
 
 fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
@@ -370,14 +599,18 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             continue;
         };
         let bname = bkey.id(host);
-        let short = strip_ns(&bname);
-        if is_water_like(&bname) || matches!(short, "ice" | "frosted_ice" | "packed_ice" | "blue_ice") {
-            let _ = level.set_block(
-                host,
-                pos,
-                air,
-                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS,
-            );
+        if is_water_like(&bname) || is_snow_or_ice(&bname) {
+            if level
+                .set_block(
+                    host,
+                    pos,
+                    air,
+                    BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS,
+                )
+                .unwrap_or(false)
+            {
+                state.queue_melt_fx(pos);
+            }
             state.dirty = true;
 
             for n in neighbors_6(pos) {
@@ -393,12 +626,13 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             }
         } else if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
             let _ = host.set_block_property(pos, "waterlogged", "false");
+            state.queue_melt_fx(pos);
             state.dirty = true;
         }
     }
 
     // Continuous gentle surface & river sweep over existing corrupted quart columns
-    // so lingering ponds or lakes never survive inside corrupted lands.
+    // so lingering ponds, snow, or ice patches never survive inside corrupted lands.
     if state.corrupted_quart_cols.is_empty() {
         return;
     }
@@ -421,7 +655,10 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
                 let p = [sub_x, y, sub_z];
                 if level
                     .block(host, p)
-                    .is_some_and(|k| is_water_like(&k.id(host)))
+                    .is_some_and(|k| {
+                        let id = k.id(host);
+                        is_water_like(&id) || is_snow_or_ice(&id)
+                    })
                     || level.block_property(host, p, "waterlogged").as_deref() == Some("true")
                 {
                     state.queue_water_evap(p);
@@ -545,13 +782,16 @@ fn apply_corruption_at(
         NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
     };
 
-    if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+    let was_waterlogged = level.block_property(host, pos, "waterlogged").as_deref() == Some("true");
+    if was_waterlogged {
         let _ = host.set_block_property(pos, "waterlogged", "false");
         state.queue_water_evap(pos);
+        state.queue_melt_fx(pos);
     }
 
     let out = transform_block(pos, current, &above, &below, local_flavor, mature);
 
+    let is_water_or_frozen = is_water_like(current) || is_snow_or_ice(current);
     if is_water_like(current) {
         state.queue_water_evap(pos);
     }
@@ -569,6 +809,9 @@ fn apply_corruption_at(
         };
         if level.set_block(host, pos, block_state, flags).unwrap_or(false) {
             changed = true;
+            if is_water_or_frozen {
+                state.queue_melt_fx(pos);
+            }
             state.rifts[rift_idx].corrupted_blocks += 1;
             if d2 > state.rifts[rift_idx].max_radius_sq {
                 state.rifts[rift_idx].max_radius_sq = d2;
@@ -899,6 +1142,8 @@ impl Hooks for Mod {
             white_ash: r.particle_key("minecraft:white_ash"),
             flame: r.particle_key("minecraft:flame"),
             small_flame: r.particle_key("minecraft:small_flame"),
+            large_smoke: r.particle_key("minecraft:large_smoke"),
+            smoke: r.particle_key("minecraft:smoke"),
         };
         if let Ok(mut guard) = self.particles.lock() {
             *guard = Some(pal);
@@ -1085,6 +1330,7 @@ impl Hooks for Mod {
                 || mobs::pos_is_corrupted(host, ow, &state, event.pos))
         {
             if let Ok(mut q) = self.queues.lock() {
+                q.queue_bucket_evap(event.player, event.pos);
                 q.pending_water_evap.push(event.pos);
             }
             return Flow::Cancel;
@@ -1325,7 +1571,7 @@ impl Hooks for Mod {
             return;
         };
         ensure_world_initialized(server, &mut state);
-        if let Some(q) = drained {
+        let bucket_evap = if let Some(q) = drained {
             state.pending_portals.extend(q.pending_portals);
             state
                 .pending_containment_checks
@@ -1333,7 +1579,10 @@ impl Hooks for Mod {
             for wp in q.pending_water_evap {
                 state.queue_water_evap(wp);
             }
-        }
+            q.pending_bucket_evap
+        } else {
+            Vec::new()
+        };
         state.tick = state.tick.wrapping_add(1);
 
         while let Some(pos) = state.pending_portals.pop_front() {
@@ -1341,6 +1590,7 @@ impl Hooks for Mod {
         }
 
         evaluate_rift_containment(server, event.level, &mut state, false);
+        drain_bucket_evaporations(server, event.level, &mut state, bucket_evap, pal.as_ref());
         drain_water_evaporation(server, event.level, &mut state);
 
         if state.tick % 20 == 0 {
@@ -1348,6 +1598,7 @@ impl Hooks for Mod {
         }
 
         spread_corruption_tick(server, event.level, &mut state);
+        emit_melt_evap_fx(server, event.level, &mut state, pal.as_ref());
         mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
         bastion::tick_bastion_emergence(server, event.level, &mut state);
 
@@ -1421,5 +1672,51 @@ mod tests {
         let q = m.queues.lock().expect("drain queue");
         assert_eq!(q.pending_portals.len(), 1);
         assert_eq!(q.pending_water_evap.len(), 1);
+    }
+
+    #[test]
+    fn water_bucket_evap_coalesces_clicks_selects_hand_and_respects_corrupted_biomes() {
+        // Double bucket_empty events in the same click coalesce onto the top air block.
+        let mut q = HookQueues::default();
+        q.queue_bucket_evap(42, [10, 64, 10]);
+        q.queue_bucket_evap(42, [10, 65, 10]);
+        assert_eq!(q.pending_bucket_evap, vec![(42, [10, 65, 10])]);
+
+        // Hand selection prefers active hotbar slot, falls back to offhand (slot 40).
+        assert_eq!(
+            select_water_bucket_slot(Some(2), &[(2, "minecraft:water_bucket", 1), (40, "minecraft:shield", 1)]),
+            Some((2, 1))
+        );
+        assert_eq!(
+            select_water_bucket_slot(Some(0), &[(0, "minecraft:diamond_pickaxe", 1), (40, "minecraft:axolotl_bucket", 1)]),
+            Some((40, 1))
+        );
+        assert_eq!(
+            select_water_bucket_slot(Some(0), &[(0, "minecraft:lava_bucket", 1)]),
+            None
+        );
+
+        // Sealed rifts still evaporate water INSIDE corrupted Nether biomes, while
+        // freeing uncorrupted Overworld soil outside once sealed.
+        let mut state = RiftState::new();
+        state.rifts.push(RiftSource {
+            id: 1,
+            center: [0, 64, 0],
+            active_portal: true,
+            contained: true,
+            flavor: NetherFlavor::CrimsonForest,
+            age_ticks: 100,
+            corrupted_blocks: 500,
+            max_radius_sq: 100,
+            ring_radius: 10,
+            ring_columns: Vec::new(),
+            active_column: None,
+            deepen_radius: 1,
+            deepen_columns: Vec::new(),
+            bastions_placed: 0,
+        });
+        state.mark_quart_corrupted([4, 64, 4]);
+        assert!(near_corruption_or_active_rift(&state, [4, 64, 4]));
+        assert!(!near_corruption_or_active_rift(&state, [8, 64, 8]));
     }
 }

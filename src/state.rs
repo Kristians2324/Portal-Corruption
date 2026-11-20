@@ -70,6 +70,10 @@ pub struct RiftState {
     /// Independent runtime vertical cursor `([x, z], next_y_down, min_y)` for each
     /// rift's simultaneous underground deepening pass, keyed by rift id.
     pub active_deepen_columns: HashMap<u64, ([i32; 2], i32, i32)>,
+    /// Runtime queue of recently evaporated/melted water, ice, or snow positions
+    /// for emitting throttled black smoke effects without saving to disk.
+    pub pending_melt_fx: Vec<[i32; 3]>,
+    pub last_melt_sound_tick: u64,
 }
 
 impl Default for RiftState {
@@ -108,6 +112,14 @@ impl RiftState {
             pending_frontier_columns: VecDeque::new(),
             water_sweep_cursor: 0,
             active_deepen_columns: HashMap::new(),
+            pending_melt_fx: Vec::new(),
+            last_melt_sound_tick: 0,
+        }
+    }
+
+    pub fn queue_melt_fx(&mut self, pos: [i32; 3]) {
+        if self.pending_melt_fx.len() < 16 && !self.pending_melt_fx.contains(&pos) {
+            self.pending_melt_fx.push(pos);
         }
     }
 

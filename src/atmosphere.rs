@@ -18,6 +18,8 @@ pub struct ParticlePalette {
     pub white_ash: ParticleKey,
     pub flame: ParticleKey,
     pub small_flame: ParticleKey,
+    pub large_smoke: ParticleKey,
+    pub smoke: ParticleKey,
 }
 
 #[derive(Clone, Debug, Default)]
