@@ -2,7 +2,7 @@ use crate::atmosphere::ParticlePalette;
 use crate::corruption::{is_air_like, is_open_space};
 use crate::state::RiftState;
 use crate::types::{
-    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource, dist_sq, horiz_dist_sq,
+    NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, dist_sq, horiz_dist_sq,
     spatial_hash, strip_ns,
 };
 use mod_api::{
@@ -21,11 +21,17 @@ pub const MIN_RIFT_BLOCKS_FOR_MOBS: u64 = 55_000;
 pub const MIN_RADIUS_SQ_FOR_MOBS: i64 = 32 * 32;
 
 #[cfg(test)]
-pub fn rift_mobs_unlocked(rift: &RiftSource) -> bool {
+pub fn rift_mobs_unlocked(rift: &crate::types::RiftSource) -> bool {
     rift.corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS && rift.max_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
 }
 
 pub fn rift_mobs_unlocked_in_state(state: &RiftState, rift_idx: usize) -> bool {
+    let Some(rift) = state.rifts.get(rift_idx) else {
+        return false;
+    };
+    if rift.pacified || rift.regressing {
+        return false;
+    }
     let w = state.connected_wasteland_for(rift_idx);
     w.total_corrupted_blocks >= MIN_RIFT_BLOCKS_FOR_MOBS
         && w.total_area_radius_sq >= MIN_RADIUS_SQ_FOR_MOBS
@@ -39,7 +45,9 @@ pub fn location_unlocks_nether_mobs(state: &RiftState, pos: [i32; 3]) -> bool {
         return false;
     }
     state.rifts.iter().enumerate().any(|(idx, rift)| {
-        rift_mobs_unlocked_in_state(state, idx)
+        !rift.pacified
+            && !rift.regressing
+            && rift_mobs_unlocked_in_state(state, idx)
             && horiz_dist_sq(rift.center, pos)
                 <= (rift.max_radius_sq + 256).max(MIN_RADIUS_SQ_FOR_MOBS)
     })
@@ -534,11 +542,18 @@ fn process_hoglin_edge_spreading(
         if base[1] <= OVERWORLD_MIN_Y || base[1] >= OVERWORLD_MAX_Y - 2 {
             continue;
         }
+        let active_nearby = state
+            .rifts
+            .iter()
+            .any(|r| r.is_actively_spreading() && horiz_dist_sq(r.center, base) <= r.max_radius_sq + 512);
+        if !active_nearby {
+            continue;
+        }
         let near_corrupt = pos_is_corrupted(host, level, state, base)
             || state
                 .rifts
                 .iter()
-                .any(|r| !r.contained && horiz_dist_sq(r.center, base) <= r.max_radius_sq + 256);
+                .any(|r| r.is_actively_spreading() && horiz_dist_sq(r.center, base) <= r.max_radius_sq + 256);
         if !near_corrupt {
             continue;
         }
@@ -681,7 +696,7 @@ fn process_supplemental_spawns(
         .rifts
         .iter()
         .enumerate()
-        .any(|(idx, r)| !r.contained && rift_mobs_unlocked_in_state(state, idx))
+        .any(|(idx, r)| r.is_actively_spreading() && rift_mobs_unlocked_in_state(state, idx))
     {
         return;
     }
@@ -716,7 +731,7 @@ fn process_supplemental_spawns(
             .iter()
             .enumerate()
             .filter(|(idx, r)| {
-                !r.contained
+                r.is_actively_spreading()
                     && rift_mobs_unlocked_in_state(state, *idx)
                     && horiz_dist_sq(r.center, pp) <= 96 * 96
             })
@@ -733,7 +748,7 @@ fn process_supplemental_spawns(
             .rifts
             .iter()
             .enumerate()
-            .find(|(idx, r)| !r.contained && rift_mobs_unlocked_in_state(state, *idx))
+            .find(|(idx, r)| r.is_actively_spreading() && rift_mobs_unlocked_in_state(state, *idx))
     {
         let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
         spawn_anchor = Some((rift.id, rift.flavor, w_blocks, rift.center));
@@ -793,10 +808,11 @@ pub fn augment_potential_spawns(
     }
 
     let near_corrupt = state.is_quart_corrupted(event.pos)
-        || state
-            .rifts
-            .iter()
-            .any(|r| horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 256).max(32 * 32));
+        || state.rifts.iter().any(|r| {
+            !r.pacified
+                && !r.regressing
+                && horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 256).max(32 * 32)
+        });
     if !near_corrupt {
         return;
     }
@@ -914,7 +930,7 @@ pub fn append_nether_touched_drops(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::build_ring_columns;
+    use crate::types::{RiftSource, build_ring_columns};
 
     fn sample_rift(corrupted_blocks: u64, radius: i32) -> RiftSource {
         RiftSource {
@@ -932,6 +948,13 @@ mod tests {
             deepen_radius: 10,
             deepen_columns: Vec::new(),
             bastions_placed: 0,
+            citadel_spawned: false,
+            boss_uuid: None,
+            pacified: false,
+            regressing: false,
+            regress_radius: 0,
+            regress_columns: Vec::new(),
+            regress_active_column: None,
         }
     }
 

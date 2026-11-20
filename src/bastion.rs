@@ -12,12 +12,15 @@ use mod_api::{
 
 const BASTION_CHECK_INTERVAL_TICKS: u64 = 600;
 const MIN_RIFT_BLOCKS_FOR_BASTION: u64 = 160_000;
-const MIN_RADIUS_SQ_FOR_BASTION: i64 = 48 * 48;
+const MIN_RADIUS_SQ_FOR_BASTION: i64 = 96 * 96;
 const MIN_DEEPEN_RADIUS_FOR_BASTION: i32 = 22;
 const SECOND_BASTION_BLOCKS: u64 = 500_000;
-const SECOND_BASTION_RING_RADIUS: i32 = 95;
+const SECOND_BASTION_RING_RADIUS: i32 = 115;
 const MAX_BASTIONS_PER_RIFT: u32 = 2;
 const MIN_BASTION_SPACING: i64 = 280;
+/// Keeps Bastions strictly on the corrupted outskirts so the portal epicenter
+/// stays clear for the unique central Citadel.
+pub const MIN_BASTION_PORTAL_DIST: i64 = 88;
 const MIN_PLAYER_DIST_FOR_BASTION: i64 = 112;
 const BASTION_RARITY_DENOM: u64 = 8;
 
@@ -119,7 +122,11 @@ pub fn tick_bastion_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
 }
 
 pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWasteland) -> bool {
-    if rift.contained || rift.bastions_placed >= MAX_BASTIONS_PER_RIFT {
+    if rift.contained
+        || rift.pacified
+        || rift.regressing
+        || rift.bastions_placed >= MAX_BASTIONS_PER_RIFT
+    {
         return false;
     }
     let max_group_bastions = ((wasteland.member_count as u32) * MAX_BASTIONS_PER_RIFT).min(4);
@@ -156,7 +163,7 @@ pub fn rift_eligible_for_bastion(rift: &RiftSource) -> bool {
     )
 }
 
-fn overworld_player_positions(host: &dyn ServerHost) -> Vec<[i32; 3]> {
+pub(crate) fn overworld_player_positions(host: &dyn ServerHost) -> Vec<[i32; 3]> {
     host.players()
         .server_players()
         .into_iter()
@@ -192,6 +199,21 @@ pub fn area_metrics_qualify(
     quart_corrupted_count * 25 >= total_samples * 23 && nether_surface_count * 25 >= total_samples * 20
 }
 
+/// True when `(x, z)` is safely outside every Rift epicenter and Citadel footprint so
+/// Bastions only ever spawn on the corrupted outskirts.
+pub fn site_outside_epicenters(state: &RiftState, cx: i32, cz: i32) -> bool {
+    let min_sq = MIN_BASTION_PORTAL_DIST * MIN_BASTION_PORTAL_DIST;
+    let clear_rifts = state
+        .rifts
+        .iter()
+        .all(|r| horiz_dist_sq(r.center, [cx, 64, cz]) >= min_sq);
+    let clear_citadels = state
+        .citadels
+        .iter()
+        .all(|c| horiz_dist_sq(*c, [cx, 64, cz]) >= min_sq);
+    clear_rifts && clear_citadels
+}
+
 fn find_bastion_site(
     host: &dyn ServerHost,
     ow: LevelRef,
@@ -200,7 +222,10 @@ fn find_bastion_site(
     overworld_players: &[[i32; 3]],
 ) -> Option<([i32; 3], NetherFlavor, u64)> {
     let radius = (rift.max_radius_sq as f64).sqrt() as i32;
-    let inner = 44;
+    let inner = MIN_BASTION_PORTAL_DIST as i32;
+    if radius < inner + 6 {
+        return None;
+    }
     let outer = (radius - 10).max(inner);
 
     for attempt in 0..8u64 {
@@ -216,15 +241,11 @@ fn find_bastion_site(
         let cx = rift.center[0] + (angle.cos() * f64::from(dist)).round() as i32;
         let cz = rift.center[2] + (angle.sin() * f64::from(dist)).round() as i32;
 
-        // Keep away from world spawn, rift cores, and other bastions.
+        // Keep away from world spawn, rift cores (epicenters), citadels, and other bastions.
         if horiz_dist_sq([cx, 64, cz], [0, 64, 0]) < 96 * 96 {
             continue;
         }
-        if state
-            .rifts
-            .iter()
-            .any(|r| horiz_dist_sq(r.center, [cx, 64, cz]) < 44 * 44)
-        {
+        if !site_outside_epicenters(state, cx, cz) {
             continue;
         }
         if state
@@ -455,7 +476,7 @@ fn is_bastion_masonry(short: &str) -> bool {
     )
 }
 
-fn is_fillable_terrain_void(short: &str) -> bool {
+pub(crate) fn is_fillable_terrain_void(short: &str) -> bool {
     is_open_space(short)
         || is_water_like(short)
         || matches!(short, "lava" | "flowing_lava" | "fire" | "soul_fire")
@@ -823,20 +844,31 @@ mod tests {
             deepen_radius: 28,
             deepen_columns: Vec::new(),
             bastions_placed: 0,
+            citadel_spawned: false,
+            boss_uuid: None,
+            pacified: false,
+            regressing: false,
+            regress_radius: 0,
+            regress_columns: Vec::new(),
+            regress_active_column: None,
         }
     }
 
     #[test]
     fn bastion_requires_heavy_deep_corruption_and_rarity_limits() {
         let mut rift = sample_rift();
+        rift.max_radius_sq = 100 * 100;
+        rift.ring_radius = 120;
         assert!(rift_eligible_for_bastion(&rift));
 
         let mut small = sample_rift();
         small.corrupted_blocks = 80_000;
+        small.max_radius_sq = 100 * 100;
         assert!(!rift_eligible_for_bastion(&small));
 
         let mut shallow = sample_rift();
         shallow.deepen_radius = 10;
+        shallow.max_radius_sq = 100 * 100;
         assert!(!rift_eligible_for_bastion(&shallow));
 
         rift.contained = true;
@@ -846,8 +878,12 @@ mod tests {
         rift.bastions_placed = 1;
         assert!(!rift_eligible_for_bastion(&rift));
         rift.corrupted_blocks = 550_000;
-        rift.ring_radius = 100;
+        rift.ring_radius = 120;
         assert!(rift_eligible_for_bastion(&rift));
+
+        rift.pacified = true;
+        assert!(!rift_eligible_for_bastion(&rift));
+        rift.pacified = false;
 
         rift.bastions_placed = 2;
         assert!(!rift_eligible_for_bastion(&rift));
@@ -855,7 +891,7 @@ mod tests {
         // Connected wasteland pools corrupted territory across touching rifts for Bastion unlocks.
         let mut r1 = sample_rift();
         r1.corrupted_blocks = 90_000;
-        r1.max_radius_sq = 35 * 35;
+        r1.max_radius_sq = 100 * 100;
         let mut r2 = sample_rift();
         r2.id = 2;
         r2.center = [260, 64, 200];
@@ -868,6 +904,16 @@ mod tests {
         assert!(!rift_eligible_for_bastion(&st.rifts[0]));
         let combined = st.connected_wasteland_for(0);
         assert!(wasteland_eligible_for_bastion(&st.rifts[0], combined));
+
+        // Pacified rifts never contribute Bastion unlock credit to a newly lit portal,
+        // and Bastions never spawn near a portal epicenter.
+        st.rifts[1].pacified = true;
+        assert!(!site_outside_epicenters(&st, 220, 210));
+        assert!(!site_outside_epicenters(&st, 280, 200));
+        assert!(site_outside_epicenters(&st, 100, 200));
+        let isolated = st.connected_wasteland_for(0);
+        assert_eq!(isolated.total_corrupted_blocks, 90_000);
+        assert!(!wasteland_eligible_for_bastion(&st.rifts[0], isolated));
     }
 
     #[test]

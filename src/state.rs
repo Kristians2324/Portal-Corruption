@@ -34,6 +34,16 @@ pub struct PendingBastion {
     pub queued_tick: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingCitadel {
+    pub rift_id: u64,
+    pub center: [i32; 3],
+    pub flavor: NetherFlavor,
+    pub roll: u64,
+    pub forced_chunks: Vec<[i32; 2]>,
+    pub queued_tick: u64,
+}
+
 pub struct RiftState {
     pub world_epoch: Option<WorldEpoch>,
     pub world_dir: Option<PathBuf>,
@@ -45,6 +55,7 @@ pub struct RiftState {
     pub dirty: bool,
     pub rifts: Vec<RiftSource>,
     pub bastions: Vec<BastionSite>,
+    pub citadels: Vec<[i32; 3]>,
     pub corrupted_quarts: HashSet<[i32; 3]>,
     pub corrupted_quart_cols: HashSet<[i32; 2]>,
     /// Tracks Overworld mobs buffed as Nether-Touched so loot & flames persist.
@@ -57,9 +68,13 @@ pub struct RiftState {
     /// Active chunk tickets held by Rift Bleed via `ChunkRef::set_forced`.
     pub core_chunks: HashSet<[i32; 2]>,
     pub frontier_chunks: VecDeque<[i32; 2]>,
+    pub regress_chunks: VecDeque<[i32; 2]>,
     pub pending_bastion: Option<PendingBastion>,
     pub bastion_release_chunks: Vec<[i32; 2]>,
     pub bastion_release_ttl: u8,
+    pub pending_citadel: Option<PendingCitadel>,
+    pub citadel_release_chunks: Vec<[i32; 2]>,
+    pub citadel_release_ttl: u8,
     /// Queues filled by read-only hooks and drained in `level_tick_post`.
     pub pending_portals: VecDeque<[i32; 3]>,
     pub pending_containment_checks: Vec<[i32; 3]>,
@@ -95,6 +110,7 @@ impl RiftState {
             dirty: false,
             rifts: Vec::new(),
             bastions: Vec::new(),
+            citadels: Vec::new(),
             corrupted_quarts: HashSet::new(),
             corrupted_quart_cols: HashSet::new(),
             nether_touched_mobs: HashSet::new(),
@@ -102,9 +118,13 @@ impl RiftState {
             zombification_immune_mobs: HashSet::new(),
             core_chunks: HashSet::new(),
             frontier_chunks: VecDeque::new(),
+            regress_chunks: VecDeque::new(),
             pending_bastion: None,
             bastion_release_chunks: Vec::new(),
             bastion_release_ttl: 0,
+            pending_citadel: None,
+            citadel_release_chunks: Vec::new(),
+            citadel_release_ttl: 0,
             pending_portals: VecDeque::new(),
             pending_containment_checks: Vec::new(),
             pending_water_evap: VecDeque::new(),
@@ -149,7 +169,11 @@ impl RiftState {
     }
 
     pub fn has_uncontained(&self) -> bool {
-        self.rifts.iter().any(|r| !r.contained)
+        self.rifts.iter().any(|r| r.is_actively_spreading())
+    }
+
+    pub fn has_regressing(&self) -> bool {
+        self.rifts.iter().any(|r| r.regressing)
     }
 
     pub fn is_quart_corrupted(&self, block_pos: [i32; 3]) -> bool {
@@ -163,6 +187,25 @@ impl RiftState {
         self.corrupted_quart_cols.insert([q[0], q[2]])
     }
 
+    pub fn unmark_quart_col(&mut self, x: i32, z: i32) {
+        let qx = x >> 2;
+        let qz = z >> 2;
+        self.corrupted_quart_cols.remove(&[qx, qz]);
+        self.corrupted_quarts.retain(|q| q[0] != qx || q[2] != qz);
+    }
+
+    /// True if any *other* active (unpacified) Rift still reaches `(x, z)` so one
+    /// purified portal's regression never erases another portal's live wasteland.
+    pub fn other_active_rift_covers(&self, excluding_rift_id: u64, x: i32, z: i32) -> bool {
+        self.rifts.iter().any(|r| {
+            if r.id == excluding_rift_id || r.pacified {
+                return false;
+            }
+            let r_limit = i64::from(r.ring_radius.max(16) + 4);
+            crate::types::horiz_dist_sq(r.center, [x, 64, z]) <= r_limit * r_limit
+        })
+    }
+
     pub fn find_near_source_mut(&mut self, pos: [i32; 3], max_dist: i32) -> Option<&mut RiftSource> {
         let limit = i64::from(max_dist) * i64::from(max_dist);
         self.rifts
@@ -171,10 +214,11 @@ impl RiftState {
             .min_by_key(|r| crate::types::dist_sq(r.center, pos))
     }
 
-    /// Computes combined territory stats across all active or scarred rifts whose
+    /// Computes combined territory stats across all unpacified rifts whose
     /// corrupted circles touch or overlap with `self.rifts[seed_idx]`.
+    /// Pacified rifts never donate blocks or Bastion credit to a new portal's cycle.
     pub fn connected_wasteland_for(&self, seed_idx: usize) -> ConnectedWasteland {
-        if seed_idx >= self.rifts.len() {
+        if seed_idx >= self.rifts.len() || self.rifts[seed_idx].pacified {
             return ConnectedWasteland::default();
         }
         let mut visited = vec![false; self.rifts.len()];
@@ -185,6 +229,9 @@ impl RiftState {
         let mut summary = ConnectedWasteland::default();
         while let Some(idx) = queue.pop_front() {
             let r = &self.rifts[idx];
+            if r.pacified {
+                continue;
+            }
             summary.total_corrupted_blocks =
                 summary.total_corrupted_blocks.saturating_add(r.corrupted_blocks);
             summary.total_area_radius_sq =
@@ -197,7 +244,7 @@ impl RiftState {
             summary.member_count += 1;
 
             for next in 0..self.rifts.len() {
-                if !visited[next] && rifts_touch(r, &self.rifts[next]) {
+                if !visited[next] && !self.rifts[next].pacified && rifts_touch(r, &self.rifts[next]) {
                     visited[next] = true;
                     queue.push_back(next);
                 }
@@ -265,7 +312,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(6));
+        root.insert("version".into(), Value::from(7));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -287,14 +334,35 @@ impl RiftState {
                 obj.insert("ring_radius".into(), Value::from(r.ring_radius));
                 obj.insert("deepen_radius".into(), Value::from(r.deepen_radius));
                 obj.insert("bastions_placed".into(), Value::from(r.bastions_placed));
+                obj.insert("citadel_spawned".into(), Value::from(r.citadel_spawned));
+                if let Some(u) = r.boss_uuid {
+                    obj.insert("boss_uuid".into(), Value::String(format!("{u:032x}")));
+                }
+                obj.insert("pacified".into(), Value::from(r.pacified));
+                obj.insert("regressing".into(), Value::from(r.regressing));
+                obj.insert("regress_radius".into(), Value::from(r.regress_radius));
                 let ring_cols: Vec<Value> = r.ring_columns.iter().copied().map(col_to_json).collect();
                 obj.insert("ring_columns".into(), Value::Array(ring_cols));
                 let deep_cols: Vec<Value> =
                     r.deepen_columns.iter().copied().map(col_to_json).collect();
                 obj.insert("deepen_columns".into(), Value::Array(deep_cols));
+                let reg_cols: Vec<Value> =
+                    r.regress_columns.iter().copied().map(col_to_json).collect();
+                obj.insert("regress_columns".into(), Value::Array(reg_cols));
                 if let Some(([x, z], y, min_y)) = r.active_column {
                     obj.insert(
                         "active_column".into(),
+                        Value::Array(vec![
+                            Value::from(x),
+                            Value::from(z),
+                            Value::from(y),
+                            Value::from(min_y),
+                        ]),
+                    );
+                }
+                if let Some(([x, z], y, min_y)) = r.regress_active_column {
+                    obj.insert(
+                        "regress_active_column".into(),
                         Value::Array(vec![
                             Value::from(x),
                             Value::from(z),
@@ -319,6 +387,9 @@ impl RiftState {
             })
             .collect();
         root.insert("bastions".into(), Value::Array(bastions));
+
+        let citadels: Vec<Value> = self.citadels.iter().copied().map(pos_to_json).collect();
+        root.insert("citadels".into(), Value::Array(citadels));
 
         let cols: Vec<Value> = self
             .corrupted_quart_cols
@@ -400,6 +471,35 @@ impl RiftState {
                     (dr, dc)
                 };
                 let active_column = item.get("active_column").and_then(active_col_from_json);
+                let citadel_spawned = item
+                    .get("citadel_spawned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let boss_uuid = item
+                    .get("boss_uuid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u128::from_str_radix(s, 16).ok());
+                let pacified = item
+                    .get("pacified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let regressing = item
+                    .get("regressing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let regress_radius = item
+                    .get("regress_radius")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(0);
+                let regress_columns: Vec<[i32; 2]> = item
+                    .get("regress_columns")
+                    .and_then(|v| v.as_array())
+                    .map(|list| list.iter().filter_map(col_from_json).collect())
+                    .unwrap_or_default();
+                let regress_active_column = item
+                    .get("regress_active_column")
+                    .and_then(active_col_from_json);
 
                 self.rifts.push(RiftSource {
                     id,
@@ -430,6 +530,13 @@ impl RiftState {
                         .get("bastions_placed")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32,
+                    citadel_spawned,
+                    boss_uuid,
+                    pacified,
+                    regressing,
+                    regress_radius,
+                    regress_columns,
+                    regress_active_column,
                 });
             }
         }
@@ -444,6 +551,15 @@ impl RiftState {
                     item.get("flavor").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
                 );
                 self.bastions.push(BastionSite { center, flavor });
+            }
+        }
+
+        self.citadels.clear();
+        if let Some(arr) = doc.get("citadels").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(center) = pos_from_json(item) {
+                    self.citadels.push(center);
+                }
             }
         }
 
@@ -537,7 +653,15 @@ mod tests {
             deepen_radius: 6,
             deepen_columns: vec![[122, -88]],
             bastions_placed: 1,
+            citadel_spawned: true,
+            boss_uuid: Some(0x1234_5678_9abc_def0_1122_3344_5566_7788),
+            pacified: false,
+            regressing: true,
+            regress_radius: 12,
+            regress_columns: vec![[128, -80]],
+            regress_active_column: Some(([120, -88], 40, -63)),
         });
+        s.citadels.push([120, 64, -88]);
         s.bastions.push(BastionSite {
             center: [210, 70, -40],
             flavor: NetherFlavor::BasaltDeltas,
@@ -554,9 +678,22 @@ mod tests {
         assert_eq!(loaded.rifts.len(), 1);
         assert!(!loaded.rifts[0].active_portal);
         assert!(loaded.rifts[0].contained);
+        assert!(loaded.rifts[0].citadel_spawned);
+        assert_eq!(
+            loaded.rifts[0].boss_uuid,
+            Some(0x1234_5678_9abc_def0_1122_3344_5566_7788)
+        );
+        assert!(!loaded.rifts[0].pacified);
+        assert!(loaded.rifts[0].regressing);
+        assert_eq!(loaded.rifts[0].regress_radius, 12);
+        assert_eq!(loaded.citadels, vec![[120, 64, -88]]);
         assert_eq!(loaded.rifts[0].flavor, NetherFlavor::SoulSandValley);
         assert_eq!(loaded.rifts[0].ring_radius, 14);
         assert_eq!(loaded.rifts[0].active_column, Some(([121, -88], 12, -63)));
+        assert_eq!(
+            loaded.rifts[0].regress_active_column,
+            Some(([120, -88], 40, -63))
+        );
         assert_eq!(loaded.bastions.len(), 1);
         assert_eq!(loaded.bastions[0].center, [210, 70, -40]);
         assert!(loaded.is_quart_corrupted([120, 64, -88]));

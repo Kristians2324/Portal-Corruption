@@ -110,6 +110,23 @@ pub struct RiftSource {
     pub deepen_radius: i32,
     pub deepen_columns: Vec<[i32; 2]>,
     pub bastions_placed: u32,
+    /// True once this Rift's unique central Citadel has erupted around the portal.
+    pub citadel_spawned: bool,
+    /// Persistent UUID of the Wither Sovereign guarding this Rift's Citadel.
+    pub boss_uuid: Option<u128>,
+    /// True once that Wither Sovereign is slain: spread halts forever without needing a seal.
+    pub pacified: bool,
+    /// True while ~80% Overworld regression is actively healing this Rift's territory.
+    pub regressing: bool,
+    pub regress_radius: i32,
+    pub regress_columns: Vec<[i32; 2]>,
+    pub regress_active_column: Option<([i32; 2], i32, i32)>,
+}
+
+impl RiftSource {
+    pub fn is_actively_spreading(&self) -> bool {
+        !self.contained && !self.pacified
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,8 +1,10 @@
 mod atmosphere;
 mod bastion;
+mod citadel;
 mod containment;
 mod corruption;
 mod mobs;
+mod regression;
 mod state;
 mod types;
 
@@ -22,13 +24,13 @@ use types::{
 use mod_api::{
     BlockChangedEvent, BlockSpreadEvent, BlockUpdateFlags, BucketEmptyEvent, ClientHost,
     ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientTickPostEvent, Command,
-    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, FillBucketEvent,
-    FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide, Identifier,
-    ItemStack, LevelDimension, LevelHost, LevelRef, LevelTickPostEvent, LivingConversionPreEvent,
-    LivingDeathEvent, LootDropsEvent, MusicEvent, ParticleOptions, PortalCreateEvent,
-    PotentialSpawnsEvent, RegisterCommandsEvent, Registrar, RegistrationContext, RenderFogEvent,
-    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent, SoundSource, Text,
-    WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
+    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, ExplosionDetonateEvent,
+    FillBucketEvent, FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide,
+    Identifier, ItemStack, LevelDimension, LevelHost, LevelRef, LevelTickPostEvent,
+    LivingConversionPreEvent, LivingDeathEvent, LootDropsEvent, MusicEvent, ParticleOptions,
+    PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RenderFogEvent, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent,
+    SoundSource, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -140,7 +142,13 @@ fn release_all_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: 
             let _ = cref.set_forced(host, false);
         }
     }
+    while let Some(chunk) = state.regress_chunks.pop_front() {
+        if let Some(cref) = level.chunk_ref(host, chunk) {
+            let _ = cref.set_forced(host, false);
+        }
+    }
     bastion::release_bastion_chunks(host, level, state);
+    citadel::release_citadel_chunks(host, level, state);
 }
 
 fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
@@ -160,7 +168,7 @@ fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut Ri
 
     let mut desired_core: HashSet<[i32; 2]> = HashSet::new();
     for rift in &state.rifts {
-        if rift.contained || desired_core.len() >= MAX_CORE_FORCED_CHUNKS {
+        if !rift.is_actively_spreading() || desired_core.len() >= MAX_CORE_FORCED_CHUNKS {
             continue;
         }
         desired_core.insert([rift.center[0] >> 4, rift.center[2] >> 4]);
@@ -189,7 +197,7 @@ fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut Ri
 
     let mut desired_frontier: Vec<[i32; 2]> = Vec::new();
     for rift in &state.rifts {
-        if rift.contained {
+        if !rift.is_actively_spreading() {
             continue;
         }
         if let Some(([x, z], _, _)) = rift.active_column {
@@ -267,6 +275,13 @@ fn register_or_refresh_rift(host: &mut dyn ServerHost, level: LevelRef, state: &
         deepen_radius: 1,
         deepen_columns: build_ring_columns(centroid[0], centroid[2], 1),
         bastions_placed: 0,
+        citadel_spawned: false,
+        boss_uuid: None,
+        pacified: false,
+        regressing: false,
+        regress_radius: 0,
+        regress_columns: Vec::new(),
+        regress_active_column: None,
     };
     state.rifts.push(rift);
     if state.mark_quart_corrupted(centroid) {
@@ -307,6 +322,9 @@ fn evaluate_rift_containment(host: &mut dyn ServerHost, level: LevelRef, state: 
     let view = ServerContainmentView { host, level };
 
     for idx in 0..state.rifts.len() {
+        if state.rifts[idx].pacified {
+            continue;
+        }
         let check_this = force_all
             || periodic
             || queued
@@ -359,7 +377,7 @@ pub fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool 
         return true;
     }
     for rift in &state.rifts {
-        if rift.contained {
+        if !rift.is_actively_spreading() {
             continue;
         }
         let limit = (rift.max_radius_sq + 256).max(16 * 16);
@@ -1085,7 +1103,7 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         .rifts
         .iter()
         .enumerate()
-        .filter(|(_, r)| !r.contained)
+        .filter(|(_, r)| r.is_actively_spreading())
         .map(|(i, _)| i)
         .collect();
     if uncontained_indices.is_empty() {
@@ -1369,10 +1387,31 @@ impl Hooks for Mod {
 
     fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
         let pal = self.particles.lock().ok().and_then(|g| *g);
-        if let Ok(mut state) = self.state.try_lock() {
+        if let Ok(mut state) = self.state.try_lock()
+            && !regression::try_handle_boss_death(
+                host,
+                &mut state,
+                event.entity,
+                event.kind,
+                event.source.position,
+                pal.as_ref(),
+            )
+        {
             mobs::handle_living_death(host, &mut state, event, pal.as_ref());
         }
         Flow::Continue
+    }
+
+    fn explosion_detonate(&self, host: &mut dyn ServerHost, event: &mut ExplosionDetonateEvent<'_>) {
+        if event.dimension != OVERWORLD {
+            return;
+        }
+        let Some(level) = host.level(OVERWORLD) else {
+            return;
+        };
+        if let Ok(state) = self.state.try_lock() {
+            citadel::protect_citadel_portals_from_explosion(host, level, &state, event.blocks);
+        }
     }
 
     fn finalize_spawn(
@@ -1440,16 +1479,33 @@ impl Hooks for Mod {
             ensure_world_initialized(host, &mut state);
             match sub {
                 None | Some("status") => {
-                    let active = state.rifts.iter().filter(|r| !r.contained).count();
-                    let sealed = state.rifts.iter().filter(|r| r.contained).count();
+                    let active = state
+                        .rifts
+                        .iter()
+                        .filter(|r| r.is_actively_spreading())
+                        .count();
+                    let sealed = state
+                        .rifts
+                        .iter()
+                        .filter(|r| r.contained && !r.pacified)
+                        .count();
+                    let pacified = state.rifts.iter().filter(|r| r.pacified).count();
+                    let regressing = state.rifts.iter().filter(|r| r.regressing).count();
                     let blocks: u64 = state.rifts.iter().map(|r| r.corrupted_blocks).sum();
                     format!(
-                        "[Rift Bleed] Rifts: {} total ({} active, {} sealed) | Corrupted blocks: {} | Bastions: {} | Speed: {} ops/tick | State: {}",
+                        "[Rift Bleed] Rifts: {} total ({} active, {} sealed, {} pacified{}) | Corrupted blocks: {} | Bastions: {} | Citadels: {} | Speed: {} ops/tick | State: {}",
                         state.rifts.len(),
                         active,
                         sealed,
+                        pacified,
+                        if regressing > 0 {
+                            format!(", {regressing} regressing")
+                        } else {
+                            String::new()
+                        },
                         blocks,
                         state.bastions.len(),
+                        state.citadels.len(),
                         state.spread_budget,
                         if state.paused { "PAUSED" } else { "RUNNING" }
                     )
@@ -1511,14 +1567,24 @@ impl Hooks for Mod {
                             .rifts
                             .iter()
                             .map(|r| {
+                                let tag = if r.regressing {
+                                    "REGRESSING"
+                                } else if r.pacified {
+                                    "PACIFIED"
+                                } else if r.contained {
+                                    "SEALED"
+                                } else {
+                                    "BREACHED"
+                                };
                                 format!(
-                                    "#{} ({}, {}, {}) [{} | {}]",
+                                    "#{} ({}, {}, {}) [{} | {}{}]",
                                     r.id,
                                     r.center[0],
                                     r.center[1],
                                     r.center[2],
-                                    if r.contained { "SEALED" } else { "BREACHED" },
-                                    if r.active_portal { "portal" } else { "scar" }
+                                    tag,
+                                    if r.active_portal { "portal" } else { "scar" },
+                                    if r.citadel_spawned { "+citadel" } else { "" }
                                 )
                             })
                             .collect();
@@ -1601,6 +1667,8 @@ impl Hooks for Mod {
         emit_melt_evap_fx(server, event.level, &mut state, pal.as_ref());
         mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
         bastion::tick_bastion_emergence(server, event.level, &mut state);
+        citadel::tick_citadel_emergence(server, event.level, &mut state);
+        regression::tick_regression(server, event.level, &mut state);
 
         if state.tick % 200 == 0 {
             state.save_to_host(server);
@@ -1714,6 +1782,13 @@ mod tests {
             deepen_radius: 1,
             deepen_columns: Vec::new(),
             bastions_placed: 0,
+            citadel_spawned: false,
+            boss_uuid: None,
+            pacified: false,
+            regressing: false,
+            regress_radius: 0,
+            regress_columns: Vec::new(),
+            regress_active_column: None,
         });
         state.mark_quart_corrupted([4, 64, 4]);
         assert!(near_corruption_or_active_rift(&state, [4, 64, 4]));
