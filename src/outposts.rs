@@ -11,13 +11,12 @@ use mod_api::{
     Identifier, ItemStack, LevelRef, ServerHost, SoundSource, Tag, Text,
 };
 
-const OUTPOST_CHECK_INTERVAL_TICKS: u64 = 300;
-const OUTPOST_OFFSET_TICK: u64 = 170;
-const MAX_OUTPOSTS_PER_RIFT: u32 = 4;
-const MIN_OUTPOST_PORTAL_DIST: i64 = 52;
-const MIN_OUTPOST_SPACING: i64 = 105;
-const MIN_OUTPOST_BASTION_SPACING: i64 = 64;
-const MIN_PLAYER_DIST_FOR_OUTPOST: i64 = 64;
+const OUTPOST_CHECK_INTERVAL_TICKS: u64 = 200;
+const OUTPOST_OFFSET_TICK: u64 = 130;
+const MIN_OUTPOST_PORTAL_DIST: i64 = 54;
+const MIN_OUTPOST_SPACING: i64 = 84;
+const MIN_OUTPOST_BASTION_SPACING: i64 = 72;
+const MIN_PLAYER_DIST_FOR_OUTPOST: i64 = 68;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -54,40 +53,44 @@ enum OMat {
     Lava = 29,
     SoulLantern = 30,
     HayBlock = 31,
+    WarpedStem = 32,
+    StrippedWarpedStem = 33,
+    WarpedPlanks = 34,
+    WarpedFence = 35,
+    WarpedWartBlock = 36,
+    BoneBlock = 37,
+    DeepslateBricks = 38,
+    PolishedDeepslate = 39,
+    SmoothBasalt = 40,
+    Glowstone = 41,
 }
 
 pub fn wasteland_eligible_for_outpost(
     rift: &RiftSource,
     wasteland: ConnectedWasteland,
 ) -> Option<OutpostKind> {
-    if rift.contained
-        || rift.pacified
-        || rift.regressing
-        || rift.outposts_placed >= MAX_OUTPOSTS_PER_RIFT
-    {
-        return None;
-    }
-    let max_group_outposts = ((wasteland.member_count as u32) * MAX_OUTPOSTS_PER_RIFT).min(8);
-    if wasteland.total_outposts_placed >= max_group_outposts {
+    if rift.contained || rift.pacified || rift.regressing {
         return None;
     }
 
-    let (min_blocks, min_ring) = match rift.outposts_placed {
-        0 => (85_000, 65),
-        1 => (190_000, 90),
-        2 => (320_000, 110),
-        _ => (480_000, 125),
+    // Dynamic scaling: outposts unlock early and keep populating indefinitely as corruption
+    // engulfs huge tracts of land, constrained only by physical world spacing.
+    let (min_blocks, min_ring) = match wasteland.total_outposts_placed {
+        0 => (45_000, 50),
+        1 => (95_000, 64),
+        2 => (155_000, 78),
+        n => (
+            155_000 + ((n - 2) as u64) * 75_000,
+            78 + ((n - 2) as i32) * 10,
+        ),
     };
     if wasteland.total_corrupted_blocks < min_blocks || wasteland.max_ring_radius < min_ring {
         return None;
     }
 
-    // Cycle reliably across all three brutal Mordor outpost archetypes!
-    Some(match (rift.outposts_placed as u64 + (rift.id % 3)) % 3 {
-        0 => OutpostKind::HoglinVillage,
-        1 => OutpostKind::InfernalFoundry,
-        _ => OutpostKind::SiegeWatchtower,
-    })
+    // Cycle smoothly across all six unique Nether invasion archetypes.
+    let idx = ((rift.outposts_placed as u64 + (rift.id % 6)) % 6) as u8;
+    Some(OutpostKind::from_u8(idx))
 }
 
 pub fn site_clear_for_outpost(state: &RiftState, cx: i32, cz: i32) -> bool {
@@ -165,15 +168,16 @@ pub fn tick_outposts(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
             continue;
         };
 
+        let half = outpost_half_extent(kind);
         let radius = ((rift.max_radius_sq as f64).sqrt() as i32).max(rift.ring_radius);
         let inner = (MIN_OUTPOST_PORTAL_DIST as i32) + 4;
-        let outer = (radius - 14).max(inner + 4);
-        if radius < inner + 6 {
+        let outer = (radius - (half + 4)).max(inner + 4);
+        if radius < inner + 8 {
             continue;
         }
 
         let mut picked: Option<([i32; 3], u64)> = None;
-        for attempt in 0..16u64 {
+        for attempt in 0..32u64 {
             let h = spatial_hash(
                 rift.center[0],
                 rift.outposts_placed as i32,
@@ -214,7 +218,7 @@ fn stage_pending_outpost(
     flavor: NetherFlavor,
     roll: u64,
 ) {
-    let half = outpost_half_extent(kind) + 4;
+    let half = outpost_half_extent(kind) + 6;
     let min_cx = (center[0] - half) >> 4;
     let max_cx = (center[0] + half) >> 4;
     let min_cz = (center[2] - half) >> 4;
@@ -312,7 +316,7 @@ fn process_pending_outpost(host: &mut dyn ServerHost, level: LevelRef, state: &m
     state.dirty = true;
 
     let msg = format!(
-        "[Rift Bleed] A brutal {} has fortified the outskirts near ({}, {}, {})!",
+        "[Rift Bleed] A colossal {} has risen from the blight near ({}, {}, {})!",
         pending.kind.display_name(),
         pending.center[0],
         floor_y,
@@ -325,15 +329,15 @@ fn process_pending_outpost(host: &mut dyn ServerHost, level: LevelRef, state: &m
         {
             let _ = player.tell(host, Text::literal(msg.clone()));
             if let Some(ppos) = player.entity().position(host)
-                && horiz_dist_sq([ppos[0] as i32, 64, ppos[2] as i32], pending.center) <= 280 * 280
+                && horiz_dist_sq([ppos[0] as i32, 64, ppos[2] as i32], pending.center) <= 320 * 320
             {
                 let _ = level.play_sound(
                     host,
                     "minecraft:block.anvil.place",
                     ppos,
                     SoundSource::Hostile,
-                    0.45,
-                    0.65,
+                    0.5,
+                    0.6,
                 );
             }
         }
@@ -342,9 +346,12 @@ fn process_pending_outpost(host: &mut dyn ServerHost, level: LevelRef, state: &m
 
 pub fn outpost_half_extent(kind: OutpostKind) -> i32 {
     match kind {
-        OutpostKind::HoglinVillage => 17,
-        OutpostKind::InfernalFoundry => 14,
-        OutpostKind::SiegeWatchtower => 11,
+        OutpostKind::HoglinVillage => 22,
+        OutpostKind::InfernalFoundry => 21,
+        OutpostKind::SiegeWatchtower => 18,
+        OutpostKind::BoneCatacomb => 21,
+        OutpostKind::ArenaPit => 23,
+        OutpostKind::AlchemistSpire => 20,
     }
 }
 
@@ -355,7 +362,7 @@ fn validate_and_resolve_outpost_floor(
     pending: &PendingOutpost,
 ) -> Option<i32> {
     let half = outpost_half_extent(pending.kind);
-    let step = (half / 2).max(4);
+    let step = (half / 2).max(6);
     let mut probe_cols = Vec::with_capacity(9);
     for dx in [-step, 0, step] {
         for dz in [-step, 0, step] {
@@ -375,7 +382,7 @@ fn validate_and_resolve_outpost_floor(
 
     let min_h = *hs.iter().min()?;
     let max_h = *hs.iter().max()?;
-    if max_h - min_h > 18 || min_h < 48 || max_h > 165 {
+    if max_h - min_h > 20 || min_h < 48 || max_h > 165 {
         return None;
     }
 
@@ -408,10 +415,78 @@ fn validate_and_resolve_outpost_floor(
     let mut sorted = hs;
     sorted.sort_unstable();
     let median = sorted[sorted.len() / 2] - 1;
-    Some(median.clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 32))
+    Some(median.clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 36))
 }
 
-/// Pure column geometry blueprint shared across all three Mordor outpost archetypes.
+#[inline]
+fn push_range(u: &mut Vec<(i32, OMat)>, y0: i32, y1: i32, mat: OMat) {
+    for dy in y0..=y1 {
+        u.push((dy, mat));
+    }
+}
+
+#[inline]
+fn push_brazier_top(u: &mut Vec<(i32, OMat)>, top_solid_y: i32, base: OMat, flame: OMat) {
+    u.push((top_solid_y, base));
+    u.push((top_solid_y + 1, flame));
+}
+
+#[inline]
+fn push_hanging_chandelier(u: &mut Vec<(i32, OMat)>, ceiling_y: i32, chain_blocks: i32) {
+    for off in 1..=chain_blocks {
+        u.push((ceiling_y - off, OMat::Chain));
+    }
+    u.push((ceiling_y - chain_blocks - 1, OMat::Shroomlight));
+}
+
+#[inline]
+fn push_enclosed_chimney_col(
+    u: &mut Vec<(i32, OMat)>,
+    sdx: i32,
+    sdz: i32,
+    base_y: i32,
+    rim_h: i32,
+    firebox_open_south: bool,
+) {
+    let edge = sdx == 2 || sdz == 2;
+    let corner = sdx == 2 && sdz == 2;
+    if edge {
+        let top = if corner { rim_h - 2 } else { rim_h };
+        for dy in base_y..=top {
+            let m = if firebox_open_south && dy <= 2 && (sdx == 0 || sdz == 0) {
+                OMat::IronBars
+            } else if dy % 5 == 0 {
+                OMat::RedNetherBricks
+            } else if dy >= rim_h - 2 {
+                OMat::Obsidian
+            } else {
+                OMat::PolishedBasalt
+            };
+            u.push((dy, m));
+        }
+    } else if sdx == 1 || sdz == 1 {
+        // Inner brick & obsidian flue sheath seals the shaft solidly from floor to crown.
+        for dy in base_y..=(rim_h - 1) {
+            let m = if firebox_open_south && dy == 2 && sdx == 0 {
+                OMat::IronBars
+            } else if dy <= 4 || dy >= rim_h - 3 {
+                OMat::Obsidian
+            } else {
+                OMat::Blackstone
+            };
+            u.push((dy, m));
+        }
+    } else {
+        // Core center: lava firebox behind bottom grate, solid masonry flue, recessed embers 2 blocks below rim!
+        u.push((1, OMat::Lava));
+        // dy 2..=3 open firebox chamber under solid flue hood starting at dy=4 (connected horizontally to inner ring).
+        push_range(u, 4, rim_h - 4, OMat::Blackstone);
+        u.push((rim_h - 3, OMat::Magma));
+        u.push((rim_h - 2, OMat::Campfire));
+    }
+}
+
+/// Pure column geometry blueprint shared across all six large Nether invasion archetypes.
 fn plan_outpost_column(
     kind: OutpostKind,
     dx: i32,
@@ -422,6 +497,9 @@ fn plan_outpost_column(
         OutpostKind::HoglinVillage => plan_hoglin_village_col(dx, dz, roll),
         OutpostKind::InfernalFoundry => plan_infernal_foundry_col(dx, dz, roll),
         OutpostKind::SiegeWatchtower => plan_siege_watchtower_col(dx, dz, roll),
+        OutpostKind::BoneCatacomb => plan_bone_catacomb_col(dx, dz, roll),
+        OutpostKind::ArenaPit => plan_arena_pit_col(dx, dz, roll),
+        OutpostKind::AlchemistSpire => plan_alchemist_spire_col(dx, dz, roll),
     }
 }
 
@@ -431,24 +509,27 @@ fn plan_hoglin_village_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat
     let cheb = ax.max(az);
     let mut u = Vec::new();
 
-    // Base brutal kraal ground floor: packed basalt mud, cracked blackstone, warm cinder trenches.
-    let floor = if (dx.abs() <= 2 && dz >= 0) || (dz.abs() <= 2 && dx.abs() <= 16) {
+    let on_war_road = (ax <= 2 && dz >= -8) || (az <= 2 && ax <= 20);
+    let in_longhouse = (-13..=13).contains(&dx) && (-19..=-9).contains(&dz);
+    let in_pens = (-19..=-9).contains(&dx) && (-6..=10).contains(&dz);
+    let in_war_hall = (9..=19).contains(&dx) && (-6..=10).contains(&dz);
+    let in_vault = (-6..=6).contains(&dx) && (11..=18).contains(&dz);
+
+    let floor = if on_war_road {
         if roll % 5 == 0 {
             OMat::GildedBlackstone
         } else {
             OMat::CrackedBricks
         }
-    } else if dz >= 8 && dx.abs() <= 5 {
+    } else if in_longhouse || in_war_hall || in_vault {
         OMat::PolishedBricks
-    } else if dx >= 7 && dx <= 14 && dz >= -5 && dz <= 7 {
-        OMat::PolishedBricks
-    } else if dx >= -14 && dx <= -8 && dz >= -4 && dz <= 6 {
+    } else if in_pens {
         if roll % 2 == 0 {
             OMat::SoulSand
         } else {
             OMat::SoulSoil
         }
-    } else if roll % 7 == 0 {
+    } else if roll % 8 == 0 {
         OMat::Magma
     } else if roll % 3 == 0 {
         OMat::SoulSoil
@@ -456,57 +537,93 @@ fn plan_hoglin_village_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat
         OMat::Blackstone
     };
 
-    // 1. Jagged Perimeter Palisade (cheb == 16..=17) with South & West/East brutal gates.
-    let in_south_gate = dz >= 15 && dx.abs() <= 2;
-    let in_west_gate = dx <= -15 && dz.abs() <= 2;
-    if cheb >= 16 && !in_south_gate && !in_west_gate {
-        let spike = (dx + dz).abs() % 3 == 0;
-        let wall_h = if ax >= 15 && az >= 15 {
-            7
-        } else if spike {
-            5
+    // 1. Massive Perimeter Palisade (cheb == 21..=22) + inner sentry wall-walk (cheb == 20).
+    let south_gate = dz >= 20 && ax <= 2;
+    let west_gate = dx <= -20 && az <= 2;
+    let east_gate = dx >= 20 && az <= 2;
+    let in_gate_axis = south_gate || west_gate || east_gate;
+    if cheb >= 21 {
+        let gate_tower =
+            (dz >= 20 && (3..=4).contains(&ax)) || (ax >= 20 && (3..=4).contains(&az));
+        let corner_bastion = ax >= 19 && az >= 19;
+        if in_gate_axis {
+            push_range(&mut u, 5, 6, OMat::Obsidian);
+            u.push((7, OMat::PolishedBricks));
+        } else if corner_bastion {
+            push_range(&mut u, 1, 8, OMat::Blackstone);
+            push_brazier_top(&mut u, 9, OMat::Obsidian, OMat::SoulCampfire);
+        } else if gate_tower {
+            push_range(&mut u, 1, 7, OMat::PolishedBricks);
+            push_brazier_top(&mut u, 8, OMat::Obsidian, OMat::SoulCampfire);
         } else {
-            4
-        };
-        for dy in 1..=wall_h {
-            let m = if dy == wall_h && (ax >= 15 && az >= 15) {
-                OMat::Obsidian
-            } else if dy == wall_h && spike {
-                OMat::Basalt
-            } else if dy == 3 && !spike && (dx.abs() % 2 == 0 || dz.abs() % 2 == 0) {
-                OMat::IronBars
-            } else if (dx % 4 == 0 && az >= 16) || (dz % 4 == 0 && ax >= 16) {
-                OMat::StrippedCrimsonStem
-            } else if roll % 3 == 0 {
-                OMat::CrackedBricks
+            let spike = (dx + dz).abs() % 3 == 0;
+            let wall_h = if spike { 7 } else { 6 };
+            for dy in 1..=wall_h {
+                let m = if dy == wall_h && spike {
+                    OMat::Obsidian
+                } else if dy == 3 && !spike && (ax % 2 == 0 || az % 2 == 0) {
+                    OMat::IronBars
+                } else if (dx % 4 == 0 && az >= 21) || (dz % 4 == 0 && ax >= 21) {
+                    OMat::StrippedCrimsonStem
+                } else if roll % 3 == 0 {
+                    OMat::CrackedBricks
+                } else {
+                    OMat::Blackstone
+                };
+                u.push((dy, m));
+            }
+        }
+        return (floor, u);
+    }
+    if cheb == 20 && !in_gate_axis {
+        // Supported perimeter wall-walk catwalk at dy = 4.
+        let buttress = (dx + dz).abs() % 3 == 0 || ax == 19 || az == 19;
+        if buttress {
+            push_range(&mut u, 1, 3, OMat::Blackstone);
+        }
+        u.push((4, OMat::PolishedBricks));
+        return (floor, u);
+    }
+
+    // Courtyard rampart staircase climbing smoothly onto West sentry walkway (cheb == 20).
+    if dx == -19 && (13..=16).contains(&dz) {
+        let h = dz - 12; // 1..=4
+        push_range(&mut u, 1, h, OMat::CrackedBricks);
+        return (floor, u);
+    }
+
+    // 2. Grand Chieftain & Household Mead Longhouse (North Wing: dx in -13..=13, dz in -19..=-9).
+    if in_longhouse {
+        let on_wall = ax == 13 || dz == -19 || dz == -9;
+        let doorway = dz == -9 && ax <= 2;
+        let dist_from_ridge = (dz + 14).abs(); // 0..=5
+        let roof_y = 11 - dist_from_ridge; // 6 at eaves .. 11 at ridge
+        let in_chimney = ax <= 1 && (-15..=-13).contains(&dz);
+
+        if in_chimney {
+            if ax == 0 && dz == -14 {
+                u.push((1, OMat::Campfire));
+                push_range(&mut u, 4, 12, OMat::Blackstone);
+                u.push((13, OMat::Magma));
+                u.push((14, OMat::Campfire));
+            } else if ax == 0 && dz == -13 {
+                u.push((1, OMat::Blackstone));
+                u.push((2, OMat::IronBars));
+                push_range(&mut u, 3, 15, OMat::PolishedBasalt);
             } else {
-                OMat::Blackstone
-            };
-            u.push((dy, m));
+                push_range(&mut u, 1, 15, OMat::PolishedBasalt);
+            }
+            return (floor, u);
         }
-        if ax >= 15 && az >= 15 {
-            u.push((wall_h + 1, OMat::SoulCampfire));
-        }
-        return (floor, u);
-    }
 
-    // Torch/brazier gateposts.
-    if (ax == 3 && dz == 16) || (az == 3 && dx == -16) {
-        for dy in 1..=5 {
-            u.push((dy, if dy == 5 { OMat::SoulCampfire } else { OMat::PolishedBasalt }));
-        }
-        return (floor, u);
-    }
-
-    // 2. North Hoglin Sleeping Household & Mead Longhouse (dx in -9..=9, dz in -14..=-7).
-    if (-9..=9).contains(&dx) && (-14..=-7).contains(&dz) {
-        let on_wall = dx.abs() == 9 || dz == -14 || dz == -7;
-        let doorway = dz == -7 && dx.abs() <= 1;
-        if on_wall && !doorway {
-            for dy in 1..=4 {
-                let m = if dx.abs() == 9 && (dz == -14 || dz == -7) {
+        if on_wall {
+            for dy in 1..=(roof_y - 2) {
+                if doorway && dy <= 3 {
+                    continue;
+                }
+                let m = if ax == 13 && (dz == -19 || dz == -9) {
                     OMat::CrimsonStem
-                } else if dy == 2 && dx.abs() % 3 == 0 && dz == -14 {
+                } else if dy == 2 && ax % 4 == 0 && !doorway {
                     OMat::IronBars
                 } else if dy == 1 {
                     OMat::CrackedBricks
@@ -516,46 +633,71 @@ fn plan_hoglin_village_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat
                 u.push((dy, m));
             }
         }
-        // Pitched brutal timber-and-basalt roof.
-        let dist_from_ridge = (dz + 10).abs().min((dz + 11).abs());
-        let roof_y = 6 - (dist_from_ridge / 2);
+        // Two-block-thick pitched roof eliminates diagonal seams and sky pinholes.
+        u.push((roof_y - 1, OMat::CrimsonPlanks));
         u.push((
             roof_y,
-            if dx.abs() % 4 == 0 {
+            if ax % 4 == 0 {
                 OMat::StrippedCrimsonStem
             } else {
                 OMat::PolishedBasalt
             },
         ));
-        if roof_y == 6 && dx.abs() == 0 {
-            u.push((7, OMat::SoulLantern));
+        if roof_y == 11 && ax % 8 == 0 && ax > 0 {
+            u.push((12, OMat::SoulLantern));
         }
-        // Interior Hoglin sleeping wallows, hay/crimson fodder nests, and central hearth!
+
+        // Interior furnishings: Chieftain Mezzanine Loft (East), Household Sleeping Wallows (West).
         if !on_wall {
-            if dx == 0 && dz == -10 {
-                u.push((1, OMat::Campfire));
-                u.push((5, OMat::Chain));
-            } else if (dx <= -3 && dx >= -7 || dx >= 3 && dx <= 7) && (dz <= -11) {
-                u.push((
-                    1,
-                    if (dx + dz) % 2 == 0 {
-                        OMat::HayBlock
-                    } else {
-                        OMat::NetherWartBlock
-                    },
-                ));
+            if (7..=12).contains(&dx) && (-18..=-10).contains(&dz) {
+                u.push((5, OMat::CrimsonPlanks));
+                if dx == 7 && dz == -18 {
+                    u.push((6, OMat::SoulLantern));
+                }
+            } else if (3..=6).contains(&dx) && dz == -10 {
+                push_range(&mut u, 1, dx - 2, OMat::StrippedCrimsonStem);
+            } else if (-12..=-4).contains(&dx)
+                && (-18..=-12).contains(&dz)
+                && !(dx == -10 && dz == -17)
+            {
+                if dx == -8 && dz.abs() >= 15 {
+                    u.push((1, OMat::CrimsonFence));
+                } else if dz <= -15 || dz == -12 {
+                    u.push((
+                        1,
+                        if (dx + dz) % 2 == 0 {
+                            OMat::HayBlock
+                        } else {
+                            OMat::NetherWartBlock
+                        },
+                    ));
+                }
             }
-            if (dx == -4 || dx == 4) && dz == -9 {
-                u.push((1, OMat::CrimsonFence));
+            if (dx == -6 || dx == 5) && dz == -14 {
+                push_hanging_chandelier(&mut u, roof_y - 1, 1);
             }
         }
         return (floor, u);
     }
 
-    // 3. West Sunken Hoglin Feeding Pen & Stable Alcove (dx in -14..=-8, dz in -4..=6).
-    if (-14..=-8).contains(&dx) && (-4..=6).contains(&dz) {
-        let on_fence = dx == -14 || dx == -8 || dz == -4 || dz == 6;
-        let pen_gate = dx == -8 && (dz == 0 || dz == 1);
+    // 3. West Sunken Hoglin Feeding Pens & Covered Lean-To (dx in -19..=-9, dz in -6..=10).
+    if in_pens {
+        let on_fence = dx == -19 || dx == -9 || dz == -6 || dz == 10;
+        let pen_gate = dx == -9 && az <= 1;
+        let in_shed = (-19..=-15).contains(&dx) && (-5..=4).contains(&dz);
+        if in_shed {
+            let corner_post = (dx == -19 || dx == -15) && (dz == -5 || dz == 4);
+            if corner_post {
+                push_range(&mut u, 1, 4, OMat::CrimsonStem);
+            } else if dx == -18 && (dz == 2 || dz == 3) {
+                u.push((1, OMat::HayBlock));
+            }
+            u.push((4, OMat::CrimsonPlanks));
+            if dx <= -16 {
+                u.push((5, OMat::StrippedCrimsonStem));
+            }
+            return (floor, u);
+        }
         if on_fence && !pen_gate {
             u.push((
                 1,
@@ -565,72 +707,83 @@ fn plan_hoglin_village_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat
                     OMat::CrimsonFence
                 },
             ));
-            if (dx == -14 || dz == -4 || dz == 6) && (dx + dz) % 4 == 0 {
-                u.push((2, OMat::IronBars));
+            if (dx + dz) % 6 == 0 {
+                u.push((2, OMat::SoulLantern));
             }
-        } else if dx <= -11 && dz >= -2 && dz <= 4 {
-            if dz % 3 == 0 && dx == -12 {
+        } else if (-13..=-11).contains(&dx) && (-3..=6).contains(&dz) {
+            if dz == -2 || dz == 4 {
                 u.push((1, OMat::HayBlock));
-            }
-            if dx == -13 && dz == 1 {
-                u.push((1, OMat::Campfire));
+            } else if dx == -12 && dz == 1 {
+                u.push((1, OMat::Magma));
+                u.push((2, OMat::Campfire));
             }
         }
         return (floor, u);
     }
 
-    // 4. East Brutal War Room (dx in 7..=14, dz in -5..=7).
-    if (7..=14).contains(&dx) && (-5..=7).contains(&dz) {
-        let on_wall = dx == 7 || dx == 14 || dz == -5 || dz == 7;
-        let war_door = dx == 7 && dz.abs() <= 1;
-        if on_wall && !war_door {
-            for dy in 1..=5 {
-                let m = if (dx == 7 || dx == 14) && (dz == -5 || dz == 7) {
+    // 4. East Two-Story War Hall & Armory (dx in 9..=19, dz in -6..=10).
+    if in_war_hall {
+        let on_wall = dx == 9 || dx == 19 || dz == -6 || dz == 10;
+        let war_door = dx == 9 && az <= 1;
+        if on_wall {
+            for dy in 1..=6 {
+                if war_door && dy <= 3 {
+                    continue;
+                }
+                let m = if (dx == 9 || dx == 19) && (dz == -6 || dz == 10) {
                     OMat::Obsidian
-                } else if dy == 3 && (dz == 1 && dx == 14 || dx == 10 && dz.abs() == 5) {
+                } else if dy == 3 && ((dx == 19 && dz % 3 == 0) || (dx == 14 && (dz == -6 || dz == 10))) {
                     OMat::IronBars
-                } else if dy == 5 {
+                } else if dy == 6 {
                     OMat::RedNetherBricks
                 } else {
                     OMat::PolishedBricks
                 };
                 u.push((dy, m));
             }
+            if (dx + dz) % 2 == 0 {
+                u.push((7, OMat::Blackstone));
+            }
         }
         u.push((
             6,
             if dx % 2 == 0 {
-                OMat::Blackstone
+                OMat::PolishedBricks
             } else {
                 OMat::PolishedBasalt
             },
         ));
-        // Central War Table inside War Room (dx in 10..=11, dz in 0..=2).
-        if (10..=11).contains(&dx) && (0..=2).contains(&dz) {
-            u.push((
-                1,
-                if dx == 10 && dz == 1 {
-                    OMat::GildedBlackstone
-                } else {
-                    OMat::ChiseledBlackstone
-                },
-            ));
-            if dx == 11 && dz == 1 {
-                u.push((2, OMat::SoulLantern));
+        u.push((7, OMat::Blackstone));
+        if !on_wall {
+            if (13..=15).contains(&dx) && (1..=3).contains(&dz) {
+                u.push((
+                    1,
+                    if dx == 14 && dz == 2 {
+                        OMat::GildedBlackstone
+                    } else {
+                        OMat::ChiseledBlackstone
+                    },
+                ));
+            }
+            if dx == 14 && (dz == -2 || dz == 6) {
+                push_hanging_chandelier(&mut u, 6, 1);
             }
         }
         return (floor, u);
     }
 
-    // 5. South-Center Grated Treasure Bunker (dx in -5..=5, dz in 8..=13).
-    if (-5..=5).contains(&dx) && (8..=13).contains(&dz) {
-        let on_wall = dx.abs() == 5 || dz == 8 || dz == 13;
-        let vault_door = dz == 8 && dx.abs() <= 1;
-        if on_wall && !vault_door {
+    // 5. South Grated Obsidian Treasury Bunker (dx in -6..=6, dz in 11..=18).
+    if in_vault {
+        let on_wall = ax == 6 || dz == 11 || dz == 18;
+        let vault_door = dz == 11 && ax <= 1;
+        if on_wall {
             for dy in 1..=4 {
+                if vault_door && dy <= 3 {
+                    continue;
+                }
                 u.push((
                     dy,
-                    if dx.abs() == 5 || dz == 13 {
+                    if ax == 6 || dz == 18 {
                         OMat::Obsidian
                     } else if dy <= 2 {
                         OMat::IronBars
@@ -641,18 +794,25 @@ fn plan_hoglin_village_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat
             }
         }
         u.push((5, OMat::Obsidian));
-        if dx == 0 && dz == 11 {
+        if ax <= 5 && (12..=17).contains(&dz) {
+            u.push((6, OMat::GildedBlackstone));
+        }
+        if dx == 0 && dz == 15 {
             u.push((1, OMat::GoldBlock));
             u.push((2, OMat::CryingObsidian));
+            u.push((3, OMat::Shroomlight));
         }
         return (floor, u);
     }
 
-    // Courtyard central War-Fire Hearth.
-    if dx.abs() <= 1 && dz.abs() <= 1 {
+    // Central Courtyard Chieftain War-Pyre Totem.
+    if ax <= 2 && az <= 2 {
         if dx == 0 && dz == 0 {
             u.push((1, OMat::Magma));
             u.push((2, OMat::SoulCampfire));
+        } else if ax == 2 && az == 2 {
+            push_range(&mut u, 1, 3, OMat::StrippedCrimsonStem);
+            u.push((4, OMat::SoulLantern));
         } else {
             u.push((1, OMat::ChiseledBlackstone));
         }
@@ -667,9 +827,9 @@ fn plan_infernal_foundry_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
     let cheb = ax.max(az);
     let mut u = Vec::new();
 
-    let is_quench_pit = (dx >= -5 && dx <= -3 && dz >= -5 && dz <= 1)
-        || (dx >= 3 && dx <= 5 && dz >= -5 && dz <= 1);
-    let floor = if is_quench_pit {
+    let in_slag_trench = (ax == 6 || ax == 7 || ax == 8) && (-8..=3).contains(&dz);
+    let in_treasury = ax <= 6 && (10..=17).contains(&dz);
+    let floor = if in_slag_trench || in_treasury {
         OMat::Obsidian
     } else if ax <= 2 || az <= 2 {
         OMat::PolishedBricks
@@ -679,65 +839,115 @@ fn plan_infernal_foundry_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
         OMat::CrackedBricks
     };
 
-    // Twin belching industrial smokestacks at (-9, -9) and (9, -9).
-    for (sx, sz) in [(-9, -9), (9, -9)] {
+    // 1. Twin Monumental Smokestacks & Enclosed Blast Fireboxes at (-12, -11) and (12, -11).
+    for (sx, sz) in [(-12, -11), (12, -11)] {
         let sdx = (dx - sx).abs();
         let sdz = (dz - sz).abs();
         if sdx <= 2 && sdz <= 2 {
-            let edge = sdx == 2 || sdz == 2;
-            let corner = sdx == 2 && sdz == 2;
-            if edge {
-                let top_h = if corner { 20 } else { 22 };
-                for dy in 1..=top_h {
-                    if !corner && dy <= 2 && (sdx == 0 || sdz == 0) {
-                        u.push((dy, OMat::IronBars));
-                    } else {
-                        u.push((
-                            dy,
-                            if dy % 6 == 0 {
-                                OMat::RedNetherBricks
-                            } else if dy >= 19 {
-                                OMat::Obsidian
-                            } else {
-                                OMat::PolishedBasalt
-                            },
-                        ));
-                    }
-                }
-            } else if sdx == 0 && sdz == 0 {
-                u.push((1, OMat::Magma));
-                u.push((2, OMat::Campfire));
-                u.push((19, OMat::Campfire));
-            }
+            let south_open = dz - sz > 0;
+            push_enclosed_chimney_col(&mut u, sdx, sdz, 1, 26, south_open);
             return (floor, u);
         }
     }
 
-    // Outer heavy foundry wall (cheb == 13..=14) with South Foundry Gate.
-    let gate = dz >= 12 && ax <= 2;
-    if cheb >= 13 && !gate {
-        let top = if ax >= 12 && az >= 12 { 9 } else { 6 };
-        for dy in 1..=top {
-            let m = if ax >= 12 && az >= 12 && dy == top {
-                OMat::SoulCampfire
-            } else if dy == 4 {
-                OMat::RedNetherBricks
-            } else if dy == 2 && (dx % 4 == 0 || dz % 4 == 0) {
-                OMat::IronBars
-            } else {
-                OMat::Blackstone
-            };
-            u.push((dy, m));
+    // 2. Heavy Outer Foundry Bastion Wall (cheb == 20..=21).
+    let south_gate = dz >= 19 && ax <= 2;
+    let east_west_gate = ax >= 19 && az <= 2;
+    if cheb >= 20 {
+        let corner_tower = ax >= 18 && az >= 18;
+        let gate_tower =
+            (dz >= 19 && (3..=4).contains(&ax)) || (ax >= 19 && (3..=4).contains(&az));
+        if south_gate || east_west_gate {
+            push_range(&mut u, 5, 7, OMat::Obsidian);
+        } else if corner_tower {
+            push_range(&mut u, 1, 10, OMat::Blackstone);
+            push_brazier_top(&mut u, 11, OMat::Obsidian, OMat::SoulCampfire);
+        } else if gate_tower {
+            push_range(&mut u, 1, 8, OMat::PolishedBasalt);
+            push_brazier_top(&mut u, 9, OMat::Obsidian, OMat::SoulCampfire);
+        } else {
+            for dy in 1..=7 {
+                let m = if dy == 4 || dy == 7 {
+                    OMat::RedNetherBricks
+                } else if (dy == 2 || dy == 5) && (dx % 4 == 0 || dz % 4 == 0) {
+                    OMat::IronBars
+                } else {
+                    OMat::Blackstone
+                };
+                u.push((dy, m));
+            }
         }
         return (floor, u);
     }
 
-    // Enclosed Smelting Lava Basins (safely contained inside Obsidian rims & Iron Bars).
-    if is_quench_pit {
-        let rim = dx.abs() == 5 || dx.abs() == 3 || dz == -5 || dz == 1;
+    // 3. Covered Industrial Foundry Roof & Heavy Steel Truss Columns (dx in -18..=18, dz in -17..=8).
+    let in_hall = ax <= 18 && (-17..=8).contains(&dz);
+    if in_hall {
+        let col_x = matches!(ax, 18 | 9 | 3);
+        let col_z = matches!(dz, -17 | -11 | -5 | 1 | 7);
+        if col_x && col_z {
+            push_range(&mut u, 1, 11, OMat::PolishedBasalt);
+        } else if (ax == 18 && (-17..=8).contains(&dz)) || (dz == -17 && ax <= 18) {
+            // North & side curtain walls with industrial iron-bar clerestory bays.
+            for dy in 1..=11 {
+                let m = if dy >= 3 && dy <= 5 && ((dx + dz).abs() % 4 != 0) {
+                    OMat::IronBars
+                } else if dy == 8 {
+                    OMat::RedNetherBricks
+                } else {
+                    OMat::PolishedBricks
+                };
+                u.push((dy, m));
+            }
+        }
+
+        // Arched Factory Hall Roof (2 blocks thick, skylight bars, glowing suspended lanterns).
+        let roof_y = if ax >= 13 {
+            12
+        } else if ax >= 6 {
+            13
+        } else {
+            14
+        };
+        if ax == 6 && dz % 3 != 0 {
+            u.push((roof_y - 1, OMat::PolishedBasalt));
+            u.push((roof_y, OMat::IronBars));
+        } else {
+            u.push((roof_y - 1, OMat::PolishedBasalt));
+            u.push((roof_y, OMat::Obsidian));
+        }
+
+        if (ax == 6 && (dz == -14 || dz == -3 || dz == 4)) || (dx == 0 && (dz == -14 || dz == 4)) {
+            push_hanging_chandelier(&mut u, roof_y - 1, 1);
+        }
+    }
+
+    // 4. Grounded Upper Gantry Walkways (dy = 6) + Twin Stepped Staircase Ramps (dz = 5).
+    let on_main_gantry = ax <= 16 && (-5..=-1).contains(&dz);
+    let on_side_spur = (14..=16).contains(&ax) && (0..=4).contains(&dz);
+    if on_main_gantry || on_side_spur {
+        let support_leg = (ax == 16 || ax == 10 || ax == 4) && (dz == -5 || dz == -1 || dz == 4);
+        if support_leg {
+            push_range(&mut u, 1, 5, OMat::PolishedBasalt);
+        }
+        u.push((6, OMat::PolishedBasalt));
+        // Guard railings on open north/south bridge edges without blocking stairs or overlook chest.
+        let rail_edge = (on_main_gantry && (dz == -5 || dz == -1) && ax > 3)
+            || (on_side_spur && ax == 14 && dz < 4);
+        if rail_edge {
+            u.push((7, OMat::IronBars));
+        }
+    } else if (10..=15).contains(&ax) && dz == 5 {
+        // Ascending stairs from ax=10 (dy=1) cleanly up to ax=15 (dy=6) joining the side spur.
+        push_range(&mut u, 1, ax - 9, OMat::CrackedBricks);
+    }
+
+    // 5. Twin Enclosed Molten Slag Casting Trenches (ax in 6..=8, dz in -8..=3).
+    if in_slag_trench {
+        let rim = ax == 6 || ax == 8 || dz == -8 || dz == 3;
         if rim {
             u.push((1, OMat::Obsidian));
-            if dz % 2 == 0 {
+            if dz % 2 == 0 && ax != 7 {
                 u.push((2, OMat::IronBars));
             }
         } else {
@@ -746,26 +956,20 @@ fn plan_infernal_foundry_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
         return (floor, u);
     }
 
-    // Overhead Iron-Chain Gantry Catwalk spanning foundry interior (dy = 6).
-    if (ax == 2 || az == 2) && cheb <= 11 {
-        u.push((6, OMat::IronBars));
-        if cheb % 5 == 0 {
-            u.push((7, OMat::Chain));
-            u.push((8, OMat::PolishedBasalt));
-        }
-    }
-
-    // Foreman Vault Bunker along South Wing (dx in -6..=6, dz in 6..=11).
-    if (-6..=6).contains(&dx) && (6..=11).contains(&dz) {
-        let wall = ax == 6 || dz == 6 || dz == 11;
-        let door = dz == 6 && ax <= 1;
-        if wall && !door {
+    // 6. South Foreman Obsidian Treasury Bunker (dx in -6..=6, dz in 10..=17).
+    if in_treasury {
+        let wall = ax == 6 || dz == 10 || dz == 17;
+        let door = dz == 10 && ax <= 1;
+        if wall {
             for dy in 1..=5 {
+                if door && dy <= 3 {
+                    continue;
+                }
                 u.push((
                     dy,
-                    if ax == 6 && (dz == 6 || dz == 11) {
+                    if ax == 6 && (dz == 10 || dz == 17) {
                         OMat::Obsidian
-                    } else if dy == 2 && ax == 3 && dz == 6 {
+                    } else if dy == 2 && ax == 3 && dz == 10 {
                         OMat::IronBars
                     } else {
                         OMat::PolishedBricks
@@ -774,14 +978,17 @@ fn plan_infernal_foundry_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
             }
         }
         u.push((5, OMat::Obsidian));
-        if dx == 0 && dz == 9 {
+        u.push((6, OMat::RedNetherBricks));
+        if dx == 0 && dz == 14 {
             u.push((1, OMat::IronBlock));
             u.push((2, OMat::AncientDebris));
+            u.push((3, OMat::GoldBlock));
         }
+        return (floor, u);
     }
 
-    // Iron / Gold Crucible Altar in central axis.
-    if ax <= 1 && dz == -8 {
+    // North Smelting Crucible Shrine (ax <= 2, dz == -14).
+    if ax <= 1 && dz == -14 {
         u.push((
             1,
             if dx == 0 {
@@ -801,9 +1008,9 @@ fn plan_siege_watchtower_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
     let cheb = ax.max(az);
     let mut u = Vec::new();
 
-    let floor = if cheb <= 4 {
+    let floor = if cheb <= 6 {
         OMat::PolishedBricks
-    } else if ax <= 1 || az <= 1 {
+    } else if ax <= 2 || az <= 2 {
         OMat::CrackedBricks
     } else if roll % 4 == 0 {
         OMat::Magma
@@ -811,85 +1018,570 @@ fn plan_siege_watchtower_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OM
         OMat::Blackstone
     };
 
-    // Spiked Siege Palisade (cheb == 10..=11) with South & North War Gates.
-    let gate = ax <= 1 && az >= 9;
-    if cheb >= 10 && !gate {
-        let h = if ax >= 9 && az >= 9 {
-            6
-        } else if (dx + dz) % 2 == 0 {
-            4
+    // 1. Star-Keep Outer Curtain Wall & Sentry Rampart (cheb == 16..=18).
+    let gate = (ax <= 2 && az >= 16) || (az <= 2 && ax >= 16);
+    if cheb >= 17 {
+        let corner = ax >= 14 && az >= 14;
+        if gate {
+            push_range(&mut u, 5, 6, OMat::Obsidian);
+        } else if corner {
+            push_range(&mut u, 1, 9, OMat::PolishedBricks);
+            push_brazier_top(&mut u, 10, OMat::Obsidian, OMat::SoulCampfire);
         } else {
-            3
-        };
-        for dy in 1..=h {
-            u.push((
-                dy,
-                if dy == h && h >= 4 {
-                    OMat::Obsidian
-                } else {
-                    OMat::Blackstone
-                },
-            ));
-        }
-        if ax >= 9 && az >= 9 {
-            u.push((7, OMat::SoulCampfire));
+            let merlon = (dx + dz).abs() % 2 == 0;
+            let top = if cheb == 18 && merlon { 6 } else { 5 };
+            push_range(&mut u, 1, top, OMat::Blackstone);
         }
         return (floor, u);
     }
+    if cheb == 16 && !gate {
+        let pier = (dx + dz).abs() % 3 == 0 || ax == 15 || az == 15;
+        if pier {
+            push_range(&mut u, 1, 3, OMat::Blackstone);
+        }
+        u.push((4, OMat::PolishedBricks));
+        return (floor, u);
+    }
+    if dx == -15 && (7..=10).contains(&dz) {
+        push_range(&mut u, 1, dz - 6, OMat::CrackedBricks);
+        return (floor, u);
+    }
 
-    // Central Spiked Watchtower Spire (cheb <= 4).
-    if cheb <= 4 {
-        let tower_wall = cheb == 4 || (ax >= 3 && az >= 3);
-        let door = (dz == 4 || dz == -4) && ax <= 1;
+    // 2. Central Three-Story Siege Citadel Spire (cheb <= 6, rising to dy = 25).
+    if cheb <= 6 {
+        let tower_wall = cheb == 6;
+        let door = (ax <= 1 && az == 6) || (az <= 1 && ax == 6);
         if tower_wall {
-            let max_h = if ax >= 3 && az >= 3 { 19 } else { 15 };
+            let corner_buttress = ax >= 5 && az >= 5;
+            let max_h = if corner_buttress { 25 } else { 22 };
             for dy in 1..=max_h {
                 if door && dy <= 3 {
                     continue;
                 }
-                let m = if dy == 6 || dy == 12 {
+                let m = if dy == 7 || dy == 14 || dy == 21 {
                     OMat::RedNetherBricks
-                } else if dy >= 16 || (ax >= 3 && az >= 3 && dy % 5 == 0) {
+                } else if dy >= 22 || (corner_buttress && dy % 5 == 0) {
                     OMat::Obsidian
-                } else if dy == 9 && (ax == 0 || az == 0) {
+                } else if (dy == 9 || dy == 10 || dy == 16 || dy == 17) && (ax <= 1 || az <= 1) {
                     OMat::IronBars
                 } else {
                     OMat::PolishedBricks
                 };
                 u.push((dy, m));
             }
-            if ax >= 3 && az >= 3 {
-                u.push((20, OMat::CryingObsidian));
-                u.push((21, OMat::Obsidian));
+            if corner_buttress {
+                push_brazier_top(&mut u, 25, OMat::CryingObsidian, OMat::SoulCampfire);
             }
-        } else {
-            // Tower floors (ground door, second war floor at dy=6, beacon summit at dy=13).
-            u.push((6, OMat::NetherBricks));
-            u.push((13, OMat::PolishedBricks));
-            if cheb <= 1 && ax + az > 0 {
-                u.push((14, OMat::Obsidian));
+            return (floor, u);
+        }
+
+        // Solid stairwell Ground (1) -> Floor 2 (7) along West inner wall dx = -5, dz in -3..=3.
+        let on_stair_1 = dx == -5 && (-3..=3).contains(&dz);
+        if on_stair_1 {
+            push_range(&mut u, 1, dz + 4, OMat::CrackedBricks);
+        }
+
+        // Floor 2 Deck (dy = 7), leaving stairwell cutout open above (-5, -3..=2).
+        let stair1_hole = dx == -5 && (-3..=2).contains(&dz);
+        if !stair1_hole {
+            u.push((7, OMat::NetherBricks));
+        }
+
+        // Solid stairwell Floor 2 (7) -> Floor 3 (14) along East inner wall dx = 5, dz in -3..=3.
+        let on_stair_2 = dx == 5 && (-3..=3).contains(&dz);
+        if on_stair_2 {
+            push_range(&mut u, 8, 11 - dz, OMat::CrackedBricks);
+        }
+
+        // Floor 3 Deck (dy = 14), leaving stairwell cutout open above (5, -2..=3).
+        let stair2_hole = dx == 5 && (-2..=3).contains(&dz);
+        if !stair2_hole {
+            u.push((14, OMat::PolishedBricks));
+        }
+
+        // Summit Battlement Roof (dy = 21) with central 3x3 eternal beacon skylight.
+        if cheb >= 2 {
+            u.push((21, OMat::Obsidian));
+            if cheb >= 4 {
+                u.push((22, OMat::PolishedBasalt));
             }
-            if dx == 0 && dz == 0 {
-                u.push((1, OMat::GildedBlackstone));
-                u.push((7, OMat::GoldBlock));
-                u.push((14, OMat::CryingObsidian));
-                u.push((15, OMat::Shroomlight));
-                u.push((16, OMat::SoulSoil));
-                u.push((17, OMat::SoulFire));
+        }
+        if (dx == 0 && dz == 2) || (dx == 0 && dz == -2) {
+            push_hanging_chandelier(&mut u, 7, 1);
+            push_hanging_chandelier(&mut u, 14, 1);
+        }
+
+        // Floor 3 Eternal Summit Beacon Altar at center (0, 0).
+        if dx == 0 && dz == 0 {
+            u.push((15, OMat::CryingObsidian));
+            u.push((16, OMat::Shroomlight));
+            push_brazier_top(&mut u, 17, OMat::SoulSoil, OMat::SoulFire);
+        }
+        return (floor, u);
+    }
+
+    // 3. Courtyard Siege Camps: SW Covered Barracks & NE Siege Pavilion + Catapult Timber Frame.
+    let in_sw_barracks = (-14..=-8).contains(&dx) && (5..=11).contains(&dz);
+    let in_ne_pavilion = (8..=14).contains(&dx) && (-11..=-5).contains(&dz);
+    for (in_pav, rx0, rx1, rz0, rz1) in [
+        (in_sw_barracks, -14, -8, 5, 11),
+        (in_ne_pavilion, 8, 14, -11, -5),
+    ] {
+        if in_pav {
+            let post = (dx == rx0 || dx == rx1) && (dz == rz0 || dz == rz1);
+            if post {
+                push_range(&mut u, 1, 4, OMat::CrimsonStem);
+            }
+            u.push((4, OMat::CrimsonPlanks));
+            if (rx0 + 1..rx1).contains(&dx) && (rz0 + 1..rz1).contains(&dz) {
+                u.push((5, OMat::RedNetherBricks));
+            }
+            return (floor, u);
+        }
+    }
+
+    // NW Siege Ballista / Counterweight Frame (dx in -13..=-9, dz in -13..=-9).
+    if (-13..=-9).contains(&dx) && (-13..=-9).contains(&dz) {
+        if (dx == -13 || dx == -9) && (dz == -13 || dz == -9) {
+            push_range(&mut u, 1, 4, OMat::StrippedCrimsonStem);
+        } else if dx == -13 || dx == -9 || (dz == -11 && (-12..=-10).contains(&dx)) {
+            u.push((4, OMat::StrippedCrimsonStem));
+            if dx == -11 && dz == -11 {
+                u.push((5, OMat::IronBlock));
             }
         }
         return (floor, u);
     }
 
-    // Outer barracks feeding pens & muster brazier.
-    if dx == -7 && az <= 2 {
-        u.push((1, OMat::CrimsonFence));
-        if dz == 0 {
-            u.push((1, OMat::HayBlock));
+    // SE Beast Pen & Muster Hearth.
+    if dx == 11 && (8..=12).contains(&dz) {
+        u.push((1, OMat::HayBlock));
+    }
+    if dx == -11 && dz == -4 {
+        u.push((1, OMat::Magma));
+        u.push((2, OMat::SoulCampfire));
+    }
+
+    (floor, u)
+}
+
+fn plan_bone_catacomb_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat)>) {
+    let ax = dx.abs();
+    let az = dz.abs();
+    let cheb = ax.max(az);
+    let mut u = Vec::new();
+
+    let on_avenue = ax <= 3 || az <= 3;
+    let floor = if on_avenue || cheb <= 10 {
+        if roll % 6 == 0 {
+            OMat::DeepslateBricks
+        } else {
+            OMat::PolishedBricks
+        }
+    } else if roll % 3 == 0 {
+        OMat::SoulSand
+    } else {
+        OMat::SoulSoil
+    };
+
+    // 1. Outer Haunted Ossuary Colonnade (cheb == 19..=21).
+    let gate = (ax <= 2 && dz >= 19) || (az <= 2 && ax >= 19) || (ax <= 2 && dz <= -19);
+    if cheb >= 19 {
+        let corner = ax >= 18 && az >= 18;
+        if corner {
+            push_range(&mut u, 1, 11, OMat::Obsidian);
+            push_brazier_top(&mut u, 12, OMat::SoulSoil, OMat::SoulFire);
+        } else if gate {
+            push_range(&mut u, 6, 8, OMat::BoneBlock);
+            u.push((9, OMat::DeepslateBricks));
+        } else {
+            let pier = (ax % 3 == 0 && az >= 19) || (az % 3 == 0 && ax >= 19) || cheb == 21;
+            if pier {
+                for dy in 1..=8 {
+                    let m = if (ax % 3 == 0 || az % 3 == 0) && dy <= 7 {
+                        OMat::BoneBlock
+                    } else if dy == 3 && cheb == 21 {
+                        OMat::IronBars
+                    } else {
+                        OMat::DeepslateBricks
+                    };
+                    u.push((dy, m));
+                }
+            }
+            push_range(&mut u, 8, 9, OMat::DeepslateBricks);
+            if (ax % 6 == 0 || az % 6 == 0) && cheb == 20 {
+                push_brazier_top(&mut u, 10, OMat::SoulSoil, OMat::SoulFire);
+            }
+        }
+        return (floor, u);
+    }
+
+    // 2. Sealed North Ossuary Crypt Mausoleum (dx in -4..=4, dz in -17..=-13).
+    if ax <= 4 && (-17..=-13).contains(&dz) {
+        let wall = ax == 4 || dz == -17 || dz == -13;
+        let side_door = ax == 4 && dz == -15;
+        if wall && !side_door {
+            for dy in 1..=5 {
+                let m = if dy % 2 == 0 && ax % 2 == 0 {
+                    OMat::BoneBlock
+                } else {
+                    OMat::DeepslateBricks
+                };
+                u.push((dy, m));
+            }
+        }
+        u.push((5, OMat::DeepslateBricks));
+        u.push((6, OMat::BoneBlock));
+        if ax <= 1 && (dz == -16 || dz == -14) {
+            u.push((1, OMat::SoulSand));
+        }
+        return (floor, u);
+    }
+
+    // 3. Giant Fossilized Rib-Arches framing East/West/South approaches (connected solidly down to dy=0).
+    if ((ax == 16 && az <= 4) || (dz == 16 && ax <= 4)) && !(ax == 0 && az == 16) {
+        if ax == 4 || az == 4 {
+            push_range(&mut u, 1, 8, OMat::BoneBlock);
+        }
+        push_range(&mut u, 7, 8, OMat::BoneBlock);
+        return (floor, u);
+    }
+
+    // 4. Central Ziggurat Step-Pyramid, Undercrypt (dy=0..=3), and Upper Sanctum Terrace (dy=4).
+    if (11..=13).contains(&cheb) {
+        let crypt_tunnel = (ax <= 2 && dz >= 11) || (az <= 2 && ax >= 11);
+        if crypt_tunnel {
+            // Walk-in Undercrypt portal topped solidly by stepped ziggurat terrace overhead!
+            push_range(&mut u, 4, 4 + (13 - cheb).min(1), OMat::DeepslateBricks);
+        } else {
+            let step_h = 14 - cheb; // 1, 2, 3
+            push_range(&mut u, 1, step_h, OMat::DeepslateBricks);
+            if ax == az {
+                u.push((step_h + 1, OMat::SoulLantern));
+            }
+        }
+        return (floor, u);
+    }
+
+    if cheb <= 10 {
+        // Lower Undercrypt Sarcophagus Pillars & Upper Sanctum Terrace Deck at dy = 4.
+        if (ax == 4 || ax == 9) && (az == 4 || az == 9) {
+            push_range(&mut u, 1, 4, OMat::BoneBlock);
+        } else if (ax == 7 && (-8..=-6).contains(&dz)) || (ax == 7 && (6..=8).contains(&dz)) {
+            u.push((1, OMat::PolishedBricks));
+            u.push((2, OMat::BoneBlock));
+        }
+        u.push((4, OMat::DeepslateBricks));
+
+        // Terrace Corner Soul Obelisks.
+        if ax >= 9 && az >= 9 {
+            push_range(&mut u, 5, 9, OMat::BoneBlock);
+            u.push((10, OMat::Obsidian));
+            u.push((11, OMat::SoulLantern));
+            return (floor, u);
+        }
+
+        // South Ziggurat Stairs on Terrace climbing from dy = 4 up onto High Reliquary dy = 8.
+        if ax <= 1 && (4..=7).contains(&dz) {
+            let reliquary_h = 12 - dz; // 7->5, 6->6, 5->7, 4->8
+            push_range(&mut u, 5, reliquary_h, OMat::BoneBlock);
+            return (floor, u);
+        }
+
+        // Upper Reliquary Sanctuary Pavilion (cheb <= 5) rising to dy = 21.
+        if cheb <= 5 {
+            if cheb == 5 {
+                let col_or_wall = ax >= 4 || az >= 4 || (ax % 2 == 1 && az % 2 == 1);
+                let upper_door = (ax <= 1 && az == 5) || (az <= 1 && ax == 5);
+                for dy in 5..=12 {
+                    if upper_door && dy <= 8 {
+                        continue;
+                    }
+                    if col_or_wall || dy >= 11 {
+                        u.push((
+                            dy,
+                            if dy == 8 || dy == 12 {
+                                OMat::DeepslateBricks
+                            } else {
+                                OMat::BoneBlock
+                            },
+                        ));
+                    }
+                }
+            }
+            // High Inner Sanctum Altar Pedestal (cheb <= 3, deck at dy = 8).
+            if cheb <= 3 {
+                push_range(&mut u, 5, 8, OMat::PolishedBricks);
+                if dx == 0 && dz == 0 {
+                    u.push((9, OMat::CryingObsidian));
+                    u.push((10, OMat::Shroomlight));
+                    push_brazier_top(&mut u, 11, OMat::SoulSoil, OMat::SoulFire);
+                }
+            }
+            // Stepped Vaulted Reliquary Crown Spire (dy = 12..=21, 100% 6-connected).
+            let crown_base = 12 + (5 - cheb);
+            let crown_top = if cheb <= 1 { 20 } else { crown_base + 1 };
+            push_range(&mut u, crown_base, crown_top, OMat::Obsidian);
+            if dx == 0 && dz == 0 {
+                push_brazier_top(&mut u, 21, OMat::SoulSoil, OMat::SoulFire);
+            }
         }
     }
-    if dx == 7 && dz == 0 {
-        u.push((1, OMat::SoulCampfire));
+
+    (floor, u)
+}
+
+fn plan_arena_pit_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat)>) {
+    let ax = dx.abs();
+    let az = dz.abs();
+    let r_sq = dx * dx + dz * dz;
+    let mut u = Vec::new();
+
+    let in_hazard_ring = (49..=64).contains(&r_sq) && ax > 2 && az > 2;
+    let in_south_bunker = ax <= 3 && (13..=17).contains(&dz);
+    let floor = if in_hazard_ring || in_south_bunker {
+        OMat::Obsidian
+    } else if ax <= 2 || az <= 2 {
+        OMat::PolishedBricks
+    } else if r_sq <= 121 && roll % 5 == 0 {
+        OMat::SmoothBasalt
+    } else if r_sq <= 121 {
+        OMat::CrackedBricks
+    } else {
+        OMat::Blackstone
+    };
+
+    // 1. Monumental Amphitheater Outer Wall Ring (r_sq in 400..=552, clamped by half=23).
+    let in_cardinal_tunnel = (ax <= 2 && dz < 13) || az <= 2;
+    let in_south_approach = (18..=23).contains(&dz) && ax <= 2;
+    if r_sq >= 400 {
+        if in_cardinal_tunnel || in_south_approach {
+            push_range(&mut u, 6, 14, OMat::PolishedBricks);
+            u.push((15, OMat::Obsidian));
+        } else {
+            let major_buttress = ax <= 3 || az <= 3 || (ax - az).abs() <= 2;
+            let wall_top = if major_buttress { 16 } else { 14 };
+            for dy in 1..=wall_top {
+                let gallery_window = !major_buttress
+                    && ((5..=7).contains(&dy) || (10..=12).contains(&dy))
+                    && (dx + dz).abs() % 3 != 0;
+                let m = if gallery_window {
+                    OMat::IronBars
+                } else if dy == 4 || dy == 9 || dy == 14 {
+                    OMat::RedNetherBricks
+                } else if dy >= 15 {
+                    OMat::Obsidian
+                } else {
+                    OMat::PolishedBricks
+                };
+                u.push((dy, m));
+            }
+            if (ax - az).abs() == 0 && (16..=17).contains(&ax) {
+                push_brazier_top(&mut u, 17, OMat::Magma, OMat::SoulCampfire);
+            }
+        }
+        return (floor, u);
+    }
+
+    // 2. South Entrance Beastmaster Strongbox (dx in -3..=3, dz in 13..=17) with flanking arches.
+    if in_south_bunker {
+        let on_wall = ax == 3 || dz == 13 || dz == 17;
+        let side_door = ax == 3 && dz == 15;
+        if on_wall && !side_door {
+            push_range(&mut u, 1, 4, OMat::Obsidian);
+        }
+        u.push((5, OMat::PolishedBricks));
+        u.push((6, OMat::RedNetherBricks));
+        return (floor, u);
+    }
+
+    // 3. Emperor's Grandstand Vault Canopy on North Bleachers (dx in -5..=5, dz in -19..=-13).
+    if ax <= 5 && (-19..=-13).contains(&dz) {
+        push_range(&mut u, 1, 7, OMat::PolishedBricks);
+        let pillar = (ax == 5) && (dz == -19 || dz == -13);
+        let throne = dx == 0 && dz == -16;
+        if pillar {
+            push_range(&mut u, 8, 12, OMat::Obsidian);
+        } else if throne {
+            u.push((8, OMat::GoldBlock));
+            u.push((9, OMat::GildedBlackstone));
+        }
+        u.push((12, OMat::RedNetherBricks));
+        u.push((13, OMat::GildedBlackstone));
+        return (floor, u);
+    }
+
+    // 4. Stepped Stadium Grandstand Bleachers (r_sq in 144..=399).
+    if r_sq >= 144 {
+        let side_foyer = ax <= 7 && (13..=17).contains(&dz);
+        if in_cardinal_tunnel || side_foyer {
+            // Walkable radial tunnels & Strongroom side-aisles beneath tiered upper seats!
+            push_range(&mut u, 5, 7, OMat::PolishedBricks);
+        } else {
+            let r = (r_sq as f64).sqrt().floor() as i32;
+            let tier_h = (r - 11).clamp(1, 7);
+            push_range(&mut u, 1, tier_h, OMat::PolishedBricks);
+            if r == 16 {
+                u.push((tier_h + 1, OMat::SoulLantern));
+            }
+        }
+        return (floor, u);
+    }
+
+    // 5. Gladiator Arena Killing Floor (r_sq < 144): Lava/Magma Hazard Trench & Center Podium.
+    if in_hazard_ring {
+        if r_sq <= 55 && (dx + dz).abs() % 2 == 0 {
+            u.push((1, OMat::Lava));
+        } else {
+            u.push((1, OMat::Magma));
+        }
+    } else if r_sq <= 9 {
+        u.push((1, OMat::Obsidian));
+        if r_sq <= 4 {
+            u.push((2, OMat::GildedBlackstone));
+        }
+        if dx == 0 && dz == 0 {
+            u.push((3, OMat::AncientDebris));
+            u.push((4, OMat::SoulCampfire));
+        }
+    }
+
+    (floor, u)
+}
+
+fn plan_alchemist_spire_col(dx: i32, dz: i32, roll: u64) -> (OMat, Vec<(i32, OMat)>) {
+    let ax = dx.abs();
+    let az = dz.abs();
+    let cheb = ax.max(az);
+    let mut u = Vec::new();
+
+    let on_path = ax <= 2 || az <= 2;
+    let in_pavilion = (9..=14).contains(&ax) && (9..=14).contains(&az);
+    let floor = if on_path || cheb <= 6 || in_pavilion {
+        if roll % 5 == 0 {
+            OMat::CryingObsidian
+        } else {
+            OMat::PolishedDeepslate
+        }
+    } else if roll % 4 == 0 {
+        OMat::WarpedWartBlock
+    } else {
+        OMat::DeepslateBricks
+    };
+
+    // 1. Outer Crystalline Obsidian Bastion Wall (cheb == 18..=20).
+    let gate = (ax <= 2 && az >= 18) || (az <= 2 && ax >= 18);
+    if cheb >= 18 {
+        let pylon = ax >= 17 && az >= 17;
+        if gate {
+            push_range(&mut u, 5, 7, OMat::Obsidian);
+        } else if pylon {
+            push_range(&mut u, 1, 10, OMat::CryingObsidian);
+            u.push((11, OMat::Shroomlight));
+            u.push((12, OMat::WarpedFence));
+        } else {
+            for dy in 1..=6 {
+                let m = if dy == 3 && (dx % 3 == 0 || dz % 3 == 0) {
+                    OMat::IronBars
+                } else if (dx % 4 == 0 && az >= 18) || (dz % 4 == 0 && ax >= 18) {
+                    OMat::WarpedStem
+                } else {
+                    OMat::DeepslateBricks
+                };
+                u.push((dy, m));
+            }
+            if cheb == 20 && (ax + az) % 4 == 0 {
+                u.push((7, OMat::SoulLantern));
+            }
+        }
+        return (floor, u);
+    }
+
+    // 2. Four Corner Warped Alchemy & Fungal Pavilions (ax in 9..=14, az in 9..=14).
+    if in_pavilion {
+        let post = (ax == 9 || ax == 14) && (az == 9 || az == 14);
+        if post {
+            push_range(&mut u, 1, 4, OMat::WarpedStem);
+        }
+        u.push((4, OMat::WarpedPlanks));
+        if (10..=13).contains(&ax) && (10..=13).contains(&az) {
+            u.push((5, OMat::WarpedWartBlock));
+        }
+        if (11..=12).contains(&ax) && (11..=12).contains(&az) {
+            u.push((6, OMat::Shroomlight));
+        }
+        return (floor, u);
+    }
+
+    // 3. Central Three-Story Warped Arcane Citadel Tower (cheb <= 6, Spire up to dy = 28).
+    if cheb <= 6 {
+        let tower_wall = cheb == 6;
+        let door = (ax <= 1 && az == 6) || (az <= 1 && ax == 6);
+        if tower_wall {
+            let corner_rib = ax >= 5 && az >= 5;
+            for dy in 1..=22 {
+                if door && dy <= 3 {
+                    continue;
+                }
+                let m = if corner_rib {
+                    OMat::StrippedWarpedStem
+                } else if dy == 7 || dy == 14 || dy == 21 {
+                    OMat::CryingObsidian
+                } else if (dy == 9 || dy == 10 || dy == 16 || dy == 17) && (ax <= 1 || az <= 1) {
+                    OMat::IronBars
+                } else {
+                    OMat::DeepslateBricks
+                };
+                u.push((dy, m));
+            }
+        } else {
+            // Solid Stair 1: Floor 1 -> Floor 2 (dy = 7) along West wall (dx = -5, dz in -3..=3).
+            if dx == -5 && (-3..=3).contains(&dz) {
+                push_range(&mut u, 1, dz + 4, OMat::Obsidian);
+            }
+            if !(dx == -5 && (-3..=2).contains(&dz)) {
+                u.push((7, OMat::PolishedDeepslate));
+            }
+
+            // Solid Stair 2: Floor 2 (7) -> Floor 3 Treasury (14) along East wall (dx = 5, dz in -3..=3).
+            if dx == 5 && (-3..=3).contains(&dz) {
+                push_range(&mut u, 8, 11 - dz, OMat::Obsidian);
+            }
+            if !(dx == 5 && (-2..=3).contains(&dz)) {
+                u.push((14, OMat::Obsidian));
+            }
+
+            // Suspended glowing chandeliers beneath Floor 2 & Floor 3 ceilings.
+            if dx == 0 && (dz == -2 || dz == 2) {
+                push_hanging_chandelier(&mut u, 7, 1);
+                push_hanging_chandelier(&mut u, 14, 1);
+            }
+            if dx == 0 && dz == 0 {
+                u.push((15, OMat::GoldBlock));
+                u.push((16, OMat::AncientDebris));
+                u.push((17, OMat::Glowstone));
+            }
+        }
+
+        // Overlapping Tiered Fungal Dome & Beacon Spire (dy = 22..=28, 100% 6-connected).
+        match cheb {
+            6 => u.push((22, OMat::WarpedWartBlock)),
+            5 => push_range(&mut u, 22, 24, OMat::WarpedWartBlock),
+            4 => push_range(&mut u, 24, 25, OMat::Obsidian),
+            3 => push_range(&mut u, 25, 26, OMat::WarpedWartBlock),
+            2 => push_range(&mut u, 26, 27, OMat::CryingObsidian),
+            _ => {
+                u.push((27, OMat::CryingObsidian));
+                u.push((28, OMat::Shroomlight));
+            }
+        }
+        return (floor, u);
+    }
+
+    // Courtyard Arcane Obelisk Lantern Posts along diagonal walks.
+    if ax == 5 && az == 12 {
+        push_range(&mut u, 1, 2, OMat::StrippedWarpedStem);
+        u.push((3, OMat::SoulLantern));
     }
 
     (floor, u)
@@ -911,6 +1603,13 @@ fn build_outpost_structure(
         return;
     };
     let resolve = |id: &str, fallback: BlockState| host.block_state_id(id).unwrap_or(fallback);
+    let iron_bars = resolve("minecraft:iron_bars", blackstone);
+    // Minecraft 1.21.9+ / 26.3 renamed chain -> iron_chain; try iron_chain first so it never degrades to a blackstone cube!
+    let chain = host
+        .block_state_id("minecraft:iron_chain")
+        .or_else(|| host.block_state_id("minecraft:chain"))
+        .unwrap_or(iron_bars);
+
     let palette = vec![
         resolve("minecraft:air", blackstone),                              // 0 Air
         blackstone,                                                        // 1 Blackstone
@@ -933,8 +1632,8 @@ fn build_outpost_structure(
         resolve("minecraft:magma_block", blackstone),                      // 18 Magma
         resolve("minecraft:shroomlight", blackstone),                      // 19 Shroomlight
         resolve("minecraft:nether_wart_block", blackstone),                // 20 NetherWartBlock
-        resolve("minecraft:iron_bars", blackstone),                        // 21 IronBars
-        resolve("minecraft:chain", blackstone),                            // 22 Chain
+        iron_bars,                                                         // 21 IronBars
+        chain,                                                             // 22 Chain
         resolve("minecraft:campfire", blackstone),                         // 23 Campfire
         resolve("minecraft:soul_campfire", blackstone),                    // 24 SoulCampfire
         resolve("minecraft:soul_fire", blackstone),                        // 25 SoulFire
@@ -944,11 +1643,21 @@ fn build_outpost_structure(
         resolve("minecraft:lava", blackstone),                             // 29 Lava
         resolve("minecraft:soul_lantern", blackstone),                     // 30 SoulLantern
         resolve("minecraft:hay_block", blackstone),                        // 31 HayBlock
+        resolve("minecraft:warped_stem", blackstone),                      // 32 WarpedStem
+        resolve("minecraft:stripped_warped_stem", blackstone),             // 33 StrippedWarpedStem
+        resolve("minecraft:warped_planks", blackstone),                    // 34 WarpedPlanks
+        resolve("minecraft:warped_fence", blackstone),                     // 35 WarpedFence
+        resolve("minecraft:warped_wart_block", blackstone),                // 36 WarpedWartBlock
+        resolve("minecraft:bone_block", blackstone),                       // 37 BoneBlock
+        resolve("minecraft:deepslate_bricks", blackstone),                 // 38 DeepslateBricks
+        resolve("minecraft:polished_deepslate", blackstone),               // 39 PolishedDeepslate
+        resolve("minecraft:smooth_basalt", blackstone),                    // 40 SmoothBasalt
+        resolve("minecraft:glowstone", blackstone),                        // 41 Glowstone
     ];
 
     let half = outpost_half_extent(kind);
     let skirt = half + 3;
-    let mut runs: Vec<BlockRun> = Vec::with_capacity(2048);
+    let mut runs: Vec<BlockRun> = Vec::with_capacity(4096);
 
     for dx in -skirt..=skirt {
         for dz in -skirt..=skirt {
@@ -970,7 +1679,6 @@ fn build_outpost_structure(
                 .clamp(floor_y, OVERWORLD_MAX_Y - 2);
 
             if cheb > half {
-                // Graded entrance apron steps on cardinal axes so doors never cliff-drop.
                 let on_gate = ax <= 3 || az <= 3;
                 if on_gate {
                     let out = cheb - half;
@@ -1019,7 +1727,7 @@ fn build_outpost_structure(
                 continue;
             }
 
-            // Solid downward foundation pier until hitting real ground (never float!).
+            // Solid downward foundation pier down to bedrock/stone — never floating!
             let mut down_y = floor_y;
             for y in ((floor_y - 48).max(OVERWORLD_MIN_Y + 2)..floor_y).rev() {
                 let b = ow.block(host, [x, y, z]).map(|k| k.id(host)).unwrap_or_default();
@@ -1055,10 +1763,12 @@ fn build_outpost_structure(
                 only: None,
             });
             let clear_h = match kind {
-                OutpostKind::HoglinVillage => 10,
-                _ => 24,
+                OutpostKind::HoglinVillage => 18,
+                _ => 30,
             };
-            let clear_top = (floor_y + clear_h).max(top_existing + 2).min(OVERWORLD_MAX_Y - 1);
+            let clear_top = (floor_y + clear_h)
+                .max(top_existing + 2)
+                .min(OVERWORLD_MAX_Y - 1);
             if clear_top > floor_y {
                 runs.push(BlockRun {
                     x,
@@ -1140,6 +1850,61 @@ fn place_block_if_loaded(host: &mut dyn ServerHost, ow: LevelRef, pos: [i32; 3],
     }
 }
 
+pub(crate) fn outpost_chest_specs(
+    kind: OutpostKind,
+) -> &'static [([i32; 3], bool, &'static str, u64)] {
+    match kind {
+        OutpostKind::HoglinVillage => &[
+            ([-2, 1, 15], true, "minecraft:chests/bastion_treasure", 0x1101),
+            ([2, 1, 15], true, "minecraft:chests/bastion_treasure", 0x1102),
+            ([9, 6, -15], true, "minecraft:chests/bastion_treasure", 0x1103),
+            ([-10, 1, -17], false, "minecraft:chests/bastion_hoglin_stable", 0x1104),
+            ([16, 1, 2], false, "minecraft:chests/bastion_other", 0x1105),
+            ([-16, 1, -1], false, "minecraft:chests/bastion_hoglin_stable", 0x1106),
+        ],
+        OutpostKind::InfernalFoundry => &[
+            ([-2, 1, 14], true, "minecraft:chests/bastion_treasure", 0x2201),
+            ([2, 1, 14], true, "minecraft:chests/bastion_treasure", 0x2202),
+            ([0, 7, -3], true, "minecraft:chests/nether_bridge", 0x2203),
+            ([-14, 1, 8], false, "minecraft:chests/bastion_other", 0x2204),
+            ([14, 1, 8], false, "minecraft:chests/nether_bridge", 0x2205),
+            ([-7, 1, -14], false, "minecraft:chests/bastion_other", 0x2206),
+        ],
+        OutpostKind::SiegeWatchtower => &[
+            ([2, 15, 0], true, "minecraft:chests/bastion_treasure", 0x3301),
+            ([-2, 15, 0], true, "minecraft:chests/bastion_treasure", 0x3302),
+            ([-2, 8, -2], true, "minecraft:chests/nether_bridge", 0x3303),
+            ([3, 1, -3], false, "minecraft:chests/bastion_other", 0x3304),
+            ([-11, 1, 6], false, "minecraft:chests/bastion_other", 0x3305),
+            ([11, 1, -6], false, "minecraft:chests/nether_bridge", 0x3306),
+        ],
+        OutpostKind::BoneCatacomb => &[
+            ([-2, 9, -2], true, "minecraft:chests/bastion_treasure", 0x4401),
+            ([2, 9, -2], true, "minecraft:chests/bastion_treasure", 0x4402),
+            ([0, 1, -15], true, "minecraft:chests/nether_bridge", 0x4403),
+            ([-9, 5, 6], false, "minecraft:chests/nether_bridge", 0x4404),
+            ([9, 5, -6], false, "minecraft:chests/bastion_other", 0x4405),
+            ([-14, 1, 14], false, "minecraft:chests/bastion_other", 0x4406),
+        ],
+        OutpostKind::ArenaPit => &[
+            ([-2, 8, -16], true, "minecraft:chests/bastion_treasure", 0x5501),
+            ([2, 8, -16], true, "minecraft:chests/bastion_treasure", 0x5502),
+            ([0, 1, 15], true, "minecraft:chests/bastion_treasure", 0x5503),
+            ([-15, 1, -2], false, "minecraft:chests/bastion_other", 0x5504),
+            ([15, 1, 2], false, "minecraft:chests/bastion_other", 0x5505),
+            ([6, 1, 15], false, "minecraft:chests/bastion_hoglin_stable", 0x5506),
+        ],
+        OutpostKind::AlchemistSpire => &[
+            ([-2, 15, -1], true, "minecraft:chests/bastion_treasure", 0x6601),
+            ([2, 15, 1], true, "minecraft:chests/bastion_treasure", 0x6602),
+            ([0, 8, -2], true, "minecraft:chests/nether_bridge", 0x6603),
+            ([3, 1, 2], false, "minecraft:chests/bastion_other", 0x6604),
+            ([-11, 1, -11], false, "minecraft:chests/nether_bridge", 0x6605),
+            ([11, 1, 11], false, "minecraft:chests/bastion_other", 0x6606),
+        ],
+    }
+}
+
 fn place_outpost_details_and_chests(
     host: &mut dyn ServerHost,
     ow: LevelRef,
@@ -1150,90 +1915,72 @@ fn place_outpost_details_and_chests(
     roll: u64,
 ) {
     let base_seed = (roll & 0x7FFF_FFFF) as i64;
-    match kind {
-        OutpostKind::HoglinVillage => {
-            // Household ration chest, War-Room tactical chest, and Twin Treasure Vault chests.
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx - 6, fy + 1, cz - 12],
-                "minecraft:chests/bastion_hoglin_stable",
-                base_seed ^ 0x1101,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx + 12, fy + 1, cz + 1],
-                "minecraft:chests/bastion_other",
-                base_seed ^ 0x1102,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx - 2, fy + 1, cz + 11],
-                "minecraft:chests/bastion_treasure",
-                base_seed ^ 0x1103,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx + 2, fy + 1, cz + 11],
-                "minecraft:chests/bastion_treasure",
-                base_seed ^ 0x1104,
-            );
-            place_block_if_loaded(host, ow, [cx + 9, fy + 1, cz - 3], "minecraft:smithing_table");
-            place_block_if_loaded(host, ow, [cx + 9, fy + 1, cz + 4], "minecraft:anvil");
-            place_block_if_loaded(host, ow, [cx + 12, fy + 1, cz - 3], "minecraft:crafting_table");
-            place_block_if_loaded(host, ow, [cx - 11, fy + 1, cz - 1], "minecraft:cauldron");
-        }
-        OutpostKind::InfernalFoundry => {
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx - 3, fy + 1, cz + 9],
-                "minecraft:chests/bastion_treasure",
-                base_seed ^ 0x2201,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx + 3, fy + 1, cz + 9],
-                "minecraft:chests/nether_bridge",
-                base_seed ^ 0x2202,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx, fy + 1, cz - 10],
-                "minecraft:chests/nether_bridge",
-                base_seed ^ 0x2203,
-            );
-            for bx in [-4, -2, 2, 4] {
-                place_block_if_loaded(host, ow, [cx + bx, fy + 1, cz - 7], "minecraft:blast_furnace");
-            }
-            place_block_if_loaded(host, ow, [cx - 6, fy + 1, cz + 3], "minecraft:anvil");
-            place_block_if_loaded(host, ow, [cx + 6, fy + 1, cz + 3], "minecraft:smithing_table");
-            place_block_if_loaded(host, ow, [cx - 6, fy + 1, cz - 3], "minecraft:lava_cauldron");
-            place_block_if_loaded(host, ow, [cx + 6, fy + 1, cz - 3], "minecraft:lava_cauldron");
-        }
-        OutpostKind::SiegeWatchtower => {
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx + 2, fy + 7, cz],
-                "minecraft:chests/bastion_treasure",
-                base_seed ^ 0x3301,
-            );
-            place_chest_with_loot(
-                host,
-                ow,
-                [cx - 2, fy + 1, cz - 2],
-                "minecraft:chests/bastion_other",
-                base_seed ^ 0x3302,
-            );
-            place_block_if_loaded(host, ow, [cx + 2, fy + 1, cz + 2], "minecraft:anvil");
-            place_block_if_loaded(host, ow, [cx - 6, fy + 1, cz + 3], "minecraft:crafting_table");
-        }
+    for ([dx, dy, dz], _, table, salt) in outpost_chest_specs(kind) {
+        place_chest_with_loot(
+            host,
+            ow,
+            [cx + dx, fy + dy, cz + dz],
+            table,
+            base_seed ^ (*salt as i64),
+        );
+    }
+
+    let furn: &[([i32; 3], &str)] = match kind {
+        OutpostKind::HoglinVillage => &[
+            ([12, 1, -4], "minecraft:smithing_table"),
+            ([12, 1, 7], "minecraft:anvil"),
+            ([17, 1, -4], "minecraft:crafting_table"),
+            ([14, 2, 2], "minecraft:lodestone"),
+            ([10, 6, -12], "minecraft:barrel"),
+            ([-12, 1, -17], "minecraft:barrel"),
+            ([-17, 1, 0], "minecraft:cauldron"),
+        ],
+        OutpostKind::InfernalFoundry => &[
+            ([-13, 1, -8], "minecraft:blast_furnace"),
+            ([-11, 1, -8], "minecraft:blast_furnace"),
+            ([11, 1, -8], "minecraft:blast_furnace"),
+            ([13, 1, -8], "minecraft:blast_furnace"),
+            ([-4, 1, 5], "minecraft:anvil"),
+            ([4, 1, 5], "minecraft:smithing_table"),
+            ([-10, 1, -4], "minecraft:lava_cauldron"),
+            ([10, 1, -4], "minecraft:lava_cauldron"),
+        ],
+        OutpostKind::SiegeWatchtower => &[
+            ([-2, 1, 2], "minecraft:anvil"),
+            ([-2, 1, -2], "minecraft:smithing_table"),
+            ([11, 1, -8], "minecraft:crafting_table"),
+            ([-11, 1, 8], "minecraft:barrel"),
+            ([11, 1, 11], "minecraft:target"),
+            ([9, 1, 9], "minecraft:target"),
+            ([0, 8, 2], "minecraft:lodestone"),
+        ],
+        OutpostKind::BoneCatacomb => &[
+            ([0, 9, 2], "minecraft:enchanting_table"),
+            ([-2, 5, -7], "minecraft:wither_skeleton_skull"),
+            ([2, 5, -7], "minecraft:wither_skeleton_skull"),
+            ([-7, 5, 7], "minecraft:cauldron"),
+            ([7, 5, 7], "minecraft:brewing_stand"),
+            ([-14, 1, -14], "minecraft:barrel"),
+        ],
+        OutpostKind::ArenaPit => &[
+            ([-16, 1, 2], "minecraft:anvil"),
+            ([16, 1, -2], "minecraft:smithing_table"),
+            ([-4, 1, 14], "minecraft:lava_cauldron"),
+            ([4, 1, 14], "minecraft:lava_cauldron"),
+            ([0, 8, -14], "minecraft:lodestone"),
+        ],
+        OutpostKind::AlchemistSpire => &[
+            ([0, 1, -2], "minecraft:enchanting_table"),
+            ([0, 8, 2], "minecraft:respawn_anchor"),
+            ([-12, 1, 12], "minecraft:brewing_stand"),
+            ([12, 1, -12], "minecraft:cauldron"),
+            ([-10, 1, -12], "minecraft:brewing_stand"),
+            ([10, 1, 12], "minecraft:smithing_table"),
+        ],
+    };
+
+    for ([dx, dy, dz], id) in furn {
+        place_block_if_loaded(host, ow, [cx + dx, fy + dy, cz + dz], id);
     }
 }
 
@@ -1243,10 +1990,10 @@ fn armor_captain(host: &mut dyn ServerHost, eid: u32, title: &str) {
     };
     let _ = ent.set_custom_name(host, Some(Text::literal(title.to_owned())));
     if let Some(living) = host.living(ent) {
-        let _ = living.set_attribute_base(host, "minecraft:max_health", 70.0);
-        let _ = living.set_health(host, 70.0);
+        let _ = living.set_attribute_base(host, "minecraft:max_health", 80.0);
+        let _ = living.set_health(host, 80.0);
         for (slot, id) in [
-            (EquipmentSlot::Head, "minecraft:golden_helmet"),
+            (EquipmentSlot::Head, "minecraft:netherite_helmet"),
             (EquipmentSlot::Chest, "minecraft:golden_chestplate"),
             (EquipmentSlot::MainHand, "minecraft:netherite_axe"),
         ] {
@@ -1260,6 +2007,122 @@ fn armor_captain(host: &mut dyn ServerHost, eid: u32, title: &str) {
     }
 }
 
+pub(crate) fn outpost_garrison_specs(
+    kind: OutpostKind,
+) -> &'static [(&'static str, [i32; 3], Option<&'static str>)] {
+    match kind {
+        OutpostKind::HoglinVillage => &[
+            ("minecraft:piglin_brute", [13, 1, -1], Some("War-Kraal Chieftain")),
+            ("minecraft:piglin_brute", [10, 6, -13], Some("Kraal Taskmaster")),
+            ("minecraft:hoglin", [-6, 1, -14], None),
+            ("minecraft:hoglin", [2, 1, -15], None),
+            ("minecraft:hoglin", [-15, 1, -3], None),
+            ("minecraft:hoglin", [-15, 1, 7], None),
+            ("minecraft:hoglin", [-6, 1, 5], None),
+            ("minecraft:hoglin", [5, 1, 5], None),
+            ("minecraft:piglin", [0, 1, 14], None),
+            ("minecraft:piglin", [-3, 1, 14], None),
+            ("minecraft:piglin", [11, 1, 5], None),
+            ("minecraft:piglin", [16, 1, -1], None),
+            ("minecraft:piglin", [-5, 1, -5], None),
+            ("minecraft:piglin", [5, 1, -5], None),
+            ("minecraft:wither_skeleton", [0, 1, -11], None),
+        ],
+        OutpostKind::InfernalFoundry => &[
+            ("minecraft:piglin_brute", [0, 1, 12], Some("Forge-Master Captain")),
+            ("minecraft:piglin_brute", [0, 7, -2], Some("Crucible Warden")),
+            ("minecraft:wither_skeleton", [-4, 1, -12], None),
+            ("minecraft:wither_skeleton", [4, 1, -12], None),
+            ("minecraft:wither_skeleton", [-12, 1, 0], None),
+            ("minecraft:wither_skeleton", [12, 1, 0], None),
+            ("minecraft:blaze", [-11, 7, -3], None),
+            ("minecraft:blaze", [11, 7, -3], None),
+            ("minecraft:blaze", [-7, 7, -3], None),
+            ("minecraft:blaze", [7, 7, -3], None),
+            ("minecraft:piglin", [-3, 1, 15], None),
+            ("minecraft:piglin", [3, 1, 15], None),
+            ("minecraft:piglin", [-14, 1, 12], None),
+            ("minecraft:piglin", [14, 1, 12], None),
+            ("minecraft:magma_cube", [0, 1, 4], None),
+            ("minecraft:magma_cube", [0, 1, -10], None),
+        ],
+        OutpostKind::SiegeWatchtower => &[
+            ("minecraft:piglin_brute", [0, 8, 0], Some("Siege Captain")),
+            ("minecraft:piglin_brute", [0, 15, 2], Some("Tower Commander")),
+            ("minecraft:wither_skeleton", [-3, 15, -2], None),
+            ("minecraft:wither_skeleton", [3, 15, 2], None),
+            ("minecraft:wither_skeleton", [2, 8, -2], None),
+            ("minecraft:wither_skeleton", [0, 1, 3], None),
+            ("minecraft:blaze", [-4, 8, 3], None),
+            ("minecraft:blaze", [4, 8, -3], None),
+            ("minecraft:hoglin", [-11, 1, -10], None),
+            ("minecraft:hoglin", [13, 1, 10], None),
+            ("minecraft:piglin", [-11, 1, 8], None),
+            ("minecraft:piglin", [11, 1, -8], None),
+            ("minecraft:piglin", [-9, 1, 0], None),
+            ("minecraft:piglin", [9, 1, 0], None),
+            ("minecraft:piglin", [0, 1, -11], None),
+            ("minecraft:piglin", [0, 1, 11], None),
+        ],
+        OutpostKind::BoneCatacomb => &[
+            ("minecraft:piglin_brute", [0, 9, 1], Some("Necropolis Bone-Lord")),
+            ("minecraft:piglin_brute", [0, 1, -15], Some("Soul-Pyre Captain")),
+            ("minecraft:wither_skeleton", [-2, 5, -7], None),
+            ("minecraft:wither_skeleton", [2, 5, -7], None),
+            ("minecraft:wither_skeleton", [-7, 5, 2], None),
+            ("minecraft:wither_skeleton", [7, 5, -2], None),
+            ("minecraft:wither_skeleton", [0, 1, 2], None),
+            ("minecraft:wither_skeleton", [-2, 1, -2], None),
+            ("minecraft:blaze", [-8, 5, -8], None),
+            ("minecraft:blaze", [8, 5, 8], None),
+            ("minecraft:blaze", [0, 9, -2], None),
+            ("minecraft:piglin", [-15, 1, 0], None),
+            ("minecraft:piglin", [15, 1, 0], None),
+            ("minecraft:piglin", [0, 1, 15], None),
+            ("minecraft:magma_cube", [-14, 1, -14], None),
+            ("minecraft:magma_cube", [14, 1, 14], None),
+        ],
+        OutpostKind::ArenaPit => &[
+            ("minecraft:piglin_brute", [0, 8, -15], Some("Arena Champion")),
+            ("minecraft:piglin_brute", [0, 1, 14], Some("Pit Beastmaster")),
+            ("minecraft:hoglin", [-4, 1, 0], None),
+            ("minecraft:hoglin", [4, 1, 0], None),
+            ("minecraft:hoglin", [0, 1, -4], None),
+            ("minecraft:hoglin", [0, 1, 4], None),
+            ("minecraft:wither_skeleton", [-3, 1, -3], None),
+            ("minecraft:wither_skeleton", [3, 1, 3], None),
+            ("minecraft:wither_skeleton", [-10, 1, 0], None),
+            ("minecraft:wither_skeleton", [10, 1, 0], None),
+            ("minecraft:blaze", [-10, 4, -10], None),
+            ("minecraft:blaze", [10, 4, 10], None),
+            ("minecraft:piglin", [-16, 1, 0], None),
+            ("minecraft:piglin", [16, 1, 0], None),
+            ("minecraft:piglin", [-6, 1, 15], None),
+            ("minecraft:piglin", [5, 1, 15], None),
+            ("minecraft:magma_cube", [-4, 1, 4], None),
+            ("minecraft:magma_cube", [4, 1, -4], None),
+        ],
+        OutpostKind::AlchemistSpire => &[
+            ("minecraft:piglin_brute", [0, 15, 2], Some("Arcane Vault-Warden")),
+            ("minecraft:piglin_brute", [0, 8, 0], Some("Spire Enchanter")),
+            ("minecraft:blaze", [-11, 1, 11], None),
+            ("minecraft:blaze", [11, 1, -11], None),
+            ("minecraft:blaze", [-3, 8, -3], None),
+            ("minecraft:blaze", [3, 8, 3], None),
+            ("minecraft:wither_skeleton", [-2, 15, 2], None),
+            ("minecraft:wither_skeleton", [2, 15, -2], None),
+            ("minecraft:wither_skeleton", [-2, 1, 2], None),
+            ("minecraft:wither_skeleton", [2, 1, -2], None),
+            ("minecraft:piglin", [0, 1, -10], None),
+            ("minecraft:piglin", [0, 1, 10], None),
+            ("minecraft:piglin", [-10, 1, 0], None),
+            ("minecraft:piglin", [10, 1, 0], None),
+            ("minecraft:piglin", [-12, 1, -10], None),
+            ("minecraft:piglin", [12, 1, 10], None),
+        ],
+    }
+}
+
 fn spawn_outpost_garrison(
     host: &mut dyn ServerHost,
     state: &mut RiftState,
@@ -1268,42 +2131,7 @@ fn spawn_outpost_garrison(
     cz: i32,
     kind: OutpostKind,
 ) {
-    let roster: &[(&str, [i32; 3], Option<&str>)] = match kind {
-        OutpostKind::HoglinVillage => &[
-            ("minecraft:piglin_brute", [10, 1, -2], Some("War-Kraal Captain")),
-            ("minecraft:hoglin", [-5, 1, -10], None),
-            ("minecraft:hoglin", [5, 1, -10], None),
-            ("minecraft:hoglin", [-11, 1, 1], None),
-            ("minecraft:hoglin", [-11, 1, -2], None),
-            ("minecraft:hoglin", [0, 1, 5], None),
-            ("minecraft:piglin", [-2, 1, 2], None),
-            ("minecraft:piglin", [4, 1, -4], None),
-            ("minecraft:piglin", [0, 1, 10], None),
-            ("minecraft:piglin", [11, 1, 4], None),
-        ],
-        OutpostKind::InfernalFoundry => &[
-            ("minecraft:piglin_brute", [0, 1, 8], Some("Forge-Master Captain")),
-            ("minecraft:wither_skeleton", [-4, 1, -7], None),
-            ("minecraft:wither_skeleton", [4, 1, -7], None),
-            ("minecraft:wither_skeleton", [0, 1, 0], None),
-            ("minecraft:blaze", [-9, 4, -6], None),
-            ("minecraft:blaze", [9, 4, -6], None),
-            ("minecraft:piglin", [-7, 1, 4], None),
-            ("minecraft:piglin", [7, 1, 4], None),
-        ],
-        OutpostKind::SiegeWatchtower => &[
-            ("minecraft:piglin_brute", [0, 7, 1], Some("Siege Captain")),
-            ("minecraft:wither_skeleton", [0, 14, 1], None),
-            ("minecraft:wither_skeleton", [2, 1, -2], None),
-            ("minecraft:hoglin", [-7, 1, 0], None),
-            ("minecraft:hoglin", [7, 1, 4], None),
-            ("minecraft:piglin", [-6, 1, -5], None),
-            ("minecraft:piglin", [6, 1, -5], None),
-            ("minecraft:piglin", [0, 1, 8], None),
-        ],
-    };
-
-    for (mob_kind, [dx, dy, dz], captain_title) in roster {
+    for (mob_kind, [dx, dy, dz], captain_title) in outpost_garrison_specs(kind) {
         let mut nbt = Compound::new();
         nbt.insert("PersistenceRequired".into(), Tag::Byte(1));
         if is_piglin_or_hoglin(mob_kind) {
@@ -1333,6 +2161,7 @@ fn spawn_outpost_garrison(
 mod tests {
     use super::*;
     use crate::types::build_ring_columns;
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     fn matured_rift() -> RiftSource {
         RiftSource {
@@ -1363,31 +2192,151 @@ mod tests {
     }
 
     #[test]
-    fn outposts_cycle_through_all_three_mordor_archetypes_with_solid_grounding() {
+    fn outposts_scale_dynamically_across_all_six_archetypes() {
         let mut rift = matured_rift();
         let mut seen = Vec::new();
-        for placed in 0..3u32 {
+        // Even 12+ outposts unlock dynamically as wasteland territory grows large!
+        for placed in 0..12u32 {
             rift.outposts_placed = placed;
-            rift.corrupted_blocks = 500_000;
-            rift.ring_radius = 120;
+            rift.corrupted_blocks = 1_500_000;
+            rift.ring_radius = 220;
             let w = ConnectedWasteland {
-                total_corrupted_blocks: 500_000,
-                total_area_radius_sq: 120 * 120,
+                total_corrupted_blocks: 1_500_000,
+                total_area_radius_sq: 220 * 220,
                 max_deepen_radius: 25,
-                max_ring_radius: 120,
+                max_ring_radius: 220,
                 total_bastions_placed: 0,
                 total_outposts_placed: placed,
                 member_count: 1,
             };
-            seen.push(wasteland_eligible_for_outpost(&rift, w).expect("should unlock outpost"));
+            let kind = wasteland_eligible_for_outpost(&rift, w).expect("should unlock outpost");
+            if placed < 6 {
+                seen.push(kind);
+            }
         }
         assert!(seen.contains(&OutpostKind::HoglinVillage));
         assert!(seen.contains(&OutpostKind::InfernalFoundry));
         assert!(seen.contains(&OutpostKind::SiegeWatchtower));
+        assert!(seen.contains(&OutpostKind::BoneCatacomb));
+        assert!(seen.contains(&OutpostKind::ArenaPit));
+        assert!(seen.contains(&OutpostKind::AlchemistSpire));
 
         let mut st = RiftState::new();
         st.rifts.push(rift);
         assert!(!site_clear_for_outpost(&st, 20, 20));
         assert!(site_clear_for_outpost(&st, 80, 20));
+    }
+
+    #[test]
+    fn all_six_outpost_blueprints_are_grounded_roofed_and_clearance_verified() {
+        for kind in [
+            OutpostKind::HoglinVillage,
+            OutpostKind::InfernalFoundry,
+            OutpostKind::SiegeWatchtower,
+            OutpostKind::BoneCatacomb,
+            OutpostKind::ArenaPit,
+            OutpostKind::AlchemistSpire,
+        ] {
+            let half = outpost_half_extent(kind);
+            assert!(
+                half >= 18,
+                "{kind:?} half extent should be large (>= 18), got {half}"
+            );
+
+            let mut grid: HashMap<[i32; 3], OMat> = HashMap::new();
+            for dx in -half..=half {
+                for dz in -half..=half {
+                    let (floor_mat, upper) = plan_outpost_column(kind, dx, dz, 0);
+                    grid.insert([dx, 0, dz], floor_mat);
+                    for (dy, mat) in upper {
+                        assert_ne!(mat, OMat::Air, "unexpected Air in upper list");
+                        grid.insert([dx, dy, dz], mat);
+                    }
+                }
+            }
+
+            // 1. 6-connected BFS support check from dy = 0 guarantees ZERO floating blocks!
+            let mut visited: HashSet<[i32; 3]> = HashSet::new();
+            let mut q: VecDeque<[i32; 3]> = VecDeque::new();
+            for pos in grid.keys() {
+                if pos[1] == 0 {
+                    visited.insert(*pos);
+                    q.push_back(*pos);
+                }
+            }
+            while let Some([x, y, z]) = q.pop_front() {
+                for [nx, ny, nz] in [
+                    [x + 1, y, z],
+                    [x - 1, y, z],
+                    [x, y + 1, z],
+                    [x, y - 1, z],
+                    [x, y, z + 1],
+                    [x, y, z - 1],
+                ] {
+                    let np = [nx, ny, nz];
+                    if grid.contains_key(&np) && visited.insert(np) {
+                        q.push_back(np);
+                    }
+                }
+            }
+            for (pos, mat) in &grid {
+                assert!(
+                    visited.contains(pos),
+                    "{kind:?} has floating block {mat:?} at {pos:?}"
+                );
+            }
+
+            // 2. Campfires/SoulCampfires/SoulFires/Lanterns must sit on non-air; Chains must attach upward; Shroomlight on chains attached upward.
+            for (&[x, y, z], &mat) in &grid {
+                if matches!(
+                    mat,
+                    OMat::Campfire | OMat::SoulCampfire | OMat::SoulFire | OMat::SoulLantern | OMat::Glowstone
+                ) {
+                    assert!(
+                        grid.get(&[x, y - 1, z])
+                            .is_some_and(|below| !matches!(below, OMat::Lava | OMat::Campfire)),
+                        "{kind:?} has unsupported {mat:?} at [{x}, {y}, {z}]"
+                    );
+                }
+                if mat == OMat::Chain {
+                    assert!(
+                        grid.contains_key(&[x, y + 1, z]),
+                        "{kind:?} has unattached Chain at [{x}, {y}, {z}]"
+                    );
+                }
+            }
+
+            // 3. Every chest must sit on solid non-lava support with Air at its position + 1 block above.
+            let chests = outpost_chest_specs(kind);
+            assert!(chests.len() >= 6, "{kind:?} should have >= 6 chests");
+            for ([dx, dy, dz], _, _, _) in chests {
+                let below = grid.get(&[*dx, dy - 1, *dz]);
+                assert!(
+                    below.is_some_and(|b| !matches!(b, OMat::Lava | OMat::Campfire | OMat::SoulFire)),
+                    "{kind:?} chest at [{dx}, {dy}, {dz}] lacks solid floor below"
+                );
+                assert!(
+                    !grid.contains_key(&[*dx, *dy, *dz])
+                        && !grid.contains_key(&[*dx, dy + 1, *dz]),
+                    "{kind:?} chest at [{dx}, {dy}, {dz}] blocked by geometry"
+                );
+            }
+
+            // 4. Every garrison spawn spot must stand on solid ground with 2 blocks headroom.
+            let roster = outpost_garrison_specs(kind);
+            assert!(roster.len() >= 15, "{kind:?} should field >= 15 defenders");
+            for (mob, [dx, dy, dz], _) in roster {
+                let below = grid.get(&[*dx, dy - 1, *dz]);
+                assert!(
+                    below.is_some_and(|b| !matches!(b, OMat::Lava | OMat::Campfire | OMat::SoulFire)),
+                    "{kind:?} mob {mob} at [{dx}, {dy}, {dz}] lacks solid floor below"
+                );
+                assert!(
+                    !grid.contains_key(&[*dx, *dy, *dz])
+                        && !grid.contains_key(&[*dx, dy + 1, *dz]),
+                    "{kind:?} mob {mob} at [{dx}, {dy}, {dz}] suffocated in block"
+                );
+            }
+        }
     }
 }

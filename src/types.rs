@@ -143,6 +143,9 @@ pub enum OutpostKind {
     HoglinVillage = 0,
     InfernalFoundry = 1,
     SiegeWatchtower = 2,
+    BoneCatacomb = 3,
+    ArenaPit = 4,
+    AlchemistSpire = 5,
 }
 
 impl OutpostKind {
@@ -150,6 +153,9 @@ impl OutpostKind {
         match v {
             1 => Self::InfernalFoundry,
             2 => Self::SiegeWatchtower,
+            3 => Self::BoneCatacomb,
+            4 => Self::ArenaPit,
+            5 => Self::AlchemistSpire,
             _ => Self::HoglinVillage,
         }
     }
@@ -163,6 +169,9 @@ impl OutpostKind {
             Self::HoglinVillage => "Hoglin War-Kraal",
             Self::InfernalFoundry => "Hellforge Foundry",
             Self::SiegeWatchtower => "Mordor Siege Garrison",
+            Self::BoneCatacomb => "Soul Necropolis",
+            Self::ArenaPit => "Magma War-Arena",
+            Self::AlchemistSpire => "Warped Arcane Citadel",
         }
     }
 }

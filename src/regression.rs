@@ -467,7 +467,7 @@ fn near_citadel_or_bastion(state: &RiftState, x: i32, z: i32) -> bool {
         || state
             .outposts
             .iter()
-            .any(|o| (x - o.center[0]).abs() <= 22 && (z - o.center[2]).abs() <= 22)
+            .any(|o| (x - o.center[0]).abs() <= 28 && (z - o.center[2]).abs() <= 28)
 }
 
 fn parse_original_info(col: Option<&mod_api::TerrainColumn>) -> OriginalColumnInfo {

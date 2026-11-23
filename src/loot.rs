@@ -93,12 +93,13 @@ pub fn classify_structure_chest(state: &RiftState, pos: [i32; 3]) -> Option<Ches
     }
 
     for o in &state.outposts {
-        let cheb = (pos[0] - o.center[0]).abs().max((pos[2] - o.center[2]).abs());
-        if cheb <= 26 && (pos[1] - o.center[1]).abs() <= 30 {
-            let high_tier = pos[1] >= o.center[1] + 5
-                || (pos[0] - o.center[0]).abs() >= 10
-                || (pos[2] - o.center[2]).abs() >= 10;
-            return Some(if high_tier {
+        let dx_abs = (pos[0] - o.center[0]).abs();
+        let dz_abs = (pos[2] - o.center[2]).abs();
+        let cheb = dx_abs.max(dz_abs);
+        let dy = pos[1] - o.center[1];
+        if cheb <= 28 && dy.abs() <= 32 {
+            let is_vault = dy >= 6 || (dx_abs <= 4 && (13..=17).contains(&dz_abs));
+            return Some(if is_vault {
                 ChestLootTier::OutpostVault(o.kind)
             } else {
                 ChestLootTier::OutpostSupply(o.kind)
@@ -177,49 +178,95 @@ pub fn enrich_container_loot(
             push_stack(event.drops, items.blaze_rod, r(20, 2, 5));
         }
         ChestLootTier::OutpostVault(OutpostKind::HoglinVillage) => {
-            push_stack(event.drops, items.netherite_scrap, r(0, 1, 3));
-            push_stack(event.drops, items.gold_block, r(4, 1, 2));
-            push_stack(event.drops, items.diamond, r(8, 2, 5));
-            push_stack(event.drops, items.golden_apple, r(12, 1, 3));
-            push_stack(event.drops, items.cooked_porkchop, r(16, 10, 18));
+            push_stack(event.drops, items.netherite_scrap, r(0, 2, 4));
+            push_stack(event.drops, items.gold_block, r(4, 2, 3));
+            push_stack(event.drops, items.diamond, r(8, 3, 6));
+            push_stack(event.drops, items.golden_apple, r(12, 2, 4));
+            push_stack(event.drops, items.cooked_porkchop, r(16, 12, 24));
         }
         ChestLootTier::OutpostSupply(OutpostKind::HoglinVillage) => {
-            push_stack(event.drops, items.cooked_porkchop, r(0, 8, 16));
-            push_stack(event.drops, items.gold_ingot, r(4, 5, 10));
-            push_stack(event.drops, items.golden_carrot, r(8, 6, 12));
-            push_stack(event.drops, items.spectral_arrow, r(12, 12, 20));
-            push_stack(event.drops, items.experience_bottle, r(16, 4, 10));
+            push_stack(event.drops, items.cooked_porkchop, r(0, 10, 18));
+            push_stack(event.drops, items.gold_ingot, r(4, 6, 12));
+            push_stack(event.drops, items.golden_carrot, r(8, 8, 16));
+            push_stack(event.drops, items.spectral_arrow, r(12, 16, 24));
+            push_stack(event.drops, items.experience_bottle, r(16, 6, 12));
         }
         ChestLootTier::OutpostVault(OutpostKind::InfernalFoundry) => {
-            push_stack(event.drops, items.netherite_scrap, r(0, 2, 3));
-            push_stack(event.drops, items.ancient_debris, r(4, 1, 2));
+            push_stack(event.drops, items.netherite_scrap, r(0, 2, 4));
+            push_stack(event.drops, items.ancient_debris, r(4, 1, 3));
             if h % 2 == 0 {
                 push_stack(event.drops, items.upgrade_template, 1);
             }
-            push_stack(event.drops, items.iron_block, r(8, 2, 4));
-            push_stack(event.drops, items.gold_block, r(12, 1, 2));
-            push_stack(event.drops, items.diamond, r(16, 3, 6));
+            push_stack(event.drops, items.iron_block, r(8, 2, 5));
+            push_stack(event.drops, items.gold_block, r(12, 1, 3));
+            push_stack(event.drops, items.diamond, r(16, 4, 7));
         }
         ChestLootTier::OutpostSupply(OutpostKind::InfernalFoundry) => {
-            push_stack(event.drops, items.iron_ingot, r(0, 12, 24));
-            push_stack(event.drops, items.coal_block, r(4, 2, 5));
-            push_stack(event.drops, items.blaze_rod, r(8, 4, 8));
-            push_stack(event.drops, items.magma_cream, r(12, 4, 8));
-            push_stack(event.drops, items.obsidian, r(16, 4, 8));
+            push_stack(event.drops, items.iron_ingot, r(0, 14, 28));
+            push_stack(event.drops, items.coal_block, r(4, 3, 6));
+            push_stack(event.drops, items.blaze_rod, r(8, 5, 10));
+            push_stack(event.drops, items.magma_cream, r(12, 5, 10));
+            push_stack(event.drops, items.obsidian, r(16, 6, 12));
         }
         ChestLootTier::OutpostVault(OutpostKind::SiegeWatchtower) => {
-            push_stack(event.drops, items.netherite_scrap, r(0, 1, 2));
+            push_stack(event.drops, items.netherite_scrap, r(0, 2, 3));
             push_stack(event.drops, items.diamond_block, 1);
-            push_stack(event.drops, items.golden_apple, r(4, 2, 3));
-            push_stack(event.drops, items.ender_pearl, r(8, 4, 8));
-            push_stack(event.drops, items.spectral_arrow, r(12, 16, 28));
-            push_stack(event.drops, items.experience_bottle, r(16, 6, 12));
+            push_stack(event.drops, items.golden_apple, r(4, 2, 4));
+            push_stack(event.drops, items.ender_pearl, r(8, 5, 10));
+            push_stack(event.drops, items.spectral_arrow, r(12, 20, 32));
+            push_stack(event.drops, items.experience_bottle, r(16, 8, 16));
         }
         ChestLootTier::OutpostSupply(OutpostKind::SiegeWatchtower) => {
-            push_stack(event.drops, items.gold_ingot, r(0, 6, 12));
-            push_stack(event.drops, items.iron_ingot, r(4, 8, 16));
-            push_stack(event.drops, items.fire_charge, r(8, 6, 12));
-            push_stack(event.drops, items.cooked_porkchop, r(12, 6, 12));
+            push_stack(event.drops, items.gold_ingot, r(0, 8, 14));
+            push_stack(event.drops, items.iron_ingot, r(4, 10, 18));
+            push_stack(event.drops, items.fire_charge, r(8, 8, 14));
+            push_stack(event.drops, items.cooked_porkchop, r(12, 8, 14));
+        }
+        ChestLootTier::OutpostVault(OutpostKind::BoneCatacomb) => {
+            push_stack(event.drops, items.ancient_debris, r(0, 1, 2));
+            push_stack(event.drops, items.diamond, r(4, 4, 8));
+            push_stack(event.drops, items.ghast_tear, r(8, 3, 6));
+            push_stack(event.drops, items.crying_obsidian, r(12, 4, 8));
+            push_stack(event.drops, items.experience_bottle, r(16, 10, 18));
+            if h % 3 == 0 {
+                push_stack(event.drops, items.totem_of_undying, 1);
+            }
+        }
+        ChestLootTier::OutpostSupply(OutpostKind::BoneCatacomb) => {
+            push_stack(event.drops, items.crying_obsidian, r(0, 2, 5));
+            push_stack(event.drops, items.blaze_rod, r(4, 4, 8));
+            push_stack(event.drops, items.spectral_arrow, r(8, 12, 24));
+            push_stack(event.drops, items.experience_bottle, r(12, 6, 12));
+        }
+        ChestLootTier::OutpostVault(OutpostKind::ArenaPit) => {
+            push_stack(event.drops, items.netherite_ingot, 1);
+            push_stack(event.drops, items.diamond_block, r(0, 1, 2));
+            push_stack(event.drops, items.golden_apple, r(4, 3, 5));
+            push_stack(event.drops, items.gold_block, r(8, 2, 4));
+            push_stack(event.drops, items.experience_bottle, r(12, 8, 16));
+        }
+        ChestLootTier::OutpostSupply(OutpostKind::ArenaPit) => {
+            push_stack(event.drops, items.cooked_porkchop, r(0, 10, 20));
+            push_stack(event.drops, items.iron_block, r(4, 1, 2));
+            push_stack(event.drops, items.gold_ingot, r(8, 8, 16));
+            push_stack(event.drops, items.spectral_arrow, r(12, 16, 28));
+        }
+        ChestLootTier::OutpostVault(OutpostKind::AlchemistSpire) => {
+            push_stack(event.drops, items.upgrade_template, 1);
+            push_stack(event.drops, items.netherite_scrap, r(0, 2, 4));
+            push_stack(event.drops, items.ghast_tear, r(4, 4, 8));
+            push_stack(event.drops, items.ender_pearl, r(8, 6, 12));
+            push_stack(event.drops, items.experience_bottle, r(12, 12, 20));
+            if h % 2 == 0 {
+                push_stack(event.drops, items.enchanted_golden_apple, 1);
+            }
+        }
+        ChestLootTier::OutpostSupply(OutpostKind::AlchemistSpire) => {
+            push_stack(event.drops, items.blaze_rod, r(0, 6, 12));
+            push_stack(event.drops, items.magma_cream, r(4, 6, 12));
+            push_stack(event.drops, items.ender_pearl, r(8, 4, 8));
+            push_stack(event.drops, items.obsidian, r(12, 6, 12));
+            push_stack(event.drops, items.golden_carrot, r(16, 8, 16));
         }
     }
 
@@ -255,13 +302,47 @@ mod tests {
             Some(ChestLootTier::CitadelReserve)
         );
         assert_eq!(
-            classify_structure_chest(&st, [274, 71, 100]),
+            classify_structure_chest(&st, [258, 71, 115]),
             Some(ChestLootTier::OutpostVault(OutpostKind::HoglinVillage))
         );
         assert_eq!(
-            classify_structure_chest(&st, [260, 71, 104]),
+            classify_structure_chest(&st, [276, 71, 102]),
             Some(ChestLootTier::OutpostSupply(OutpostKind::HoglinVillage))
         );
         assert_eq!(classify_structure_chest(&st, [0, 64, 0]), None);
+
+        // Verify every chest placed across all six OutpostKind archetypes resolves cleanly.
+        for (i, kind) in [
+            OutpostKind::HoglinVillage,
+            OutpostKind::InfernalFoundry,
+            OutpostKind::SiegeWatchtower,
+            OutpostKind::BoneCatacomb,
+            OutpostKind::ArenaPit,
+            OutpostKind::AlchemistSpire,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let center = [600 + (i as i32) * 120, 70, 600];
+            let mut single = RiftState::new();
+            single.outposts.push(OutpostSite {
+                center,
+                kind,
+                flavor: NetherFlavor::CrimsonForest,
+            });
+            for (off, expect_vault, _, _) in crate::outposts::outpost_chest_specs(kind) {
+                let p = [center[0] + off[0], center[1] + off[1], center[2] + off[2]];
+                let expected = if *expect_vault {
+                    ChestLootTier::OutpostVault(kind)
+                } else {
+                    ChestLootTier::OutpostSupply(kind)
+                };
+                assert_eq!(
+                    classify_structure_chest(&single, p),
+                    Some(expected),
+                    "{kind:?} chest offset {off:?} misclassified"
+                );
+            }
+        }
     }
 }

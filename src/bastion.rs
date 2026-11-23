@@ -10,19 +10,20 @@ use mod_api::{
     Text,
 };
 
-const BASTION_CHECK_INTERVAL_TICKS: u64 = 600;
+const BASTION_CHECK_INTERVAL_TICKS: u64 = 360;
 const MIN_RIFT_BLOCKS_FOR_BASTION: u64 = 160_000;
 const MIN_RADIUS_SQ_FOR_BASTION: i64 = 96 * 96;
 const MIN_DEEPEN_RADIUS_FOR_BASTION: i32 = 22;
 const SECOND_BASTION_BLOCKS: u64 = 500_000;
 const SECOND_BASTION_RING_RADIUS: i32 = 115;
-const MAX_BASTIONS_PER_RIFT: u32 = 2;
-const MIN_BASTION_SPACING: i64 = 280;
+const EXTRA_BASTION_BLOCKS_STEP: u64 = 350_000;
+const EXTRA_BASTION_RING_STEP: i32 = 30;
+const MIN_BASTION_SPACING: i64 = 176;
 /// Keeps Bastions strictly on the corrupted outskirts so the portal epicenter
 /// stays clear for the unique central Citadel.
 pub const MIN_BASTION_PORTAL_DIST: i64 = 88;
 const MIN_PLAYER_DIST_FOR_BASTION: i64 = 112;
-const BASTION_RARITY_DENOM: u64 = 8;
+const BASTION_RARITY_DENOM: u64 = 4;
 
 /// Follows `#minecraft:has_structure/bastion_remnant`: Bastion Remnants form in
 /// Crimson Forest, Warped Forest, Soul Sand Valley, and Nether Wastes — never Basalt Deltas.
@@ -122,15 +123,7 @@ pub fn tick_bastion_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
 }
 
 pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWasteland) -> bool {
-    if rift.contained
-        || rift.pacified
-        || rift.regressing
-        || rift.bastions_placed >= MAX_BASTIONS_PER_RIFT
-    {
-        return false;
-    }
-    let max_group_bastions = ((wasteland.member_count as u32) * MAX_BASTIONS_PER_RIFT).min(4);
-    if wasteland.total_bastions_placed >= max_group_bastions {
+    if rift.contained || rift.pacified || rift.regressing {
         return false;
     }
     if wasteland.total_corrupted_blocks < MIN_RIFT_BLOCKS_FOR_BASTION
@@ -139,11 +132,13 @@ pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWas
     {
         return false;
     }
-    if wasteland.total_bastions_placed >= 1
-        && (wasteland.total_corrupted_blocks < SECOND_BASTION_BLOCKS
-            || wasteland.max_ring_radius < SECOND_BASTION_RING_RADIUS)
-    {
-        return false;
+    if wasteland.total_bastions_placed >= 1 {
+        let extra = (wasteland.total_bastions_placed - 1) as u64;
+        let req_blocks = SECOND_BASTION_BLOCKS + extra * EXTRA_BASTION_BLOCKS_STEP;
+        let req_ring = SECOND_BASTION_RING_RADIUS + (extra as i32) * EXTRA_BASTION_RING_STEP;
+        if wasteland.total_corrupted_blocks < req_blocks || wasteland.max_ring_radius < req_ring {
+            return false;
+        }
     }
     true
 }
@@ -212,7 +207,7 @@ pub fn site_outside_epicenters(state: &RiftState, cx: i32, cz: i32) -> bool {
         .citadels
         .iter()
         .all(|c| horiz_dist_sq(*c, [cx, 64, cz]) >= min_sq);
-    let out_sq = 64 * 64;
+    let out_sq = 72 * 72;
     let clear_outposts = state
         .outposts
         .iter()
@@ -234,7 +229,7 @@ fn find_bastion_site(
     }
     let outer = (radius - 10).max(inner);
 
-    for attempt in 0..8u64 {
+    for attempt in 0..16u64 {
         let h = spatial_hash(
             rift.center[0],
             rift.bastions_placed as i32,
@@ -895,6 +890,11 @@ mod tests {
 
         rift.bastions_placed = 2;
         assert!(!rift_eligible_for_bastion(&rift));
+
+        // Giant spreading wastelands dynamically unlock 3rd+ Bastions whenever territory expands.
+        rift.corrupted_blocks = 900_000;
+        rift.ring_radius = 150;
+        assert!(rift_eligible_for_bastion(&rift));
 
         // Connected wasteland pools corrupted territory across touching rifts for Bastion unlocks.
         let mut r1 = sample_rift();
