@@ -343,6 +343,43 @@ pub fn effective_deepen_budget(base_budget: usize, ring_radius: i32) -> usize {
     (effective_rift_budget(base_budget, ring_radius) * 2 + 6).clamp(24, 68)
 }
 
+/// Continuous per-tick surface corruption speed: starts at a slow eerie crawl (~0.08 blocks/tick)
+/// on a newly lit portal and increases slightly with every corrupted block up to the mature cap.
+pub fn rift_surface_ops_per_tick(
+    base_budget: usize,
+    ring_radius: i32,
+    corrupted_blocks: u64,
+) -> f64 {
+    let scale = (base_budget.max(1) as f64) / 14.0;
+    let b = corrupted_blocks as f64;
+    let sqrt_ramp = (b + 25.0).sqrt() - 5.0;
+    let raw = (0.08 + b * 0.00025 + sqrt_ramp * 0.085) * scale;
+    let cap = if ring_radius <= 2 {
+        effective_rift_budget(base_budget, ring_radius) as f64
+    } else {
+        (effective_rift_budget(base_budget, ring_radius) as f64 * 0.55).max(1.0)
+    };
+    raw.min(cap).max(0.05 * scale)
+}
+
+/// Continuous per-tick underground boring speed that accelerates alongside every corrupted block
+/// up to the chunk-friendly `effective_deepen_budget` ceiling.
+pub fn rift_deepen_ops_per_tick(
+    base_budget: usize,
+    ring_radius: i32,
+    corrupted_blocks: u64,
+) -> f64 {
+    if ring_radius <= 2 {
+        return 0.0;
+    }
+    let scale = (base_budget.max(1) as f64) / 14.0;
+    let b = corrupted_blocks as f64;
+    let sqrt_ramp = (b + 25.0).sqrt() - 5.0;
+    let raw = (0.08 + b * 0.00025 + sqrt_ramp * 0.085) * scale * 2.2;
+    let max_deep = effective_deepen_budget(base_budget, ring_radius) as f64;
+    raw.min(max_deep).max(0.10 * scale)
+}
+
 /// Computes how deep the underground deepening pass can sink at horizontal
 /// distance `horiz_dist` from a rift at `center_y`. Immediately penetrates shallow
 /// caves underneath, sinks steadily in a cone over time, and reaches Bedrock (`-63`)
@@ -1276,6 +1313,19 @@ mod tests {
         assert!(b_small < b_mid && b_mid < b_large);
         assert!(b_small <= 10, "small radius should start steady, not explosive");
         assert!(b_large <= 56, "large radius stays server-friendly");
+
+        // Newly lit portal creeps slowly, and every single corrupted block nudges speed upward.
+        let r0 = rift_surface_ops_per_tick(14, 1, 0);
+        let r1 = rift_surface_ops_per_tick(14, 1, 1);
+        let r10 = rift_surface_ops_per_tick(14, 3, 10);
+        let r500 = rift_surface_ops_per_tick(14, 8, 500);
+        let r5k = rift_surface_ops_per_tick(14, 24, 5_000);
+        let r40k = rift_surface_ops_per_tick(14, 80, 40_000);
+        assert!(r0 <= 0.12, "fresh portal must start very slow (got {r0})");
+        assert!(r0 < r1 && r1 < r10 && r10 < r500 && r500 < r5k && r5k < r40k);
+        assert!(
+            rift_deepen_ops_per_tick(14, 4, 200) < rift_deepen_ops_per_tick(14, 40, 20_000)
+        );
     }
 
     #[test]

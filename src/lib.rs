@@ -13,9 +13,9 @@ mod types;
 use atmosphere::{ClientAtmosphere, ParticlePalette};
 use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
 use corruption::{
-    SURFACE_CRUST_DEPTH, effective_deepen_budget, effective_rift_budget, is_air_like,
-    is_nether_terrain_block, is_preserved_ore, is_protected_block, is_snow_or_ice, is_water_like,
-    surface_column_y_range, transform_block,
+    SURFACE_CRUST_DEPTH, is_air_like, is_nether_terrain_block, is_preserved_ore,
+    is_protected_block, is_snow_or_ice, is_water_like, rift_deepen_ops_per_tick,
+    rift_surface_ops_per_tick, surface_column_y_range, transform_block,
 };
 use loot::ItemPalette;
 use mobs::paint_biome_column;
@@ -2086,21 +2086,37 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         state.rifts[idx].age_ticks += 1;
     }
 
-    // Compute smooth radius-scaled budgets for surface spread and a dedicated larger
-    // deep-boring budget for full peak-to-bedrock underground conversion.
-    let raw_budgets: Vec<usize> = uncontained_indices
+    // Progressive per-block speed curve: brand-new rifts creep very slowly (~1 block every
+    // ~0.5-0.6s) and every corrupted block slightly accelerates both surface & deep spread.
+    let surf_rates: Vec<f64> = uncontained_indices
         .iter()
-        .map(|&idx| effective_rift_budget(state.spread_budget, state.rifts[idx].ring_radius))
+        .map(|&idx| {
+            let r = &state.rifts[idx];
+            rift_surface_ops_per_tick(state.spread_budget, r.ring_radius, r.corrupted_blocks)
+        })
         .collect();
-    let total_raw: usize = raw_budgets.iter().sum();
-    let global_cap = (state.spread_budget * 5).clamp(48, 84);
+    let total_surf_rate: f64 = surf_rates.iter().sum();
+    let global_cap = (state.spread_budget * 5).clamp(48, 84) as f64;
+    let surf_scale = if total_surf_rate > global_cap && total_surf_rate > 0.0 {
+        global_cap / total_surf_rate
+    } else {
+        1.0
+    };
 
-    let deepen_raw: Vec<usize> = uncontained_indices
+    let deep_rates: Vec<f64> = uncontained_indices
         .iter()
-        .map(|&idx| effective_deepen_budget(state.spread_budget, state.rifts[idx].ring_radius))
+        .map(|&idx| {
+            let r = &state.rifts[idx];
+            rift_deepen_ops_per_tick(state.spread_budget, r.ring_radius, r.corrupted_blocks)
+        })
         .collect();
-    let total_deep_raw: usize = deepen_raw.iter().sum();
-    let global_deep_cap = (state.spread_budget * 6).clamp(64, 96);
+    let total_deep_rate: f64 = deep_rates.iter().sum();
+    let global_deep_cap = (state.spread_budget * 6).clamp(64, 96) as f64;
+    let deep_scale = if total_deep_rate > global_deep_cap && total_deep_rate > 0.0 {
+        global_deep_cap / total_deep_rate
+    } else {
+        1.0
+    };
 
     let count = uncontained_indices.len();
     let start = (state.tick as usize) % count;
@@ -2108,25 +2124,30 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
     for offset in 0..count {
         let pos_i = (start + offset) % count;
         let r_idx = uncontained_indices[pos_i];
-        let rift_budget = if total_raw > global_cap {
-            ((raw_budgets[pos_i] * global_cap) / total_raw).max(2)
-        } else {
-            raw_budgets[pos_i]
+        let rid = state.rifts[r_idx].id;
+
+        let mut surface_budget = {
+            let acc = state.surface_budget_accum.entry(rid).or_insert(0.0);
+            *acc += surf_rates[pos_i] * surf_scale;
+            let whole = acc.floor() as usize;
+            *acc -= whole as f64;
+            whole
         };
-
-        if state.rifts[r_idx].ring_radius <= 2 {
-            let mut surf = rift_budget;
-            corrupt_surface_step(host, level, state, r_idx, &mut surf);
-        } else {
-            let mut surface_budget = rift_budget.div_ceil(2);
+        if surface_budget > 0 {
             corrupt_surface_step(host, level, state, r_idx, &mut surface_budget);
+        }
 
-            let mut deep_budget = if total_deep_raw > global_deep_cap {
-                ((deepen_raw[pos_i] * global_deep_cap) / total_deep_raw).max(8)
-            } else {
-                deepen_raw[pos_i]
+        if state.rifts[r_idx].ring_radius > 2 {
+            let mut deep_budget = {
+                let acc = state.deepen_budget_accum.entry(rid).or_insert(0.0);
+                *acc += deep_rates[pos_i] * deep_scale;
+                let whole = acc.floor() as usize;
+                *acc -= whole as f64;
+                whole
             };
-            corrupt_deepen_step(host, level, state, r_idx, &mut deep_budget);
+            if deep_budget > 0 {
+                corrupt_deepen_step(host, level, state, r_idx, &mut deep_budget);
+            }
         }
     }
 }

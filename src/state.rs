@@ -123,6 +123,10 @@ pub struct RiftState {
     pub session_deepened_cols: HashSet<[i32; 2]>,
     pub session_cave_band_cols: HashSet<([i32; 2], i32)>,
     pub last_deepen_probe_tick: HashMap<u64, u64>,
+    /// Runtime fractional spread accumulators per rift so every corrupted block smoothly
+    /// accelerates growth from a very slow crawl up to full speed.
+    pub surface_budget_accum: HashMap<u64, f64>,
+    pub deepen_budget_accum: HashMap<u64, f64>,
     /// Runtime queue of recently evaporated/melted water, ice, or snow positions
     /// for emitting throttled black smoke effects without saving to disk.
     pub pending_melt_fx: Vec<[i32; 3]>,
@@ -185,6 +189,8 @@ impl RiftState {
             session_deepened_cols: HashSet::new(),
             session_cave_band_cols: HashSet::new(),
             last_deepen_probe_tick: HashMap::new(),
+            surface_budget_accum: HashMap::new(),
+            deepen_budget_accum: HashMap::new(),
             pending_melt_fx: Vec::new(),
             last_melt_sound_tick: 0,
         }
@@ -549,6 +555,8 @@ impl RiftState {
         self.session_deepened_cols.clear();
         self.session_cave_band_cols.clear();
         self.last_deepen_probe_tick.clear();
+        self.surface_budget_accum.clear();
+        self.deepen_budget_accum.clear();
         if let Some(arr) = doc.get("rifts").and_then(|v| v.as_array()) {
             for item in arr {
                 let Some(center) = item.get("center").and_then(pos_from_json) else {
