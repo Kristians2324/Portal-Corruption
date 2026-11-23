@@ -375,6 +375,9 @@ pub fn transform_restore_block(
     if is_monument_masonry(short) {
         return None;
     }
+    if near_monument && pos[1] >= original.surface_y - 4 {
+        return None;
+    }
 
     if matches!(short, "shroomlight" | "nether_wart_block" | "warped_wart_block") {
         if near_monument || in_persistent_scar_patch(pos) {

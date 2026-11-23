@@ -59,6 +59,17 @@ pub struct PendingOutpost {
     pub queued_tick: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingNetherFob {
+    pub rift_id: u64,
+    pub center_xz: [i32; 2],
+    pub ow_y: i32,
+    pub flavor: NetherFlavor,
+    pub roll: u64,
+    pub forced_chunks: Vec<[i32; 2]>,
+    pub queued_tick: u64,
+}
+
 pub struct RiftState {
     pub world_epoch: Option<WorldEpoch>,
     pub world_dir: Option<PathBuf>,
@@ -72,6 +83,10 @@ pub struct RiftState {
     pub bastions: Vec<BastionSite>,
     pub outposts: Vec<OutpostSite>,
     pub citadels: Vec<[i32; 3]>,
+    /// Rift IDs whose Nether-side Forward Operating Base has already been linked/built.
+    pub nether_fob_rifts: HashSet<u64>,
+    /// Built Nether Forward Operating Base centers in `minecraft:the_nether`.
+    pub nether_fobs: Vec<[i32; 3]>,
     pub corrupted_quart_cols: HashSet<[i32; 2]>,
     pub corrupted_quart_cols_list: Vec<[i32; 2]>,
     /// Tracks Overworld mobs buffed as Nether-Touched so loot & flames persist.
@@ -102,6 +117,9 @@ pub struct RiftState {
     pub pending_citadel: Option<PendingCitadel>,
     pub citadel_release_chunks: Vec<[i32; 2]>,
     pub citadel_release_ttl: u8,
+    pub pending_nether_fob: Option<PendingNetherFob>,
+    pub nether_fob_release_chunks: Vec<[i32; 2]>,
+    pub nether_fob_release_ttl: u8,
     /// Queues filled by read-only hooks and drained in `level_tick_post`.
     pub pending_portals: VecDeque<[i32; 3]>,
     pub pending_containment_checks: Vec<[i32; 3]>,
@@ -155,6 +173,8 @@ impl RiftState {
             bastions: Vec::new(),
             outposts: Vec::new(),
             citadels: Vec::new(),
+            nether_fob_rifts: HashSet::new(),
+            nether_fobs: Vec::new(),
             corrupted_quart_cols: HashSet::new(),
             corrupted_quart_cols_list: Vec::new(),
             nether_touched_mobs: HashSet::new(),
@@ -176,6 +196,9 @@ impl RiftState {
             pending_citadel: None,
             citadel_release_chunks: Vec::new(),
             citadel_release_ttl: 0,
+            pending_nether_fob: None,
+            nether_fob_release_chunks: Vec::new(),
+            nether_fob_release_ttl: 0,
             pending_portals: VecDeque::new(),
             pending_containment_checks: Vec::new(),
             pending_water_evap: VecDeque::new(),
@@ -525,6 +548,20 @@ impl RiftState {
             "shore_columns".into(),
             flat_cols_iter_to_json(self.shore_columns.iter().copied()),
         );
+        root.insert(
+            "nether_fob_rifts".into(),
+            Value::Array(
+                self.nether_fob_rifts
+                    .iter()
+                    .copied()
+                    .map(Value::from)
+                    .collect(),
+            ),
+        );
+        root.insert(
+            "nether_fobs".into(),
+            Value::Array(self.nether_fobs.iter().copied().map(pos_to_json).collect()),
+        );
 
         Value::Object(root)
     }
@@ -758,6 +795,22 @@ impl RiftState {
                 }
             }
         }
+        self.nether_fob_rifts.clear();
+        if let Some(arr) = doc.get("nether_fob_rifts").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(id) = item.as_u64() {
+                    self.nether_fob_rifts.insert(id);
+                }
+            }
+        }
+        self.nether_fobs.clear();
+        if let Some(arr) = doc.get("nether_fobs").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(center) = pos_from_json(item) {
+                    self.nether_fobs.push(center);
+                }
+            }
+        }
         self.dirty = false;
     }
 }
@@ -864,6 +917,8 @@ mod tests {
             regress_active_column: Some(([120, -88], 40, -63)),
         });
         s.citadels.push([120, 64, -88]);
+        s.nether_fob_rifts.insert(1);
+        s.nether_fobs.push([15, 52, -11]);
         s.outposts.push(OutpostSite {
             center: [185, 68, -20],
             kind: OutpostKind::HoglinVillage,
@@ -894,6 +949,8 @@ mod tests {
         assert!(loaded.rifts[0].regressing);
         assert_eq!(loaded.rifts[0].regress_radius, 12);
         assert_eq!(loaded.citadels, vec![[120, 64, -88]]);
+        assert!(loaded.nether_fob_rifts.contains(&1));
+        assert_eq!(loaded.nether_fobs, vec![[15, 52, -11]]);
         assert_eq!(loaded.outposts.len(), 1);
         assert_eq!(loaded.outposts[0].kind, OutpostKind::HoglinVillage);
         assert_eq!(loaded.rifts[0].max_deepen_reached, 24);

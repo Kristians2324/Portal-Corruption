@@ -1,5 +1,5 @@
 use crate::state::RiftState;
-use crate::types::{OutpostKind, OVERWORLD, spatial_hash, strip_ns};
+use crate::types::{NETHER, OVERWORLD, OutpostKind, spatial_hash, strip_ns};
 use mod_api::{ContainerLootFilledEvent, ItemKey, ItemStack, Registrar};
 
 /// Pre-registered item keys cached during `Hooks::register` so `container_loot_filled`
@@ -72,9 +72,42 @@ pub enum ChestLootTier {
     CitadelReserve,
     OutpostVault(OutpostKind),
     OutpostSupply(OutpostKind),
+    NetherFobVault,
+    NetherFobSupply,
 }
 
+#[cfg(test)]
 pub fn classify_structure_chest(state: &RiftState, pos: [i32; 3]) -> Option<ChestLootTier> {
+    classify_structure_chest_in_dim(state, OVERWORLD, pos)
+}
+
+pub fn classify_structure_chest_in_dim(
+    state: &RiftState,
+    dimension: &str,
+    pos: [i32; 3],
+) -> Option<ChestLootTier> {
+    if dimension == NETHER {
+        for f in &state.nether_fobs {
+            let dx_abs = (pos[0] - f[0]).abs();
+            let dz = pos[2] - f[2];
+            let cheb = dx_abs.max(dz.abs());
+            let dy = (pos[1] - f[1]).abs();
+            if cheb <= 26 && dy <= 24 {
+                let is_vault = (12..=18).contains(&dx_abs) && (-8..=-4).contains(&dz);
+                return Some(if is_vault {
+                    ChestLootTier::NetherFobVault
+                } else {
+                    ChestLootTier::NetherFobSupply
+                });
+            }
+        }
+        return None;
+    }
+
+    if dimension != OVERWORLD {
+        return None;
+    }
+
     for c in &state.citadels {
         let dx = (pos[0] - c[0]).abs();
         let dz = (pos[2] - c[2]).abs();
@@ -124,13 +157,10 @@ pub fn enrich_container_loot(
     event: &mut ContainerLootFilledEvent<'_>,
     items: &ItemPalette,
 ) {
-    if event.context.dimension != OVERWORLD {
-        return;
-    }
     let Some(pos) = event.context.block else {
         return;
     };
-    let Some(tier) = classify_structure_chest(state, pos) else {
+    let Some(tier) = classify_structure_chest_in_dim(state, event.context.dimension, pos) else {
         return;
     };
 
@@ -268,6 +298,31 @@ pub fn enrich_container_loot(
             push_stack(event.drops, items.obsidian, r(12, 6, 12));
             push_stack(event.drops, items.golden_carrot, r(16, 8, 16));
         }
+        ChestLootTier::NetherFobVault => {
+            push_stack(event.drops, items.netherite_ingot, 1);
+            push_stack(event.drops, items.ancient_debris, r(0, 2, 4));
+            push_stack(event.drops, items.upgrade_template, 1);
+            push_stack(event.drops, items.diamond_block, 1);
+            push_stack(event.drops, items.gold_block, r(4, 2, 4));
+            push_stack(
+                event.drops,
+                if h % 3 == 0 {
+                    items.enchanted_golden_apple
+                } else {
+                    items.golden_apple
+                },
+                if h % 3 == 0 { 1 } else { r(8, 2, 4) },
+            );
+            push_stack(event.drops, items.experience_bottle, r(12, 10, 18));
+        }
+        ChestLootTier::NetherFobSupply => {
+            push_stack(event.drops, items.netherite_scrap, r(0, 1, 3));
+            push_stack(event.drops, items.gold_ingot, r(4, 10, 18));
+            push_stack(event.drops, items.iron_ingot, r(8, 10, 20));
+            push_stack(event.drops, items.blaze_rod, r(12, 4, 8));
+            push_stack(event.drops, items.golden_carrot, r(16, 8, 16));
+            push_stack(event.drops, items.obsidian, r(20, 6, 12));
+        }
     }
 
     // Never keep vanilla empty junk if somehow rolled in non-treasure containers.
@@ -343,6 +398,20 @@ mod tests {
                     "{kind:?} chest offset {off:?} misclassified"
                 );
             }
+        }
+
+        // Verify Nether Forward Operating Base chests resolve exclusively inside NETHER.
+        let mut fob_state = RiftState::new();
+        fob_state.nether_fobs.push([100, 52, -100]);
+        for (off, expect_vault, _, _) in crate::nether_fob::fob_chest_specs() {
+            let p = [100 + off[0], 52 + off[1], -100 + off[2]];
+            let expected = if *expect_vault {
+                ChestLootTier::NetherFobVault
+            } else {
+                ChestLootTier::NetherFobSupply
+            };
+            assert_eq!(classify_structure_chest_in_dim(&fob_state, NETHER, p), Some(expected));
+            assert_eq!(classify_structure_chest(&fob_state, p), None);
         }
     }
 }

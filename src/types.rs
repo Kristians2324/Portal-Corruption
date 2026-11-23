@@ -1,6 +1,9 @@
 pub const OVERWORLD: &str = "minecraft:overworld";
+pub const NETHER: &str = "minecraft:the_nether";
 pub const OVERWORLD_MIN_Y: i32 = -64;
 pub const OVERWORLD_MAX_Y: i32 = 319;
+pub const NETHER_MIN_Y: i32 = 4;
+pub const NETHER_MAX_Y: i32 = 123;
 pub const BEDROCK_FLOOR_Y: i32 = -63;
 
 /// Vanilla Nether biome themes projected into Overworld chunks.

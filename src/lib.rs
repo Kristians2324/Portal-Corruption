@@ -5,6 +5,7 @@ mod containment;
 mod corruption;
 mod loot;
 mod mobs;
+mod nether_fob;
 mod outposts;
 mod regression;
 mod state;
@@ -21,7 +22,7 @@ use loot::ItemPalette;
 use mobs::paint_biome_column;
 use state::RiftState;
 use types::{
-    BEDROCK_FLOOR_Y, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource,
+    BEDROCK_FLOOR_Y, NETHER, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource,
     build_ring_columns, dist_sq, horiz_dist_sq, neighbors_6, spatial_hash, strip_ns,
 };
 
@@ -157,6 +158,7 @@ fn release_all_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: 
     bastion::release_bastion_chunks(host, level, state);
     outposts::release_outpost_chunks(host, level, state);
     citadel::release_citadel_chunks(host, level, state);
+    nether_fob::release_nether_fob_chunks(host, state);
 }
 
 fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
@@ -2744,6 +2746,15 @@ impl Hooks for Mod {
         let HostSide::Server(server) = host else {
             return;
         };
+        if event.level.dimension_id() == NETHER {
+            if let Ok(mut state) = self.state.try_lock()
+                && state.pending_nether_fob.is_some()
+            {
+                ensure_world_initialized(server, &mut state);
+                nether_fob::tick_nether_dimension(server, event.level, &mut state);
+            }
+            return;
+        }
         if event.level.dimension_id() != OVERWORLD {
             return;
         }
@@ -2787,6 +2798,7 @@ impl Hooks for Mod {
         bastion::tick_bastion_emergence(server, event.level, &mut state);
         outposts::tick_outposts(server, event.level, &mut state);
         citadel::tick_citadel_emergence(server, event.level, &mut state);
+        nether_fob::tick_nether_fob_emergence(server, &mut state);
         regression::tick_regression(server, event.level, &mut state);
 
         if state.tick % 1200 == 0 {
