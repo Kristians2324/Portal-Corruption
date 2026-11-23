@@ -617,7 +617,9 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             continue;
         };
         let bname = bkey.id(host);
-        if is_water_like(&bname) || is_snow_or_ice(&bname) {
+        let is_water = is_water_like(&bname);
+        let is_cold = is_snow_or_ice(&bname);
+        if is_water || is_cold {
             if level
                 .set_block(
                     host,
@@ -631,15 +633,40 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             }
             state.dirty = true;
 
-            for n in neighbors_6(pos) {
-                if n[1] >= OVERWORLD_MIN_Y
-                    && n[1] <= OVERWORLD_MAX_Y
-                    && near_corruption_or_active_rift(state, n)
-                    && level
-                        .block(host, n)
-                        .is_some_and(|nk| is_water_like(&nk.id(host)))
-                {
-                    state.queue_water_evap(n);
+            if is_cold {
+                // Chain-melt adjacent and sloped snow/ice across mountain peaks and frozen lakes.
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            if dx == 0 && dy == 0 && dz == 0 {
+                                continue;
+                            }
+                            let n = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                            if n[1] >= OVERWORLD_MIN_Y
+                                && n[1] <= OVERWORLD_MAX_Y
+                                && near_corruption_or_active_rift(state, n)
+                                && level.block(host, n).is_some_and(|nk| {
+                                    let nid = nk.id(host);
+                                    is_snow_or_ice(&nid) || is_water_like(&nid)
+                                })
+                            {
+                                state.queue_water_evap(n);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for n in neighbors_6(pos) {
+                    if n[1] >= OVERWORLD_MIN_Y
+                        && n[1] <= OVERWORLD_MAX_Y
+                        && near_corruption_or_active_rift(state, n)
+                        && level.block(host, n).is_some_and(|nk| {
+                            let nid = nk.id(host);
+                            is_water_like(&nid) || is_snow_or_ice(&nid)
+                        })
+                    {
+                        state.queue_water_evap(n);
+                    }
                 }
             }
         } else if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
@@ -650,12 +677,13 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
     }
 
     // Continuous gentle surface & river sweep over existing corrupted quart columns
-    // so lingering ponds, snow, or ice patches never survive inside corrupted lands.
+    // so lingering ponds, snow, or ice patches (including beneath tall forest canopies)
+    // never survive inside corrupted lands.
     if state.corrupted_quart_cols.is_empty() {
         return;
     }
     let cols: Vec<[i32; 2]> = state.corrupted_quart_cols.iter().copied().collect();
-    for _ in 0..4 {
+    for _ in 0..12 {
         let idx = state.water_sweep_cursor % cols.len();
         state.water_sweep_cursor = state.water_sweep_cursor.wrapping_add(1);
         let qc = cols[idx];
@@ -664,12 +692,28 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
         if !level.is_loaded(host, [sub_x, 64, sub_z]) {
             continue;
         }
-        if let Ok(hs) = host.surface_heights(OVERWORLD, &[(sub_x, sub_z)], Heightmap::WorldSurface)
-            && let Some(Some(top)) = hs.first().copied()
-        {
-            let lo = (top - 12).max(OVERWORLD_MIN_Y);
-            let hi = (top + 1).min(OVERWORLD_MAX_Y);
-            for y in lo..=hi {
+        let ws = host
+            .surface_heights(OVERWORLD, &[(sub_x, sub_z)], Heightmap::WorldSurface)
+            .ok()
+            .and_then(|hs| hs.first().copied().flatten());
+        let mb = host
+            .surface_heights(OVERWORLD, &[(sub_x, sub_z)], Heightmap::MotionBlockingNoLeaves)
+            .ok()
+            .and_then(|hs| hs.first().copied().flatten());
+
+        let mut scan_y_ranges: [Option<(i32, i32)>; 2] = [None, None];
+        if let Some(top) = ws {
+            scan_y_ranges[0] = Some(((top - 8).max(OVERWORLD_MIN_Y), (top + 1).min(OVERWORLD_MAX_Y)));
+        }
+        if let Some(ground) = mb {
+            scan_y_ranges[1] = Some((
+                (ground - 6).max(OVERWORLD_MIN_Y),
+                (ground + 4).min(OVERWORLD_MAX_Y),
+            ));
+        }
+
+        for range in scan_y_ranges.into_iter().flatten() {
+            for y in range.0..=range.1 {
                 let p = [sub_x, y, sub_z];
                 if level
                     .block(host, p)
@@ -1246,7 +1290,7 @@ impl Hooks for Mod {
                 || level
                     .state_fluid_state(event.new)
                     .is_some_and(|f| !f.is_empty() && !matches!(new_short, "lava" | "flowing_lava"));
-            if has_water
+            if (has_water || is_snow_or_ice(new_name))
                 && near_corruption_or_active_rift(&state, pos)
                 && let Ok(mut q) = self.queues.lock()
             {
@@ -1263,7 +1307,7 @@ impl Hooks for Mod {
         if let Ok(state) = self.state.try_lock()
             && near_corruption_or_active_rift(&state, to)
         {
-            if is_water_like(event.kind) {
+            if is_water_like(event.kind) || is_snow_or_ice(event.kind) {
                 if let Ok(mut q) = self.queues.lock() {
                     q.pending_water_evap.push(to);
                 }
@@ -1271,7 +1315,7 @@ impl Hooks for Mod {
             }
             if matches!(
                 strip_ns(event.kind),
-                "grass_block" | "mycelium" | "vine" | "sculk" | "moss_block"
+                "grass_block" | "mycelium" | "vine" | "sculk" | "moss_block" | "pale_moss_block"
             ) {
                 return Flow::Cancel;
             }

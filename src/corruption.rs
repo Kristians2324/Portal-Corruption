@@ -233,6 +233,22 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
             | "nether_bricks"
             | "cracked_nether_bricks"
             | "red_nether_bricks"
+            | "nether_brick_fence"
+            | "nether_brick_wall"
+            | "nether_brick_stairs"
+            | "nether_brick_slab"
+            | "red_nether_brick_wall"
+            | "red_nether_brick_stairs"
+            | "red_nether_brick_slab"
+            | "blackstone_wall"
+            | "blackstone_stairs"
+            | "blackstone_slab"
+            | "polished_blackstone_wall"
+            | "polished_blackstone_stairs"
+            | "polished_blackstone_slab"
+            | "polished_blackstone_brick_wall"
+            | "polished_blackstone_brick_stairs"
+            | "polished_blackstone_brick_slab"
             | "magma_block"
             | "glowstone"
             | "shroomlight"
@@ -246,6 +262,12 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
             | "warped_planks"
             | "crimson_fence"
             | "warped_fence"
+            | "crimson_fence_gate"
+            | "warped_fence_gate"
+            | "crimson_stairs"
+            | "warped_stairs"
+            | "crimson_slab"
+            | "warped_slab"
             | "nether_wart_block"
             | "warped_wart_block"
             | "crimson_fungus"
@@ -411,41 +433,98 @@ fn flavor_surface_flora(flavor: NetherFlavor, surface_block: &str, h: u64) -> Op
     }
 }
 
+fn is_burnable_overworld_growth(short: &str) -> bool {
+    if short.ends_with("_sapling") {
+        return true;
+    }
+    if (short.ends_with("_coral")
+        || short.ends_with("_coral_fan")
+        || short.ends_with("_coral_wall_fan"))
+        && !short.starts_with("dead_")
+    {
+        return true;
+    }
+    matches!(
+        short,
+        "mangrove_propagule"
+            | "bamboo"
+            | "bamboo_sapling"
+            | "cactus"
+            | "wheat"
+            | "carrots"
+            | "potatoes"
+            | "beetroots"
+            | "melon_stem"
+            | "pumpkin_stem"
+            | "attached_melon_stem"
+            | "attached_pumpkin_stem"
+            | "torchflower_crop"
+            | "pitcher_crop"
+            | "cocoa"
+            | "pumpkin"
+            | "melon"
+            | "hay_block"
+            | "dried_kelp_block"
+            | "frogspawn"
+            | "chorus_plant"
+            | "chorus_flower"
+    )
+}
+
 fn transform_wood_and_foliage(
     short: &str,
-    pos: [i32; 3],
     flavor: NetherFlavor,
     h: u64,
 ) -> Option<TransformOutcome> {
-    if short.ends_with("_log") || short.ends_with("_wood") {
-        // Leave ~6% dead/stripped Overworld trunks scarred rather than uniform stems.
-        if in_remnant_cluster(pos, 0x712E_A501, 6) {
-            return Some(TransformOutcome::replace("minecraft:stripped_oak_log"));
-        }
-        let stem = match flavor {
-            NetherFlavor::CrimsonForest => "minecraft:crimson_stem",
-            NetherFlavor::WarpedForest => "minecraft:warped_stem",
-            NetherFlavor::BasaltDeltas | NetherFlavor::SoulSandValley => "minecraft:basalt",
-            NetherFlavor::NetherWastes => {
-                if h % 3 == 0 {
-                    "minecraft:crimson_stem"
-                } else {
-                    "minecraft:basalt"
-                }
-            }
+    let is_overworld_log = ((short.ends_with("_log") || short.ends_with("_wood"))
+        && !short.starts_with("crimson_")
+        && !short.starts_with("warped_"))
+        || matches!(
+            short,
+            "mangrove_roots" | "bamboo_block" | "stripped_bamboo_block" | "mushroom_stem"
+        );
+    if is_overworld_log {
+        // Wood always burns, rots away, or warps into Nether stems / charred basalt — never stays Overworld wood.
+        let roll = h % 20;
+        let replacement = match flavor {
+            NetherFlavor::CrimsonForest => match roll {
+                0..=11 => "minecraft:crimson_stem",
+                12..=16 => "minecraft:basalt",
+                _ => "minecraft:air",
+            },
+            NetherFlavor::WarpedForest => match roll {
+                0..=11 => "minecraft:warped_stem",
+                12..=16 => "minecraft:basalt",
+                _ => "minecraft:air",
+            },
+            NetherFlavor::SoulSandValley | NetherFlavor::BasaltDeltas => match roll {
+                0..=11 => "minecraft:basalt",
+                12..=14 => "minecraft:blackstone",
+                _ => "minecraft:air",
+            },
+            NetherFlavor::NetherWastes => match roll {
+                0..=4 => "minecraft:crimson_stem",
+                5..=12 => "minecraft:basalt",
+                _ => "minecraft:air",
+            },
         };
-        return Some(TransformOutcome::replace(stem));
+        return Some(TransformOutcome::replace(replacement));
     }
 
-    if short.ends_with("_leaves") || short == "azalea" || short == "flowering_azalea" {
+    if short.ends_with("_leaves")
+        || matches!(
+            short,
+            "azalea" | "flowering_azalea" | "red_mushroom_block" | "brown_mushroom_block"
+        )
+    {
         let replacement = match (flavor, h % 100) {
-            (_, 0..=4) => "minecraft:shroomlight",
-            (NetherFlavor::CrimsonForest, 5..=62) => "minecraft:nether_wart_block",
-            (NetherFlavor::WarpedForest, 5..=62) => "minecraft:warped_wart_block",
-            (NetherFlavor::SoulSandValley | NetherFlavor::BasaltDeltas, 5..=24) => {
+            (_, 0..=3) => "minecraft:shroomlight",
+            (NetherFlavor::CrimsonForest, 4..=51) => "minecraft:nether_wart_block",
+            (NetherFlavor::WarpedForest, 4..=51) => "minecraft:warped_wart_block",
+            (NetherFlavor::SoulSandValley | NetherFlavor::BasaltDeltas, 4..=16) => {
                 "minecraft:basalt"
             }
-            (NetherFlavor::NetherWastes, 5..=39) => "minecraft:nether_wart_block",
+            (NetherFlavor::NetherWastes, 4..=28) => "minecraft:nether_wart_block",
             _ => "minecraft:air",
         };
         return Some(TransformOutcome::replace(replacement));
@@ -488,9 +567,9 @@ fn transform_stone_family(
         return None;
     }
 
-    // Leave ~3% tiny scarred Overworld stone/cobble remnants so terrain still hints
-    // at its Overworld origin while stone overwhelmingly transforms into Nether rock.
-    if in_remnant_cluster(pos, 0x5CA2_1001, 3) {
+    // Leave ~2% rare scarred Overworld stone/cobble traces as subtle remnants of what
+    // used to be there, while the surrounding stone overwhelms into Nether rock.
+    if in_remnant_cluster(pos, 0x5CA2_1001, 2) {
         if short == "stone" && h % 2 == 0 {
             return Some(TransformOutcome::replace("minecraft:cobblestone"));
         }
@@ -603,35 +682,64 @@ pub fn transform_block(
         return TransformOutcome::replace("minecraft:air");
     }
 
-    // Soft Overworld foliage / flowers / vines / snow -> clear cleanly to air so
-    // Nether roots & fungi are only ever planted AFTER the ground beneath becomes nylium.
-    if is_open_space(current) {
+    // Soft Overworld foliage / flowers / vines / snow / crops / saplings / wet blocks ->
+    // rot, burn, or dry cleanly away with zero green or cold survivors.
+    if is_open_space(current) || is_burnable_overworld_growth(short) {
         return TransformOutcome::replace("minecraft:air");
     }
 
-    if let Some(wood_out) = transform_wood_and_foliage(short, pos, flavor, h) {
+    if short == "wet_sponge" {
+        return TransformOutcome::replace("minecraft:sponge");
+    }
+
+    if short.ends_with("_coral_block") && !short.starts_with("dead_") {
+        return TransformOutcome::replace(if h % 2 == 0 {
+            "minecraft:dead_brain_coral_block"
+        } else {
+            "minecraft:blackstone"
+        });
+    }
+
+    if let Some(wood_out) = transform_wood_and_foliage(short, flavor, h) {
         return wood_out;
     }
 
-    // Surface soils & ground covers.
+    // Living green / wet surface covers (grass, moss, mycelium, podzol, mud, clay) ALWAYS corrupt —
+    // never keep green or muddy patches! Only plain dry earth keeps rare (~2%) scorched dirt traces.
     if matches!(
         short,
         "grass_block"
-            | "dirt"
-            | "coarse_dirt"
-            | "rooted_dirt"
-            | "podzol"
-            | "mycelium"
             | "moss_block"
             | "pale_moss_block"
+            | "mycelium"
+            | "podzol"
             | "mud"
             | "muddy_mangrove_roots"
             | "clay"
     ) {
-        if short != "coarse_dirt" && in_remnant_cluster(pos, 0x5CA2_2002, 6) {
-            if h % 4 == 0 && matches!(short, "grass_block" | "dirt") {
-                return TransformOutcome::unchanged(true);
-            }
+        if is_open_space(above) && !matches!(short, "mud" | "muddy_mangrove_roots" | "clay") {
+            let block = flavor_surface_block(flavor, h);
+            let flora = if is_air_like(above) {
+                flavor_surface_flora(flavor, block, scar_roll(pos, 0xF102_A001))
+            } else {
+                None
+            };
+            return TransformOutcome {
+                block: Some(block),
+                above: flora,
+                below: None,
+                is_corrupt: true,
+            };
+        }
+        return TransformOutcome::replace(match flavor {
+            NetherFlavor::SoulSandValley => "minecraft:soul_soil",
+            NetherFlavor::BasaltDeltas => "minecraft:blackstone",
+            _ => "minecraft:netherrack",
+        });
+    }
+
+    if matches!(short, "dirt" | "coarse_dirt" | "rooted_dirt") {
+        if in_remnant_cluster(pos, 0x5CA2_2002, 2) {
             return TransformOutcome::replace("minecraft:coarse_dirt");
         }
         if is_open_space(above) {
@@ -656,7 +764,7 @@ pub fn transform_block(
     }
 
     if matches!(short, "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel") {
-        if in_remnant_cluster(pos, 0x5CA2_3003, 6) {
+        if in_remnant_cluster(pos, 0x5CA2_3003, 2) {
             return TransformOutcome::unchanged(true);
         }
         let block = match flavor {
@@ -693,7 +801,7 @@ pub fn transform_block(
             | "deepslate_bricks"
             | "deepslate_tiles"
     ) {
-        if in_remnant_cluster(pos, 0x5CA2_4004, 6) {
+        if in_remnant_cluster(pos, 0x5CA2_4004, 2) {
             return TransformOutcome::replace("minecraft:cracked_stone_bricks");
         }
         let block = match h % 24 {
@@ -705,7 +813,7 @@ pub fn transform_block(
         return TransformOutcome::replace(block);
     }
 
-    if short.ends_with("_planks") {
+    if short.ends_with("_planks") && !short.starts_with("crimson_") && !short.starts_with("warped_") {
         let plank = match flavor {
             NetherFlavor::WarpedForest => "minecraft:warped_planks",
             _ => "minecraft:crimson_planks",
@@ -713,7 +821,11 @@ pub fn transform_block(
         return TransformOutcome::replace(plank);
     }
 
-    if short.ends_with("_fence") {
+    if short.ends_with("_fence")
+        && !short.starts_with("crimson_")
+        && !short.starts_with("warped_")
+        && !short.starts_with("nether_brick_")
+    {
         let fence = match flavor {
             NetherFlavor::WarpedForest => "minecraft:warped_fence",
             _ => "minecraft:crimson_fence",
@@ -925,6 +1037,87 @@ mod tests {
             );
             assert_eq!(out.block, Some("minecraft:air"), "{block} must melt to air");
         }
+    }
+
+    #[test]
+    fn grass_wood_wet_and_living_plants_always_corrupt_or_burn() {
+        for flavor in [
+            NetherFlavor::CrimsonForest,
+            NetherFlavor::WarpedForest,
+            NetherFlavor::SoulSandValley,
+            NetherFlavor::BasaltDeltas,
+            NetherFlavor::NetherWastes,
+        ] {
+            for x in 0..400 {
+                let grass = transform_block(
+                    [x, 70, x * 3],
+                    "minecraft:grass_block",
+                    "minecraft:air",
+                    "minecraft:dirt",
+                    flavor,
+                    true,
+                );
+                assert!(grass.block.is_some(), "grass_block must never remain uncorrupted grass");
+
+                let moss = transform_block(
+                    [x, 70, x * 5],
+                    "minecraft:moss_block",
+                    "minecraft:air",
+                    "minecraft:stone",
+                    flavor,
+                    true,
+                );
+                assert!(moss.block.is_some(), "moss_block must never remain uncorrupted");
+
+                let oak = transform_block(
+                    [x, 75, x * 7],
+                    "minecraft:oak_log",
+                    "minecraft:oak_leaves",
+                    "minecraft:dirt",
+                    flavor,
+                    true,
+                );
+                assert!(
+                    oak.block.is_some() && oak.block != Some("minecraft:stripped_oak_log"),
+                    "Overworld wood must burn, rot, or warp into Nether material (got {:?})",
+                    oak.block
+                );
+            }
+        }
+
+        for dry_or_burn in [
+            ("minecraft:wet_sponge", "minecraft:sponge"),
+            ("minecraft:wheat", "minecraft:air"),
+            ("minecraft:oak_sapling", "minecraft:air"),
+            ("minecraft:bamboo", "minecraft:air"),
+            ("minecraft:cactus", "minecraft:air"),
+            ("minecraft:hay_block", "minecraft:air"),
+            ("minecraft:dried_kelp_block", "minecraft:air"),
+            ("minecraft:frogspawn", "minecraft:air"),
+        ] {
+            let out = transform_block(
+                [14, 65, -22],
+                dry_or_burn.0,
+                "minecraft:air",
+                "minecraft:dirt",
+                NetherFlavor::NetherWastes,
+                true,
+            );
+            assert_eq!(out.block, Some(dry_or_burn.1));
+        }
+
+        assert_eq!(
+            transform_block(
+                [0, 70, 0],
+                "minecraft:nether_brick_fence",
+                "minecraft:air",
+                "minecraft:nether_bricks",
+                NetherFlavor::CrimsonForest,
+                true,
+            )
+            .block,
+            None
+        );
     }
 
     #[test]
