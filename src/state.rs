@@ -142,6 +142,7 @@ pub struct RiftState {
     pub session_cave_band_cols: HashSet<([i32; 2], i32)>,
     pub last_deepen_probe_tick: HashMap<u64, u64>,
     pub last_priority_focus: HashMap<u64, [i32; 3]>,
+    pub needs_forced_chunk_sync: bool,
     /// Runtime fractional spread accumulators per rift so every corrupted block smoothly
     /// accelerates growth from a very slow crawl up to full speed.
     pub surface_budget_accum: HashMap<u64, f64>,
@@ -214,6 +215,7 @@ impl RiftState {
             session_cave_band_cols: HashSet::new(),
             last_deepen_probe_tick: HashMap::new(),
             last_priority_focus: HashMap::new(),
+            needs_forced_chunk_sync: true,
             surface_budget_accum: HashMap::new(),
             deepen_budget_accum: HashMap::new(),
             pending_melt_fx: Vec::new(),

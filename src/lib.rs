@@ -42,8 +42,8 @@ use mod_api::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-const MAX_CORE_FORCED_CHUNKS: usize = 8;
-const MAX_FRONTIER_FORCED_CHUNKS: usize = 8;
+const MAX_CORE_FORCED_CHUNKS: usize = 16;
+const MAX_FRONTIER_FORCED_CHUNKS: usize = 40;
 
 /// Re-entrancy-safe ingress queues populated by hooks (`block_changed`, `portal_create`, etc.)
 /// without ever holding this lock across a host call.
@@ -161,7 +161,113 @@ fn release_all_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: 
     nether_fob::release_nether_fob_chunks(host, state);
 }
 
+fn push_unique_chunk(dst: &mut Vec<[i32; 2]>, chunk: [i32; 2], core: &HashSet<[i32; 2]>) -> bool {
+    if core.contains(&chunk) || dst.contains(&chunk) {
+        return false;
+    }
+    dst.push(chunk);
+    true
+}
+
+/// Computes bounded core + round-robin frontier/deep-bore forced chunks across ALL active
+/// spreading Rifts so remote portals far from any player keep corrupting both surface terrain
+/// and deep stone all the way down to Bedrock cleanly and evenly.
+pub(crate) fn collect_desired_forced_chunks(state: &RiftState) -> (HashSet<[i32; 2]>, Vec<[i32; 2]>) {
+    let mut desired_core: HashSet<[i32; 2]> = HashSet::new();
+    let mut per_rift_candidates: Vec<Vec<[i32; 2]>> = Vec::new();
+
+    for rift in &state.rifts {
+        if !rift.is_actively_spreading() {
+            continue;
+        }
+        if desired_core.len() < MAX_CORE_FORCED_CHUNKS {
+            desired_core.insert([rift.center[0] >> 4, rift.center[2] >> 4]);
+        }
+
+        let mut cands = Vec::new();
+        if let Some(([x, z], _, _)) = rift.active_column {
+            cands.push([x >> 4, z >> 4]);
+        }
+        let mut added_surf = 0usize;
+        for col in rift.ring_columns.iter().rev().take(64) {
+            let c = [col[0] >> 4, col[1] >> 4];
+            if !cands.contains(&c) {
+                cands.push(c);
+                added_surf += 1;
+                if added_surf >= 4 {
+                    break;
+                }
+            }
+        }
+        if let Some(([x, z], _, _)) = state.active_deepen_columns.get(&rift.id).copied() {
+            let c = [x >> 4, z >> 4];
+            if !cands.contains(&c) {
+                cands.push(c);
+            }
+        }
+        if let Some(([x, z], _, _, _)) = state.active_priority_deepen.get(&rift.id).copied() {
+            let c = [x >> 4, z >> 4];
+            if !cands.contains(&c) {
+                cands.push(c);
+            }
+        }
+        if let Some(q) = state.priority_deepen_cols.get(&rift.id) {
+            let mut added_prio = 0usize;
+            for (col, _, _, _) in q.iter().take(24) {
+                let c = [col[0] >> 4, col[1] >> 4];
+                if !cands.contains(&c) {
+                    cands.push(c);
+                    added_prio += 1;
+                    if added_prio >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut added_deep = 0usize;
+        for col in rift.deepen_columns.iter().rev().take(96) {
+            if state.session_deepened_cols.contains(col) {
+                continue;
+            }
+            let c = [col[0] >> 4, col[1] >> 4];
+            if !cands.contains(&c) {
+                cands.push(c);
+                added_deep += 1;
+                if added_deep >= 3 {
+                    break;
+                }
+            }
+        }
+        per_rift_candidates.push(cands);
+    }
+
+    let mut desired_frontier: Vec<[i32; 2]> = Vec::new();
+    let mut layer = 0usize;
+    loop {
+        if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
+            break;
+        }
+        let mut progressed = false;
+        for list in &per_rift_candidates {
+            if let Some(&chunk) = list.get(layer) {
+                progressed = true;
+                push_unique_chunk(&mut desired_frontier, chunk, &desired_core);
+                if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+        layer += 1;
+    }
+
+    (desired_core, desired_frontier)
+}
+
 fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    state.needs_forced_chunk_sync = false;
     if state.paused || !state.has_uncontained() {
         for chunk in state.core_chunks.drain() {
             if let Some(cref) = level.chunk_ref(host, chunk) {
@@ -176,13 +282,7 @@ fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut Ri
         return;
     }
 
-    let mut desired_core: HashSet<[i32; 2]> = HashSet::new();
-    for rift in &state.rifts {
-        if !rift.is_actively_spreading() || desired_core.len() >= MAX_CORE_FORCED_CHUNKS {
-            continue;
-        }
-        desired_core.insert([rift.center[0] >> 4, rift.center[2] >> 4]);
-    }
+    let (desired_core, desired_frontier) = collect_desired_forced_chunks(state);
 
     let to_drop: Vec<[i32; 2]> = state
         .core_chunks
@@ -202,31 +302,6 @@ fn sync_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: &mut Ri
             && cref.set_forced(host, true)
         {
             state.core_chunks.insert(chunk);
-        }
-    }
-
-    let mut desired_frontier: Vec<[i32; 2]> = Vec::new();
-    for rift in &state.rifts {
-        if !rift.is_actively_spreading() {
-            continue;
-        }
-        if let Some(([x, z], _, _)) = rift.active_column {
-            let c = [x >> 4, z >> 4];
-            if !desired_frontier.contains(&c) {
-                desired_frontier.push(c);
-            }
-        }
-        for col in rift.ring_columns.iter().rev().take(48) {
-            let c = [col[0] >> 4, col[1] >> 4];
-            if !state.core_chunks.contains(&c) && !desired_frontier.contains(&c) {
-                desired_frontier.push(c);
-                if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
-                    break;
-                }
-            }
-        }
-        if desired_frontier.len() >= MAX_FRONTIER_FORCED_CHUNKS {
-            break;
         }
     }
 
@@ -300,6 +375,7 @@ fn register_or_refresh_rift(host: &mut dyn ServerHost, level: LevelRef, state: &
         regress_active_column: None,
     };
     state.rifts.push(rift);
+    state.needs_forced_chunk_sync = true;
     if state.mark_quart_corrupted(centroid) {
         paint_biome_column(level, host, centroid[0], centroid[2], flavor);
     }
@@ -1341,23 +1417,41 @@ fn is_never_waterlogged(id: &str) -> bool {
         || s.ends_with("_leaves")
 }
 
+fn pop_tail_loaded_column(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    cols: &mut Vec<[i32; 2]>,
+    needs_sync: &mut bool,
+) -> Option<[i32; 2]> {
+    let tail_start = cols.len().saturating_sub(24);
+    for idx in (tail_start..cols.len()).rev() {
+        let c = cols[idx];
+        if level.is_loaded(host, [c[0], 64, c[1]]) {
+            return Some(cols.swap_remove(idx));
+        }
+        *needs_sync = true;
+    }
+    None
+}
+
 fn pop_next_loaded_column(
     host: &dyn ServerHost,
     level: LevelRef,
     cols: &mut Vec<[i32; 2]>,
     radius: &mut i32,
     center: [i32; 3],
+    needs_sync: &mut bool,
 ) -> Option<[i32; 2]> {
     for _ in 0..6 {
         if cols.is_empty() {
             *radius += 1;
             *cols = build_ring_columns(center[0], center[2], *radius);
+            *needs_sync = true;
         }
-        if let Some(pos_idx) = cols.iter().rposition(|c| level.is_loaded(host, [c[0], 64, c[1]])) {
-            return Some(cols.swap_remove(pos_idx));
+        if let Some(col) = pop_tail_loaded_column(host, level, cols, needs_sync) {
+            return Some(col);
         }
-        // Keep expanding or waiting if outer ring is still loading; check up to a couple rings.
-        if cols.len() > 64 {
+        if !cols.is_empty() {
             break;
         }
     }
@@ -1618,16 +1712,18 @@ fn corrupt_surface_step(
                     None
                 }
             } else {
-                let r = &mut state.rifts[rift_idx];
-                let mut ring_r = r.ring_radius;
+                let mut ring_r = state.rifts[rift_idx].ring_radius;
+                let mut sync_needed = state.needs_forced_chunk_sync;
                 let picked = pop_next_loaded_column(
                     host,
                     level,
-                    &mut r.ring_columns,
+                    &mut state.rifts[rift_idx].ring_columns,
                     &mut ring_r,
                     rift_center,
+                    &mut sync_needed,
                 );
-                r.ring_radius = ring_r;
+                state.rifts[rift_idx].ring_radius = ring_r;
+                state.needs_forced_chunk_sync = sync_needed;
                 picked
             };
 
@@ -1657,6 +1753,7 @@ fn corrupt_surface_step(
         let pos = [col[0], y, col[1]];
         if !level.is_loaded(host, pos) {
             state.rifts[rift_idx].active_column = None;
+            state.needs_forced_chunk_sync = true;
             break;
         }
 
@@ -1720,6 +1817,7 @@ fn pop_next_deepen_column(
     deepen_radius: &mut i32,
     ring_radius: i32,
     center: [i32; 3],
+    needs_sync: &mut bool,
 ) -> Option<[i32; 2]> {
     let max_r = (ring_radius - 1).max(1);
     for _ in 0..8 {
@@ -1730,14 +1828,12 @@ fn pop_next_deepen_column(
                 *deepen_radius + 1
             };
             *cols = build_ring_columns(center[0], center[2], *deepen_radius);
+            *needs_sync = true;
         }
-        if let Some(pos_idx) = cols
-            .iter()
-            .rposition(|c| level.is_loaded(host, [c[0], 64, c[1]]))
-        {
-            return Some(cols.swap_remove(pos_idx));
+        if let Some(col) = pop_tail_loaded_column(host, level, cols, needs_sync) {
+            return Some(col);
         }
-        if cols.len() > 64 {
+        if !cols.is_empty() {
             break;
         }
     }
@@ -1936,18 +2032,22 @@ fn next_deepen_column_for_stream(
         return None;
     }
 
-    let r = &mut state.rifts[rift_idx];
-    if r.ring_radius <= 2 {
+    let mut sync_needed = state.needs_forced_chunk_sync;
+    if state.rifts[rift_idx].ring_radius <= 2 {
         return None;
     }
-    let mut d_rad = r.deepen_radius.clamp(1, (r.ring_radius - 1).max(1));
+    let mut d_rad = state.rifts[rift_idx]
+        .deepen_radius
+        .clamp(1, (state.rifts[rift_idx].ring_radius - 1).max(1));
+    let ring_radius = state.rifts[rift_idx].ring_radius;
     let mut picked = pop_next_deepen_column(
         host,
         level,
-        &mut r.deepen_columns,
+        &mut state.rifts[rift_idx].deepen_columns,
         &mut d_rad,
-        r.ring_radius,
+        ring_radius,
         rift_center,
+        &mut sync_needed,
     );
     while let Some(c) = picked {
         if !state.session_deepened_cols.contains(&c) {
@@ -1957,14 +2057,16 @@ fn next_deepen_column_for_stream(
         picked = pop_next_deepen_column(
             host,
             level,
-            &mut r.deepen_columns,
+            &mut state.rifts[rift_idx].deepen_columns,
             &mut d_rad,
-            r.ring_radius,
+            ring_radius,
             rift_center,
+            &mut sync_needed,
         );
     }
-    r.deepen_radius = d_rad;
-    r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
+    state.needs_forced_chunk_sync = sync_needed;
+    state.rifts[rift_idx].deepen_radius = d_rad;
+    state.rifts[rift_idx].max_deepen_reached = state.rifts[rift_idx].max_deepen_reached.max(d_rad);
     picked.map(|col| {
         let floor_y = host
             .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::OceanFloor)
@@ -2788,11 +2890,14 @@ impl Hooks for Mod {
         drain_water_evaporation(server, event.level, &mut state);
         step_ocean_shores(server, event.level, &mut state);
 
-        if state.tick % 20 == 0 {
+        if state.tick % 4 == 0 || state.needs_forced_chunk_sync {
             sync_forced_chunks(server, event.level, &mut state);
         }
 
         spread_corruption_tick(server, event.level, &mut state);
+        if state.needs_forced_chunk_sync {
+            sync_forced_chunks(server, event.level, &mut state);
+        }
         emit_melt_evap_fx(server, event.level, &mut state, pal.as_ref());
         mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
         bastion::tick_bastion_emergence(server, event.level, &mut state);
@@ -2971,5 +3076,56 @@ mod tests {
         // Deep interior boils down to seabed (or at most a small 1-3 block volcanic sea-stack).
         let inner = volcanic_shelf_target_y(col, 16.0, seabed, sea_top);
         assert!(inner >= seabed && inner <= seabed + 3, "expected dried seabed/stack, got {inner}");
+    }
+
+    #[test]
+    fn remote_rifts_force_chunks_for_both_surface_and_deep_stone_fairly() {
+        let make_rift = |id: u64, cx: i32, cz: i32, active: bool| RiftSource {
+            id,
+            center: [cx, 64, cz],
+            active_portal: true,
+            contained: !active,
+            flavor: NetherFlavor::CrimsonForest,
+            age_ticks: 1000,
+            corrupted_blocks: 50_000,
+            max_radius_sq: 48 * 48,
+            ring_radius: 48,
+            ring_columns: build_ring_columns(cx, cz, 48),
+            active_column: None,
+            deepen_radius: 24,
+            deepen_columns: build_ring_columns(cx, cz, 24),
+            max_deepen_reached: 24,
+            bastions_placed: 0,
+            outposts_placed: 0,
+            citadel_spawned: false,
+            boss_uuid: None,
+            pacified: false,
+            regressing: false,
+            regress_radius: 0,
+            regress_columns: Vec::new(),
+            regress_active_column: None,
+        };
+
+        let mut st = RiftState::new();
+        st.rifts.push(make_rift(1, 0, 0, true));
+        st.rifts.push(make_rift(2, 5000, 5000, true));
+        st.rifts.push(make_rift(3, -5000, -5000, false));
+
+        let (core, frontier) = collect_desired_forced_chunks(&st);
+        assert!(core.contains(&[0, 0]));
+        assert!(core.contains(&[5000 >> 4, 5000 >> 4]));
+        assert!(!core.contains(&[-5000 >> 4, -5000 >> 4]));
+
+        let r1_surf = st.rifts[0].ring_columns.last().copied().unwrap();
+        let r1_deep = st.rifts[0].deepen_columns.last().copied().unwrap();
+        let r2_surf = st.rifts[1].ring_columns.last().copied().unwrap();
+        let r2_deep = st.rifts[1].deepen_columns.last().copied().unwrap();
+        for col in [r1_surf, r1_deep, r2_surf, r2_deep] {
+            let chunk = [col[0] >> 4, col[1] >> 4];
+            assert!(
+                core.contains(&chunk) || frontier.contains(&chunk),
+                "expected active rift cursor chunk {chunk:?} to be forced"
+            );
+        }
     }
 }
