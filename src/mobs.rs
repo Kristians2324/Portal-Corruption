@@ -1,7 +1,5 @@
 use crate::atmosphere::ParticlePalette;
-use crate::corruption::{
-    is_air_like, is_nether_terrain_block, is_open_space, is_water_like, transform_block,
-};
+use crate::corruption::{is_air_like, is_open_space, is_water_like, transform_block};
 use crate::state::RiftState;
 use crate::types::{
     NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, dist_sq, horiz_dist_sq,
@@ -397,6 +395,16 @@ pub fn should_corrupt_kill_patch(
 ) -> bool {
     (attacker_is_nether && !victim_is_nether)
         || (victim_is_nether && attacker_has_id && !attacker_is_player)
+}
+
+/// True when any non-Nether mob dies by Nether hands OR inside/near an active spreading Rift front
+/// or Nether battle (covering Blaze/Ghast fire, knockback falls, and kills on uncorrupted border land).
+pub fn should_corrupt_non_nether_death(
+    victim_is_nether: bool,
+    attacker_is_nether: bool,
+    near_active_nether_front: bool,
+) -> bool {
+    !victim_is_nether && (attacker_is_nether || near_active_nether_front)
 }
 
 /// Maps any Overworld creature killed by Nether mobs (or dying inside an established
@@ -1076,7 +1084,58 @@ fn resolve_mob_block_cached(
     Some(bs)
 }
 
-/// Scorches an organic ~3-block patch of uncorrupted land beneath a Nether battle kill.
+#[derive(Clone, Debug)]
+pub struct PendingDeath {
+    pub kind: String,
+    pub pos: [f64; 3],
+    pub attacker_id: Option<u32>,
+    pub attacker_is_player: bool,
+    pub attacker_is_nether_kind: bool,
+}
+
+/// Captures a mob death before deferring it across a lock-contended tick (for example when
+/// `magma_cube.hurt()` inside `tick_mobs` triggers `living_death` re-entrantly).
+pub fn extract_living_death(
+    host: &dyn ServerHost,
+    event: &LivingDeathEvent<'_>,
+) -> Option<PendingDeath> {
+    if strip_ns(event.kind) == "player" {
+        return None;
+    }
+    let ow = host.level(OVERWORLD)?;
+    if host
+        .entity(event.entity)
+        .and_then(|e| e.level(host))
+        .is_some_and(|l| l != ow)
+    {
+        return None;
+    }
+    let pos = host
+        .entity(event.entity)
+        .and_then(|e| e.position(host))
+        .or(event.source.position)?;
+    let attacker_id = u32::try_from(event.source.causing)
+        .ok()
+        .filter(|&v| v > 0)
+        .or_else(|| u32::try_from(event.source.direct).ok().filter(|&v| v > 0));
+    let attacker_kind = attacker_id.and_then(|aid| host.entity(aid).and_then(|e| e.kind(host)));
+    let attacker_is_player = attacker_kind
+        .as_ref()
+        .is_some_and(|k| strip_ns(&k.id(host)) == "player");
+    let attacker_is_nether_kind = attacker_kind.as_ref().is_some_and(|k| {
+        let kid = k.id(host);
+        is_nether_predator(&kid) || strip_ns(&kid) == "wither"
+    });
+    Some(PendingDeath {
+        kind: event.kind.to_owned(),
+        pos,
+        attacker_id,
+        attacker_is_player,
+        attacker_is_nether_kind,
+    })
+}
+
+/// Scorches an organic ~3-block patch of uncorrupted land beneath a mob death.
 fn corrupt_kill_patch(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -1094,14 +1153,6 @@ fn corrupt_kill_patch(
         return;
     }
 
-    let ground_block = level
-        .block(host, [bp[0], (bp[1] - 1).max(OVERWORLD_MIN_Y), bp[2]])
-        .map(|k| k.id(host))
-        .unwrap_or_default();
-    if state.is_quart_corrupted(bp) && is_nether_terrain_block(&ground_block) {
-        return;
-    }
-
     let nearest = state
         .rifts
         .iter()
@@ -1114,7 +1165,7 @@ fn corrupt_kill_patch(
         .unwrap_or_else(|| NetherFlavor::pick_for_region(bp[0], bp[2], state.seed));
     let mature = nearest.is_some_and(|(_, r)| r.corrupted_blocks >= 35_000 || r.age_ticks >= 5_000);
 
-    let min_y = (bp[1] - 3).max(OVERWORLD_MIN_Y + 1);
+    let min_y = (bp[1] - 4).max(OVERWORLD_MIN_Y + 1);
     let max_y = (bp[1] + 2).min(OVERWORLD_MAX_Y - 1);
     let mut converted_here = 0u64;
 
@@ -1206,62 +1257,83 @@ fn corrupt_kill_patch(
     }
 }
 
-/// Converts any Overworld creature killed by a Nether mob (or slain inside an already-large
-/// corrupted Nether biome) into its Nether version on death, and corrupts uncorrupted terrain
-/// underneath Nether battle kills.
-pub fn handle_living_death(
+fn is_near_active_nether_front(
+    host: &dyn ServerHost,
+    state: &RiftState,
+    bp: [i32; 3],
+) -> bool {
+    let in_healing_zone = state.rifts.iter().any(|r| {
+        (r.pacified || r.regressing) && horiz_dist_sq(r.center, bp) <= r.max_radius_sq.max(48 * 48)
+    });
+    if in_healing_zone {
+        return false;
+    }
+    if state.is_quart_corrupted(bp) {
+        return true;
+    }
+    if state.rifts.iter().any(|r| {
+        r.is_actively_spreading()
+            && horiz_dist_sq(r.center, bp) <= i64::from(r.ring_radius.max(8) + 96).pow(2)
+    }) {
+        return true;
+    }
+    state.known_nether_mobs.iter().any(|&nid| {
+        host.entity(nid)
+            .and_then(|e| e.position(host))
+            .is_some_and(|np| {
+                horiz_dist_sq(
+                    [np[0].floor() as i32, np[1].floor() as i32, np[2].floor() as i32],
+                    bp,
+                ) <= 32 * 32
+            })
+    })
+}
+
+/// Applies kill-patch corruption and Nether death conversion for a captured Overworld death event
+/// (used both immediately by `handle_living_death` and when drained from `pending_deaths`).
+pub fn apply_living_death(
     host: &mut dyn ServerHost,
+    level: LevelRef,
     state: &mut RiftState,
-    event: &LivingDeathEvent<'_>,
+    death: &PendingDeath,
     particles: Option<&ParticlePalette>,
 ) {
-    if strip_ns(event.kind) == "player" {
-        return;
-    }
-    let Some(level) = host.level(OVERWORLD) else {
-        return;
-    };
-    let Some(pos) = host
-        .entity(event.entity)
-        .and_then(|e| e.position(host))
-        .or(event.source.position)
-    else {
-        return;
-    };
+    let pos = death.pos;
     let bp = [
         pos[0].floor() as i32,
         pos[1].floor() as i32,
         pos[2].floor() as i32,
     ];
 
-    let attacker_id = u32::try_from(event.source.causing)
-        .ok()
-        .filter(|&v| v > 0)
-        .or_else(|| u32::try_from(event.source.direct).ok().filter(|&v| v > 0));
-
-    let victim_is_nether = is_nether_predator(event.kind) || strip_ns(event.kind) == "strider";
-    let attacker_kind = attacker_id.and_then(|aid| host.entity(aid).and_then(|e| e.kind(host)));
-    let attacker_is_player = attacker_kind
-        .as_ref()
-        .is_some_and(|k| strip_ns(&k.id(host)) == "player");
-    let attacker_is_nether = attacker_id.is_some_and(|aid| {
-        state.known_nether_mobs.contains(&aid)
-            || state.nether_touched_mobs.contains(&aid)
-            || attacker_kind
-                .as_ref()
-                .is_some_and(|k| is_nether_predator(&k.id(host)))
-    });
+    let biome_flavor = local_corrupt_flavor(host, level, bp);
+    let victim_is_nether = is_nether_predator(&death.kind)
+        || matches!(strip_ns(&death.kind), "strider" | "wither")
+        || (strip_ns(&death.kind) == "enderman"
+            && matches!(
+                biome_flavor,
+                Some(NetherFlavor::WarpedForest | NetherFlavor::SoulSandValley)
+            ));
+    let attacker_is_nether = death.attacker_is_nether_kind
+        || death.attacker_id.is_some_and(|aid| {
+            state.known_nether_mobs.contains(&aid) || state.nether_touched_mobs.contains(&aid)
+        });
+    let near_active_front = if !victim_is_nether && !attacker_is_nether {
+        is_near_active_nether_front(host, state, bp)
+    } else {
+        false
+    };
 
     if should_corrupt_kill_patch(
         attacker_is_nether,
         victim_is_nether,
-        attacker_id.is_some(),
-        attacker_is_player,
-    ) {
+        death.attacker_id.is_some(),
+        death.attacker_is_player,
+    ) || should_corrupt_non_nether_death(victim_is_nether, attacker_is_nether, near_active_front)
+    {
         corrupt_kill_patch(host, level, state, bp, particles);
     }
 
-    let Some(target_kind) = nether_death_conversion_target(event.kind) else {
+    let Some(target_kind) = nether_death_conversion_target(&death.kind) else {
         return;
     };
 
@@ -1313,6 +1385,24 @@ pub fn handle_living_death(
         0.3,
         0.85,
     );
+}
+
+/// Converts any Overworld creature killed by a Nether mob (or slain inside an already-large
+/// corrupted Nether biome) into its Nether version on death, and corrupts uncorrupted terrain
+/// underneath dying Overworld mobs near active fronts or killed in Nether combat.
+pub fn handle_living_death(
+    host: &mut dyn ServerHost,
+    state: &mut RiftState,
+    event: &LivingDeathEvent<'_>,
+    particles: Option<&ParticlePalette>,
+) {
+    let Some(level) = host.level(OVERWORLD) else {
+        return;
+    };
+    let Some(death) = extract_living_death(host, event) else {
+        return;
+    };
+    apply_living_death(host, level, state, &death, particles);
 }
 
 /// Hoglins act as border vanguard: near the edge of corrupted land they root
@@ -2607,5 +2697,12 @@ mod tests {
         assert!(!should_corrupt_kill_patch(false, false, true, false));
         // Natural despawn / fall with no attacker does not trigger a kill patch.
         assert!(!should_corrupt_kill_patch(false, true, false, false));
+
+        // Non-Nether mob dying anywhere near active Nether front / fighting Nether mobs OR slain
+        // by a Nether attacker always scorches a small patch; far away peaceful kills do not.
+        assert!(should_corrupt_non_nether_death(false, true, false));
+        assert!(should_corrupt_non_nether_death(false, false, true));
+        assert!(!should_corrupt_non_nether_death(false, false, false));
+        assert!(!should_corrupt_non_nether_death(true, false, true));
     }
 }

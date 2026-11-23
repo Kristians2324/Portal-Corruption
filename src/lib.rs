@@ -53,6 +53,7 @@ struct HookQueues {
     pending_containment_checks: Vec<[i32; 3]>,
     pending_water_evap: Vec<[i32; 3]>,
     pending_bucket_evap: Vec<(u128, [i32; 3])>,
+    pending_deaths: Vec<mobs::PendingDeath>,
 }
 
 impl HookQueues {
@@ -2694,17 +2695,22 @@ impl Hooks for Mod {
 
     fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
         let pal = self.particles.lock().ok().and_then(|g| *g);
-        if let Ok(mut state) = self.state.try_lock()
-            && !regression::try_handle_boss_death(
+        if let Ok(mut state) = self.state.try_lock() {
+            if !regression::try_handle_boss_death(
                 host,
                 &mut state,
                 event.entity,
                 event.kind,
                 event.source.position,
                 pal.as_ref(),
-            )
+            ) {
+                mobs::handle_living_death(host, &mut state, event, pal.as_ref());
+            }
+        } else if let Some(pd) = mobs::extract_living_death(host, event)
+            && let Ok(mut q) = self.queues.lock()
         {
-            mobs::handle_living_death(host, &mut state, event, pal.as_ref());
+            // Deferred when a synchronous `hurt()` call inside `tick_mobs` holds `self.state`.
+            q.pending_deaths.push(pd);
         }
         Flow::Continue
     }
@@ -2987,7 +2993,7 @@ impl Hooks for Mod {
             return;
         };
         ensure_world_initialized(server, &mut state);
-        let bucket_evap = if let Some(q) = drained {
+        let (bucket_evap, pre_deaths) = if let Some(q) = drained {
             state.pending_portals.extend(q.pending_portals);
             state
                 .pending_containment_checks
@@ -2995,11 +3001,15 @@ impl Hooks for Mod {
             for wp in q.pending_water_evap {
                 state.queue_water_evap(wp);
             }
-            q.pending_bucket_evap
+            (q.pending_bucket_evap, q.pending_deaths)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         state.tick = state.tick.wrapping_add(1);
+
+        for pd in pre_deaths {
+            mobs::apply_living_death(server, event.level, &mut state, &pd, pal.as_ref());
+        }
 
         while let Some(pos) = state.pending_portals.pop_front() {
             register_or_refresh_rift(server, event.level, &mut state, pos);
@@ -3020,6 +3030,15 @@ impl Hooks for Mod {
         }
         emit_melt_evap_fx(server, event.level, &mut state, pal.as_ref());
         mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
+        let same_tick_deaths = self
+            .queues
+            .lock()
+            .ok()
+            .map(|mut q| std::mem::take(&mut q.pending_deaths))
+            .unwrap_or_default();
+        for pd in same_tick_deaths {
+            mobs::apply_living_death(server, event.level, &mut state, &pd, pal.as_ref());
+        }
         bastion::tick_bastion_emergence(server, event.level, &mut state);
         outposts::tick_outposts(server, event.level, &mut state);
         citadel::tick_citadel_emergence(server, event.level, &mut state);
