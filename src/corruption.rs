@@ -250,6 +250,8 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
             | "polished_blackstone_wall"
             | "polished_blackstone_stairs"
             | "polished_blackstone_slab"
+            | "polished_blackstone_button"
+            | "polished_blackstone_pressure_plate"
             | "polished_blackstone_brick_wall"
             | "polished_blackstone_brick_stairs"
             | "polished_blackstone_brick_slab"
@@ -262,12 +264,22 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
             | "stripped_warped_stem"
             | "crimson_hyphae"
             | "warped_hyphae"
+            | "stripped_crimson_hyphae"
+            | "stripped_warped_hyphae"
             | "crimson_planks"
             | "warped_planks"
             | "crimson_fence"
             | "warped_fence"
             | "crimson_fence_gate"
             | "warped_fence_gate"
+            | "crimson_door"
+            | "warped_door"
+            | "crimson_trapdoor"
+            | "warped_trapdoor"
+            | "crimson_button"
+            | "warped_button"
+            | "crimson_pressure_plate"
+            | "warped_pressure_plate"
             | "crimson_stairs"
             | "warped_stairs"
             | "crimson_slab"
@@ -298,7 +310,7 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
 /// pass converts before moving to the next column on the circular ring.
 /// Penetrates deep through surface dirt and upper cave stone immediately, while the
 /// dedicated deep-boring pass drives all the way down to Bedrock (`-63`).
-pub const SURFACE_CRUST_DEPTH: i32 = 22;
+pub const SURFACE_CRUST_DEPTH: i32 = 32;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
 /// Normal surface/mountain portals sweep from the column's highest block (up to `Y = 319`)
@@ -340,7 +352,7 @@ pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
 /// Keeps underground work concentrated inside 1–2 columns per tick so shader/client chunk
 /// meshing stays smooth without multi-chunk hitching.
 pub fn effective_deepen_budget(base_budget: usize, ring_radius: i32) -> usize {
-    (effective_rift_budget(base_budget, ring_radius) * 2 + 6).clamp(24, 68)
+    (effective_rift_budget(base_budget, ring_radius) * 3 + 16).clamp(32, 128)
 }
 
 /// Continuous per-tick surface corruption speed: starts at a slow eerie crawl (~0.08 blocks/tick)
@@ -375,7 +387,7 @@ pub fn rift_deepen_ops_per_tick(
     let scale = (base_budget.max(1) as f64) / 14.0;
     let b = corrupted_blocks as f64;
     let sqrt_ramp = (b + 25.0).sqrt() - 5.0;
-    let raw = (0.08 + b * 0.00025 + sqrt_ramp * 0.085) * scale * 2.2;
+    let raw = (0.08 + b * 0.00025 + sqrt_ramp * 0.085) * scale * 3.4;
     let max_deep = effective_deepen_budget(base_budget, ring_radius) as f64;
     raw.min(max_deep).max(0.10 * scale)
 }
@@ -524,29 +536,145 @@ fn is_burnable_overworld_growth(short: &str) -> bool {
     )
 }
 
+fn is_overworld_wood_prefix(prefix: &str) -> bool {
+    let base = prefix.strip_prefix("stripped_").unwrap_or(prefix);
+    matches!(
+        base,
+        "oak"
+            | "spruce"
+            | "birch"
+            | "jungle"
+            | "acacia"
+            | "dark_oak"
+            | "mangrove"
+            | "cherry"
+            | "pale_oak"
+            | "bamboo"
+            | "bamboo_mosaic"
+    )
+}
+
+fn is_overworld_masonry_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix,
+        "stone"
+            | "smooth_stone"
+            | "cobblestone"
+            | "mossy_cobblestone"
+            | "stone_brick"
+            | "mossy_stone_brick"
+            | "andesite"
+            | "polished_andesite"
+            | "diorite"
+            | "polished_diorite"
+            | "granite"
+            | "polished_granite"
+            | "deepslate"
+            | "cobbled_deepslate"
+            | "polished_deepslate"
+            | "deepslate_brick"
+            | "deepslate_tile"
+            | "tuff"
+            | "polished_tuff"
+            | "tuff_brick"
+            | "sandstone"
+            | "cut_sandstone"
+            | "smooth_sandstone"
+            | "red_sandstone"
+            | "cut_red_sandstone"
+            | "smooth_red_sandstone"
+            | "brick"
+            | "mud_brick"
+            | "prismarine"
+            | "prismarine_brick"
+            | "dark_prismarine"
+    )
+}
+
+fn pick_warped_wood_replacement(
+    crimson_id: &'static str,
+    warped_id: &'static str,
+    dark_id: &'static str,
+    allow_burn: bool,
+    flavor: NetherFlavor,
+    h: u64,
+) -> &'static str {
+    let roll = h % 20;
+    if allow_burn && roll == 19 {
+        return "minecraft:air";
+    }
+    match flavor {
+        NetherFlavor::WarpedForest => {
+            if allow_burn && roll == 18 {
+                dark_id
+            } else {
+                warped_id
+            }
+        }
+        NetherFlavor::SoulSandValley | NetherFlavor::BasaltDeltas => match roll {
+            0..=10 => dark_id,
+            11..=17 => crimson_id,
+            _ if allow_burn => "minecraft:air",
+            _ => dark_id,
+        },
+        NetherFlavor::CrimsonForest | NetherFlavor::NetherWastes => match roll {
+            0..=15 => crimson_id,
+            16..=17 => dark_id,
+            _ if allow_burn => "minecraft:air",
+            _ => dark_id,
+        },
+    }
+}
+
 fn transform_wood_and_foliage(
     short: &str,
     flavor: NetherFlavor,
     h: u64,
 ) -> Option<TransformOutcome> {
+    let is_stripped_overworld_log = short
+        .strip_suffix("_log")
+        .or_else(|| short.strip_suffix("_wood"))
+        .is_some_and(|p| p.starts_with("stripped_") && is_overworld_wood_prefix(p))
+        || short == "stripped_bamboo_block";
+
     let is_overworld_log = ((short.ends_with("_log") || short.ends_with("_wood"))
         && !short.starts_with("crimson_")
-        && !short.starts_with("warped_"))
+        && !short.starts_with("warped_")
+        && !short.starts_with("stripped_crimson_")
+        && !short.starts_with("stripped_warped_"))
         || matches!(
             short,
             "mangrove_roots" | "bamboo_block" | "stripped_bamboo_block" | "mushroom_stem"
         );
     if is_overworld_log {
         // Wood always burns, rots away, or warps into Nether stems / charred basalt — never stays Overworld wood.
+        let (crimson_stem, warped_stem) = if is_stripped_overworld_log {
+            if short.ends_with("_wood") {
+                (
+                    "minecraft:stripped_crimson_hyphae",
+                    "minecraft:stripped_warped_hyphae",
+                )
+            } else {
+                (
+                    "minecraft:stripped_crimson_stem",
+                    "minecraft:stripped_warped_stem",
+                )
+            }
+        } else if short.ends_with("_wood") {
+            ("minecraft:crimson_hyphae", "minecraft:warped_hyphae")
+        } else {
+            ("minecraft:crimson_stem", "minecraft:warped_stem")
+        };
+
         let roll = h % 20;
         let replacement = match flavor {
             NetherFlavor::CrimsonForest => match roll {
-                0..=11 => "minecraft:crimson_stem",
+                0..=11 => crimson_stem,
                 12..=16 => "minecraft:basalt",
                 _ => "minecraft:air",
             },
             NetherFlavor::WarpedForest => match roll {
-                0..=11 => "minecraft:warped_stem",
+                0..=11 => warped_stem,
                 12..=16 => "minecraft:basalt",
                 _ => "minecraft:air",
             },
@@ -556,12 +684,128 @@ fn transform_wood_and_foliage(
                 _ => "minecraft:air",
             },
             NetherFlavor::NetherWastes => match roll {
-                0..=4 => "minecraft:crimson_stem",
+                0..=4 => crimson_stem,
                 5..=12 => "minecraft:basalt",
                 _ => "minecraft:air",
             },
         };
         return Some(TransformOutcome::replace(replacement));
+    }
+
+    if (short.ends_with("_planks")
+        || short == "bamboo_mosaic")
+        && !short.starts_with("crimson_")
+        && !short.starts_with("warped_")
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_planks",
+            "minecraft:warped_planks",
+            "minecraft:blackstone",
+            true,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_stairs")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_stairs",
+            "minecraft:warped_stairs",
+            "minecraft:blackstone_stairs",
+            true,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_slab")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_slab",
+            "minecraft:warped_slab",
+            "minecraft:blackstone_slab",
+            true,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_fence_gate")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_fence_gate",
+            "minecraft:warped_fence_gate",
+            "minecraft:crimson_fence_gate",
+            true,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_fence")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_fence",
+            "minecraft:warped_fence",
+            "minecraft:nether_brick_fence",
+            false,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_trapdoor")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_trapdoor",
+            "minecraft:warped_trapdoor",
+            "minecraft:crimson_trapdoor",
+            true,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_door")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(if flavor == NetherFlavor::WarpedForest {
+            "minecraft:warped_door"
+        } else {
+            "minecraft:crimson_door"
+        }));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_button")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_button",
+            "minecraft:warped_button",
+            "minecraft:polished_blackstone_button",
+            false,
+            flavor,
+            h,
+        )));
+    }
+
+    if let Some(prefix) = short.strip_suffix("_pressure_plate")
+        && is_overworld_wood_prefix(prefix)
+    {
+        return Some(TransformOutcome::replace(pick_warped_wood_replacement(
+            "minecraft:crimson_pressure_plate",
+            "minecraft:warped_pressure_plate",
+            "minecraft:polished_blackstone_pressure_plate",
+            false,
+            flavor,
+            h,
+        )));
     }
 
     if short.ends_with("_leaves")
@@ -612,8 +856,16 @@ fn transform_stone_family(
         short,
         "deepslate"
             | "cobbled_deepslate"
+            | "polished_deepslate"
+            | "chiseled_deepslate"
+            | "cracked_deepslate_bricks"
+            | "cracked_deepslate_tiles"
             | "infested_deepslate"
             | "tuff"
+            | "polished_tuff"
+            | "tuff_bricks"
+            | "chiseled_tuff"
+            | "chiseled_tuff_bricks"
             | "sculk"
             | "sculk_catalyst"
             | "sculk_sensor"
@@ -623,17 +875,29 @@ fn transform_stone_family(
     let normal_rock = matches!(
         short,
         "stone"
+            | "smooth_stone"
             | "infested_stone"
             | "infested_cobblestone"
             | "infested_stone_bricks"
             | "granite"
+            | "polished_granite"
             | "diorite"
+            | "polished_diorite"
             | "andesite"
+            | "polished_andesite"
             | "calcite"
             | "dripstone_block"
             | "pointed_dripstone"
             | "sandstone"
+            | "cut_sandstone"
+            | "chiseled_sandstone"
+            | "smooth_sandstone"
             | "red_sandstone"
+            | "cut_red_sandstone"
+            | "chiseled_red_sandstone"
+            | "smooth_red_sandstone"
+            | "bricks"
+            | "mud_bricks"
             | "packed_mud"
             | "terracotta"
     ) || short.ends_with("_terracotta");
@@ -642,15 +906,14 @@ fn transform_stone_family(
         return None;
     }
 
-    // Upper rock leaves ~2% rare Overworld stone/cobble scars; mid/deep rock leaves slightly
-    // more (~8-14%) weathered Overworld remnants since deep earth resists full penetration while
-    // still keeping underground stone heavily corrupted (~86-92%).
+    // Overwhelmingly corrupts surface, cliff, and subterranean rock (~95-98%), leaving only
+    // rare 2-5% weathered Overworld rock traces underground so caves & shafts clearly burn Nether.
     let scar_pct = if pos[1] >= 36 {
         2
     } else if pos[1] >= 0 {
-        8
+        4
     } else {
-        14
+        5
     };
     if in_remnant_cluster(pos, 0x5CA2_1001, scar_pct) {
         if short == "stone" && h % 2 == 0 {
@@ -865,6 +1128,51 @@ pub fn transform_block(
         });
     }
 
+    // Shovel-flattened village/trail paths (`dirt_path`): corrupt the majority (~76%) into
+    // scarred hell-tracks while leaving ~24% flattened path traces behind.
+    if short == "dirt_path" {
+        if in_remnant_cluster(pos, 0x5CA2_7A74, 24) {
+            return TransformOutcome::unchanged(true);
+        }
+        let block = match flavor {
+            NetherFlavor::SoulSandValley => {
+                if h % 4 == 0 {
+                    "minecraft:cracked_polished_blackstone_bricks"
+                } else {
+                    "minecraft:soul_soil"
+                }
+            }
+            NetherFlavor::BasaltDeltas => {
+                if h % 2 == 0 {
+                    "minecraft:basalt"
+                } else {
+                    "minecraft:blackstone"
+                }
+            }
+            NetherFlavor::WarpedForest => match h % 6 {
+                0..=2 => "minecraft:netherrack",
+                3..=4 => "minecraft:soul_soil",
+                _ => "minecraft:warped_nylium",
+            },
+            NetherFlavor::CrimsonForest | NetherFlavor::NetherWastes => match h % 6 {
+                0..=2 => "minecraft:netherrack",
+                3 => "minecraft:soul_soil",
+                4 => "minecraft:cracked_polished_blackstone_bricks",
+                _ => "minecraft:crimson_nylium",
+            },
+        };
+        return TransformOutcome::replace(block);
+    }
+
+    // Wet cultivated village farmland always rots/dries away completely.
+    if short == "farmland" {
+        return TransformOutcome::replace(match flavor {
+            NetherFlavor::SoulSandValley | NetherFlavor::BasaltDeltas => "minecraft:soul_soil",
+            _ if h % 3 == 0 => "minecraft:soul_soil",
+            _ => "minecraft:netherrack",
+        });
+    }
+
     if matches!(short, "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel") {
         if in_remnant_cluster(pos, 0x5CA2_3003, 2) {
             return TransformOutcome::unchanged(true);
@@ -877,21 +1185,21 @@ pub fn transform_block(
         return TransformOutcome::replace(block);
     }
 
-    // Overworld common ores (mostly converted into Nether ores, small fraction left scarred).
+    // Overworld common ores (90% converted into Nether ores, tiny fraction left scarred).
     if matches!(short, "coal_ore" | "deepslate_coal_ore" | "copper_ore" | "deepslate_copper_ore") {
-        if h % 3 != 0 {
+        if h % 10 != 0 {
             return TransformOutcome::replace("minecraft:nether_quartz_ore");
         }
         return TransformOutcome::unchanged(true);
     }
     if matches!(short, "iron_ore" | "deepslate_iron_ore" | "gold_ore" | "deepslate_gold_ore") {
-        if h % 3 != 0 {
+        if h % 10 != 0 {
             return TransformOutcome::replace("minecraft:nether_gold_ore");
         }
         return TransformOutcome::unchanged(true);
     }
 
-    // Built Overworld structures: scarred bricks and Nether planks.
+    // Built Overworld stonework & village masonry (full blocks, stairs, slabs, walls).
     if matches!(
         short,
         "cobblestone"
@@ -915,24 +1223,46 @@ pub fn transform_block(
         return TransformOutcome::replace(block);
     }
 
-    if short.ends_with("_planks") && !short.starts_with("crimson_") && !short.starts_with("warped_") {
-        let plank = match flavor {
-            NetherFlavor::WarpedForest => "minecraft:warped_planks",
-            _ => "minecraft:crimson_planks",
+    if let Some(prefix) = short.strip_suffix("_stairs")
+        && is_overworld_masonry_prefix(prefix)
+    {
+        if in_remnant_cluster(pos, 0x5CA2_4004, 2) {
+            return TransformOutcome::unchanged(true);
+        }
+        let block = match h % 12 {
+            0..=4 => "minecraft:blackstone_stairs",
+            5..=9 => "minecraft:polished_blackstone_brick_stairs",
+            _ => "minecraft:nether_brick_stairs",
         };
-        return TransformOutcome::replace(plank);
+        return TransformOutcome::replace(block);
     }
 
-    if short.ends_with("_fence")
-        && !short.starts_with("crimson_")
-        && !short.starts_with("warped_")
-        && !short.starts_with("nether_brick_")
+    if let Some(prefix) = short.strip_suffix("_slab")
+        && is_overworld_masonry_prefix(prefix)
     {
-        let fence = match flavor {
-            NetherFlavor::WarpedForest => "minecraft:warped_fence",
-            _ => "minecraft:crimson_fence",
+        if in_remnant_cluster(pos, 0x5CA2_4004, 2) {
+            return TransformOutcome::unchanged(true);
+        }
+        let block = match h % 12 {
+            0..=4 => "minecraft:blackstone_slab",
+            5..=9 => "minecraft:polished_blackstone_brick_slab",
+            _ => "minecraft:nether_brick_slab",
         };
-        return TransformOutcome::replace(fence);
+        return TransformOutcome::replace(block);
+    }
+
+    if let Some(prefix) = short.strip_suffix("_wall")
+        && is_overworld_masonry_prefix(prefix)
+    {
+        if in_remnant_cluster(pos, 0x5CA2_4004, 2) {
+            return TransformOutcome::unchanged(true);
+        }
+        let block = match h % 12 {
+            0..=4 => "minecraft:blackstone_wall",
+            5..=9 => "minecraft:polished_blackstone_brick_wall",
+            _ => "minecraft:nether_brick_wall",
+        };
+        return TransformOutcome::replace(block);
     }
 
     if let Some(stone_out) = transform_stone_family(short, pos, below, flavor, rift_mature, h) {
@@ -1289,10 +1619,12 @@ mod tests {
         assert_eq!(min_y, 64 - SURFACE_CRUST_DEPTH);
 
         // Portal on mountain base (y=90) expanding UP onto a y=240 snowy peak:
-        // must NOT clip top_y at 128 or 90+12, and must sweep down sheer cliff face to neighbor y=215!
+        // must NOT clip top_y at 128 or 90+12, and sweeps through both full crust and sheer cliffs!
         let (peak_top, peak_min) = surface_column_y_range(90, false, 240, 240, 215);
         assert_eq!(peak_top, 242);
-        assert_eq!(peak_min, 213);
+        assert_eq!(peak_min, 240 - SURFACE_CRUST_DEPTH);
+        let (_, cliff_min) = surface_column_y_range(90, false, 240, 240, 200);
+        assert_eq!(cliff_min, 204);
 
         // Tall tree canopy: WorldSurface=82, OceanFloor=64 -> sweeps canopy AND reaches ground crust.
         let (tree_top, tree_min) = surface_column_y_range(64, false, 82, 64, 64);
@@ -1430,5 +1762,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn village_wood_stairs_slabs_doors_and_paths_corrupt_accurately() {
+        let village_wood = [
+            "minecraft:oak_planks",
+            "minecraft:spruce_planks",
+            "minecraft:stripped_oak_log",
+            "minecraft:dark_oak_wood",
+            "minecraft:oak_stairs",
+            "minecraft:spruce_stairs",
+            "minecraft:birch_slab",
+            "minecraft:oak_fence",
+            "minecraft:oak_fence_gate",
+            "minecraft:oak_door",
+            "minecraft:spruce_trapdoor",
+            "minecraft:farmland",
+        ];
+        for flavor in [
+            NetherFlavor::CrimsonForest,
+            NetherFlavor::WarpedForest,
+            NetherFlavor::SoulSandValley,
+            NetherFlavor::BasaltDeltas,
+            NetherFlavor::NetherWastes,
+        ] {
+            for block in village_wood {
+                for x in 0..40 {
+                    let out = transform_block(
+                        [x * 3, 66, x - 5],
+                        block,
+                        "minecraft:air",
+                        "minecraft:dirt",
+                        flavor,
+                        true,
+                    );
+                    assert!(
+                        out.block.is_some(),
+                        "{block} must always corrupt in {flavor:?}, never stay Overworld"
+                    );
+                }
+            }
+        }
+
+        for masonry in [
+            "minecraft:cobblestone_stairs",
+            "minecraft:cobblestone_slab",
+            "minecraft:cobblestone_wall",
+            "minecraft:stone_brick_stairs",
+            "minecraft:smooth_stone",
+            "minecraft:smooth_stone_slab",
+            "minecraft:andesite_stairs",
+            "minecraft:tuff_bricks",
+        ] {
+            let mut conv = 0;
+            for x in 0..100 {
+                let out = transform_block(
+                    [x, 68, x * 2],
+                    masonry,
+                    "minecraft:air",
+                    "minecraft:stone",
+                    NetherFlavor::NetherWastes,
+                    true,
+                );
+                if out.block.is_some() {
+                    conv += 1;
+                }
+            }
+            assert!(
+                conv >= 90,
+                "{masonry} should overwhelmingly corrupt (got {conv}/100)"
+            );
+        }
+
+        let mut path_corrupted = 0;
+        let mut path_preserved = 0;
+        for x in 0..400 {
+            let out = transform_block(
+                [x, 65, (x * 7) % 131],
+                "minecraft:dirt_path",
+                "minecraft:air",
+                "minecraft:dirt",
+                NetherFlavor::CrimsonForest,
+                true,
+            );
+            if out.block.is_some() {
+                path_corrupted += 1;
+            } else if out.is_corrupt {
+                path_preserved += 1;
+            }
+        }
+        assert!(
+            path_corrupted >= 250 && path_preserved >= 40,
+            "dirt_path should mostly corrupt while leaving traces (corrupted={path_corrupted}, preserved={path_preserved})"
+        );
     }
 }

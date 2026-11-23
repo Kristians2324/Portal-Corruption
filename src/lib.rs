@@ -1410,6 +1410,38 @@ fn portal_is_underground(host: &mut dyn ServerHost, rift_center: [i32; 3]) -> bo
 }
 
 /// Applies one block corruption step at `pos` and returns `true` if a block changed.
+fn capture_structural_properties(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    current: &str,
+) -> Vec<(&'static str, String)> {
+    let short = strip_ns(current);
+    let keys: &[&str] = if short.ends_with("_stairs") {
+        &["facing", "half", "shape"]
+    } else if short.ends_with("_slab") {
+        &["type"]
+    } else if short.ends_with("_door") {
+        &["facing", "half", "open", "hinge"]
+    } else if short.ends_with("_trapdoor") {
+        &["facing", "half", "open"]
+    } else if short.ends_with("_fence_gate") {
+        &["facing", "open"]
+    } else if short.ends_with("_log") || short.ends_with("_wood") {
+        &["axis"]
+    } else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(keys.len());
+    for &key in keys {
+        if let Some(val) = level.block_property(host, pos, key) {
+            out.push((key, val));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_corruption_at(
     host: &mut dyn ServerHost,
@@ -1458,6 +1490,11 @@ fn apply_corruption_at(
     }
 
     let mut out = transform_block(pos, current, &above, &below, local_flavor, mature);
+    let preserved_props = if out.block.is_some_and(|t| t != "minecraft:air") {
+        capture_structural_properties(host, level, pos, current)
+    } else {
+        Vec::new()
+    };
 
     let is_water_or_frozen = is_water_like(current) || is_snow_or_ice(current);
     let mut quenched_berm = false;
@@ -1479,8 +1516,14 @@ fn apply_corruption_at(
     if let Some(target_id) = out.block
         && let Some(block_state) = resolve_block_cached(&mut state.block_state_cache, host, target_id)
     {
+        let short_target = strip_ns(target_id);
+        let shape_connected = short_target.ends_with("_stairs")
+            || short_target.ends_with("_wall")
+            || short_target.ends_with("_fence")
+            || short_target.ends_with("_fence_gate")
+            || short_target.ends_with("_door");
         let known_shape_solid =
-            !is_water_or_frozen && out.above.is_none() && out.below.is_none();
+            !is_water_or_frozen && !shape_connected && out.above.is_none() && out.below.is_none();
         let flags = if target_id == "minecraft:air" || known_shape_solid {
             BlockUpdateFlags::CLIENTS
                 | BlockUpdateFlags::KNOWN_SHAPE
@@ -1489,6 +1532,9 @@ fn apply_corruption_at(
             BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS
         };
         if level.set_block(host, pos, block_state, flags).unwrap_or(false) {
+            for (k, v) in preserved_props {
+                let _ = host.set_block_property_with(pos, k, &v, flags.bits());
+            }
             changed = true;
             if is_water_or_frozen {
                 state.queue_melt_fx(pos);
@@ -1623,6 +1669,9 @@ fn corrupt_surface_step(
                 || s.ends_with("_log")
                 || s.ends_with("_wood")
                 || s.ends_with("_leaves")
+                || s.ends_with("_planks")
+                || s.ends_with("_stairs")
+                || s.ends_with("_slab")
             {
                 min_y = min_y.min((y - SURFACE_CRUST_DEPTH).max(BEDROCK_FLOOR_Y));
             }
@@ -1706,6 +1755,43 @@ fn refill_priority_deepen_cols(
     if max_r < 2 {
         return;
     }
+
+    // Track active Overworld players near this rift so moving into a new cave or digging
+    // a new shaft immediately refocuses deep rock corruption instead of grinding old rock.
+    let mut tracked_player: Option<([i32; 3], i32)> = None;
+    for player in host.players().server_players() {
+        if !player
+            .dimension(host)
+            .is_some_and(|d| d.to_string() == OVERWORLD)
+        {
+            continue;
+        }
+        let Some(epos) = player.entity().position(host) else {
+            continue;
+        };
+        let px = epos[0].floor() as i32;
+        let py = epos[1].floor() as i32;
+        let pz = epos[2].floor() as i32;
+        if horiz_dist_sq(center, [px, 64, pz]) <= i64::from(rift.ring_radius + 8).pow(2) {
+            let surf_y = host
+                .surface_heights(OVERWORLD, &[(px, pz)], Heightmap::OceanFloor)
+                .ok()
+                .and_then(|hs| hs.first().copied().flatten())
+                .unwrap_or(center[1]);
+            tracked_player = Some(([px, py, pz], surf_y));
+            if let Some(prev) = state.last_priority_focus.get(&rift_id).copied() {
+                let dxz2 = (px - prev[0]).abs().max((pz - prev[2]).abs());
+                let dy = (py - prev[1]).abs();
+                if dxz2 >= 12 || dy >= 8 {
+                    state.priority_deepen_cols.remove(&rift_id);
+                    state.active_priority_deepen.remove(&rift_id);
+                    state.last_deepen_probe_tick.remove(&rift_id);
+                }
+            }
+            break;
+        }
+    }
+
     if state
         .priority_deepen_cols
         .get(&rift_id)
@@ -1716,7 +1802,7 @@ fn refill_priority_deepen_cols(
     if state
         .last_deepen_probe_tick
         .get(&rift_id)
-        .is_some_and(|t| state.tick.saturating_sub(*t) < 40)
+        .is_some_and(|t| state.tick.saturating_sub(*t) < 30)
     {
         return;
     }
@@ -1731,49 +1817,40 @@ fn refill_priority_deepen_cols(
     }
 
     let mut foci: Vec<ProbeFocus> = Vec::new();
-    for player in host.players().server_players() {
-        if !player
-            .dimension(host)
-            .is_some_and(|d| d.to_string() == OVERWORLD)
-        {
-            continue;
-        }
-        let Some(epos) = player.entity().position(host) else {
-            continue;
-        };
-        let px = epos[0].floor() as i32;
-        let py = epos[1].floor() as i32;
-        let pz = epos[2].floor() as i32;
-        if horiz_dist_sq(center, [px, 64, pz]) <= i64::from(rift.ring_radius + 6).pow(2) {
-            let surf_y = host
-                .surface_heights(OVERWORLD, &[(px, pz)], Heightmap::OceanFloor)
-                .ok()
-                .and_then(|hs| hs.first().copied().flatten())
-                .unwrap_or(center[1]);
-            if py < surf_y - 12 {
-                // Player is underground: target cavern walls, floors, and diamond strata at
-                // their actual depth first before boring upper unseen rock.
-                let cave_top = (py + 22).min(surf_y + 2).min(OVERWORLD_MAX_Y - 1);
-                let cave_bot = (py - 28).max(BEDROCK_FLOOR_Y);
+    if let Some(([px, py, pz], surf_y)) = tracked_player {
+        state.last_priority_focus.insert(rift_id, [px, py, pz]);
+        if py < surf_y - 10 {
+            // Player is underground: first sweep a wide horizontal cavern band right at player
+            // depth, then drill straight to Bedrock underneath their shaft.
+            let cave_top = (py + 14).min(surf_y + 2).min(OVERWORLD_MAX_Y - 1);
+            let cave_bot = (py - 12).max(BEDROCK_FLOOR_Y);
+            foci.push(ProbeFocus {
+                xz: [px, pz],
+                scan_r: 20,
+                top_y: cave_top,
+                bottom_y: cave_bot,
+                cave_band: py >> 4,
+            });
+            if cave_bot > BEDROCK_FLOOR_Y {
                 foci.push(ProbeFocus {
                     xz: [px, pz],
-                    scan_r: 18,
-                    top_y: cave_top,
-                    bottom_y: cave_bot,
-                    cave_band: py >> 4,
-                });
-            } else {
-                foci.push(ProbeFocus {
-                    xz: [px, pz],
-                    scan_r: 14,
-                    top_y: OVERWORLD_MAX_Y,
+                    scan_r: 8,
+                    top_y: cave_bot,
                     bottom_y: BEDROCK_FLOOR_Y,
                     cave_band: i32::MIN,
                 });
             }
+        } else {
+            foci.push(ProbeFocus {
+                xz: [px, pz],
+                scan_r: 14,
+                top_y: OVERWORLD_MAX_Y,
+                bottom_y: BEDROCK_FLOOR_Y,
+                cave_band: i32::MIN,
+            });
         }
     }
-    // Always prioritize the epicenter core alongside active player neighborhoods.
+    // Always reinforce the epicenter core alongside active player neighborhoods.
     foci.push(ProbeFocus {
         xz: [center[0], center[2]],
         scan_r: 18,
@@ -1793,7 +1870,7 @@ fn refill_priority_deepen_cols(
                 build_ring_columns(focus.xz[0], focus.xz[1], r)
             };
             for col in ring {
-                if batch.len() >= 128 {
+                if batch.len() >= 144 {
                     break;
                 }
                 if horiz_dist_sq(center, [col[0], 64, col[1]]) > max_r_sq {
@@ -1810,11 +1887,11 @@ fn refill_priority_deepen_cols(
                 }
                 batch.push_back((col, focus.top_y, focus.bottom_y, focus.cave_band));
             }
-            if batch.len() >= 128 {
+            if batch.len() >= 144 {
                 break;
             }
         }
-        if batch.len() >= 128 {
+        if batch.len() >= 144 {
             break;
         }
     }
@@ -1839,12 +1916,13 @@ fn next_deepen_column_for_stream(
                 || (band != i32::MIN && state.session_cave_band_cols.contains(&(col, band)));
             if !already_done && level.is_loaded(host, [col[0], 64, col[1]]) {
                 let start_y = if top_y >= OVERWORLD_MAX_Y {
-                    let ws = host
-                        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+                    let floor_y = host
+                        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::OceanFloor)
                         .ok()
                         .and_then(|hs| hs.first().copied().flatten())
                         .unwrap_or(rift_center[1] + 24);
-                    (ws + 2).min(OVERWORLD_MAX_Y - 1)
+                    (floor_y - SURFACE_CRUST_DEPTH + 4)
+                        .clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 1)
                 } else {
                     top_y
                 };
@@ -1886,12 +1964,13 @@ fn next_deepen_column_for_stream(
     r.deepen_radius = d_rad;
     r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
     picked.map(|col| {
-        let ws = host
-            .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+        let floor_y = host
+            .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::OceanFloor)
             .ok()
             .and_then(|hs| hs.first().copied().flatten())
             .unwrap_or(rift_center[1] + 24);
-        let start_y = (ws + 2).min(OVERWORLD_MAX_Y - 1);
+        let start_y = (floor_y - SURFACE_CRUST_DEPTH + 4)
+            .clamp(BEDROCK_FLOOR_Y, OVERWORLD_MAX_Y - 1);
         (col, start_y, BEDROCK_FLOOR_Y, i32::MIN)
     })
 }
@@ -1909,7 +1988,7 @@ fn bore_deepen_stream(
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
 
-    while *budget > 0 && skips < 512 {
+    while *budget > 0 && skips < 2048 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
@@ -2111,7 +2190,7 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         })
         .collect();
     let total_deep_rate: f64 = deep_rates.iter().sum();
-    let global_deep_cap = (state.spread_budget * 6).clamp(64, 96) as f64;
+    let global_deep_cap = (state.spread_budget * 10).clamp(96, 192) as f64;
     let deep_scale = if total_deep_rate > global_deep_cap && total_deep_rate > 0.0 {
         global_deep_cap / total_deep_rate
     } else {
