@@ -306,11 +306,11 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
     )
 }
 
-/// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
-/// pass converts before moving to the next column on the circular ring.
-/// Penetrates deep through surface dirt and upper cave stone immediately, while the
-/// dedicated deep-boring pass drives all the way down to Bedrock (`-63`).
-pub const SURFACE_CRUST_DEPTH: i32 = 32;
+/// How many blocks below solid ground (`OceanFloor`) the outer surface expansion pass
+/// converts before moving horizontally to the next column on the ring, so deep digging
+/// never slows down outward surface spread. Meanwhile `corrupt_deepen_step` simultaneously
+/// drives underground rock all the way down to Bedrock (`-63`).
+pub const SURFACE_CRUST_DEPTH: i32 = 7;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
 /// Normal surface/mountain portals sweep from the column's highest block (up to `Y = 319`)
@@ -366,11 +366,7 @@ pub fn rift_surface_ops_per_tick(
     let b = corrupted_blocks as f64;
     let sqrt_ramp = (b + 25.0).sqrt() - 5.0;
     let raw = (0.08 + b * 0.00025 + sqrt_ramp * 0.085) * scale;
-    let cap = if ring_radius <= 2 {
-        effective_rift_budget(base_budget, ring_radius) as f64
-    } else {
-        (effective_rift_budget(base_budget, ring_radius) as f64 * 0.55).max(1.0)
-    };
+    let cap = effective_rift_budget(base_budget, ring_radius) as f64;
     raw.min(cap).max(0.05 * scale)
 }
 
@@ -1620,7 +1616,7 @@ mod tests {
 
         // Portal on mountain base (y=90) expanding UP onto a y=240 snowy peak:
         // must NOT clip top_y at 128 or 90+12, and sweeps through both full crust and sheer cliffs!
-        let (peak_top, peak_min) = surface_column_y_range(90, false, 240, 240, 215);
+        let (peak_top, peak_min) = surface_column_y_range(90, false, 240, 240, 236);
         assert_eq!(peak_top, 242);
         assert_eq!(peak_min, 240 - SURFACE_CRUST_DEPTH);
         let (_, cliff_min) = surface_column_y_range(90, false, 240, 240, 200);

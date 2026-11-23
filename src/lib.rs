@@ -2387,7 +2387,7 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         })
         .collect();
     let total_surf_rate: f64 = surf_rates.iter().sum();
-    let global_cap = (state.spread_budget * 5).clamp(48, 84) as f64;
+    let global_cap = (state.spread_budget * 8).clamp(64, 140) as f64;
     let surf_scale = if total_surf_rate > global_cap && total_surf_rate > 0.0 {
         global_cap / total_surf_rate
     } else {
