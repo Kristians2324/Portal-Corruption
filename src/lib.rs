@@ -253,9 +253,13 @@ fn register_or_refresh_rift(host: &mut dyn ServerHost, level: LevelRef, state: &
     if let Some(rift) = state.find_near_source_mut(centroid, 12) {
         rift.center = centroid;
         rift.active_portal = lit;
-        let outcome = evaluate_chamber(&view, &seeds);
-        if outcome != ContainmentOutcome::Indeterminate {
-            rift.contained = outcome == ContainmentOutcome::Contained;
+        if rift.citadel_spawned && !rift.pacified {
+            rift.contained = false;
+        } else if !rift.pacified {
+            let outcome = evaluate_chamber(&view, &seeds);
+            if outcome != ContainmentOutcome::Indeterminate {
+                rift.contained = outcome == ContainmentOutcome::Contained;
+            }
         }
         state.dirty = true;
         return;
@@ -350,6 +354,26 @@ fn evaluate_rift_containment(host: &mut dyn ServerHost, level: LevelRef, state: 
         rift.active_portal = lit;
         if lit {
             rift.center = centroid;
+        }
+        // Once the Obsidian Breach Citadel has awoken and while its Wither Sovereign lives,
+        // Crying Obsidian quarantining cannot stop corruption — only slaying the Wither can.
+        if rift.citadel_spawned && !rift.pacified {
+            if rift.contained {
+                rift.contained = false;
+                state.dirty = true;
+            }
+            let seal_attempted = outcome == ContainmentOutcome::Contained
+                && (force_all
+                    || queued
+                        .iter()
+                        .any(|p| dist_sq(*p, rift.center) <= 22 * 22));
+            if seal_attempted {
+                announcements.push(format!(
+                    "[Rift Bleed] Crying Obsidian cannot seal Rift #{} — defeat the Wither Sovereign first!",
+                    rift.id
+                ));
+            }
+            continue;
         }
         match outcome {
             ContainmentOutcome::Contained => {

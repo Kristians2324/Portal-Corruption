@@ -54,8 +54,8 @@ pub fn location_unlocks_nether_mobs(state: &RiftState, pos: [i32; 3]) -> bool {
     })
 }
 
-/// Blocks vanilla natural spawns and portal piglin leaks in Overworld near an immature Rift
-/// until the corruption actually covers a large Nether biome.
+/// Blocks vanilla Nether mob spawns inside immature Rifts AND blocks ALL new Nether mob spawns
+/// inside pacified or regressing Rift zones (while letting already-alive survivors remain).
 pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEvent<'_>) -> bool {
     if event.dimension != OVERWORLD {
         return false;
@@ -63,9 +63,9 @@ pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEven
     if !is_nether_predator(event.kind) && strip_ns(event.kind) != "strider" {
         return false;
     }
-    if !matches!(
+    if matches!(
         event.reason,
-        SpawnReason::Natural | SpawnReason::ChunkGeneration | SpawnReason::Structure
+        SpawnReason::Command | SpawnReason::SpawnItemUse | SpawnReason::Conversion
     ) {
         return false;
     }
@@ -78,7 +78,7 @@ pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEven
         || state
             .rifts
             .iter()
-            .any(|r| horiz_dist_sq(r.center, bp) <= (r.max_radius_sq + 512).max(32 * 32));
+            .any(|r| horiz_dist_sq(r.center, bp) <= (r.max_radius_sq + 512).max(48 * 48));
     near_any_rift && !location_unlocks_nether_mobs(state, bp)
 }
 
@@ -103,7 +103,7 @@ pub fn is_nether_predator(kind: &str) -> bool {
 pub fn nether_death_conversion_target(kind: &str) -> Option<&'static str> {
     match strip_ns(kind) {
         "pig" | "cow" | "mooshroom" | "sheep" | "goat" | "horse" | "donkey" | "mule"
-        | "llama" | "camel" | "sniffer" => Some("minecraft:hoglin"),
+        | "llama" | "camel" | "sniffer" | "polar_bear" => Some("minecraft:hoglin"),
         "villager" | "wandering_trader" | "pillager" | "evoker" | "illusioner" => {
             Some("minecraft:piglin")
         }
@@ -112,9 +112,8 @@ pub fn nether_death_conversion_target(kind: &str) -> Option<&'static str> {
         "skeleton" | "stray" | "bogged" | "spider" | "cave_spider" | "phantom" => {
             Some("minecraft:wither_skeleton")
         }
-        "slime" | "chicken" | "rabbit" | "wolf" | "cat" | "fox" | "frog" | "bat" => {
-            Some("minecraft:magma_cube")
-        }
+        "slime" | "chicken" | "rabbit" | "wolf" | "cat" | "fox" | "frog" | "bat" | "armadillo"
+        | "ocelot" | "panda" | "turtle" => Some("minecraft:magma_cube"),
         "witch" | "creeper" | "breeze" => Some("minecraft:blaze"),
         _ => None,
     }
@@ -304,12 +303,12 @@ fn process_predator_hunting_and_buffs(
     entities: &[(EntityRef, u32, String, [f64; 3])],
     particles: Option<&ParticlePalette>,
 ) {
-    let mut hunters: Vec<(EntityRef, [f64; 3])> = Vec::new();
+    let mut hunters: Vec<(EntityRef, String, [f64; 3])> = Vec::new();
     let mut prey: Vec<(EntityRef, [f64; 3])> = Vec::new();
     let mut fire_buffs: Vec<EntityRef> = Vec::new();
     let mut immunize_mobs: Vec<u32> = Vec::new();
     let mut touched_buffs: Vec<(EntityRef, [f64; 3])> = Vec::new();
-    let mut withers: Vec<(EntityRef, u32)> = Vec::new();
+    let mut withers: Vec<(EntityRef, u32, [f64; 3])> = Vec::new();
 
     state.known_nether_mobs.clear();
     state.known_withers.clear();
@@ -328,11 +327,11 @@ fn process_predator_hunting_and_buffs(
                 || state
                     .citadels
                     .iter()
-                    .any(|c| horiz_dist_sq(*c, bp) <= 44 * 44);
+                    .any(|c| horiz_dist_sq(*c, bp) <= 56 * 56);
             if is_sovereign {
                 state.known_nether_mobs.insert(*id);
                 state.known_withers.insert(*id);
-                withers.push((*ent, *id));
+                withers.push((*ent, *id, *pos));
             }
             continue;
         }
@@ -347,9 +346,17 @@ fn process_predator_hunting_and_buffs(
             }
             if matches!(
                 strip_ns(kind),
-                "piglin" | "piglin_brute" | "hoglin" | "wither_skeleton" | "blaze" | "zoglin"
+                "piglin"
+                    | "piglin_brute"
+                    | "hoglin"
+                    | "wither_skeleton"
+                    | "blaze"
+                    | "zoglin"
+                    | "magma_cube"
+                    | "zombified_piglin"
+                    | "ghast"
             ) {
-                hunters.push((*ent, *pos));
+                hunters.push((*ent, strip_ns(kind).to_owned(), *pos));
             }
             if is_piglin_or_hoglin(kind) {
                 if (state.tick + u64::from(*id)) % 80 < MOB_TICK_INTERVAL {
@@ -397,9 +404,36 @@ fn process_predator_hunting_and_buffs(
         apply_mob_effects(host, ent, 20 * 600, 20 * 600);
     }
 
-    // Ensure Sovereign Withers (even loaded from older saves) target only Players and
-    // drop any stray lock onto nearby Nether guards, and keep allied guards off the Wither.
-    for (w_ent, _) in withers {
+    // Ensure Sovereign Withers target only Players, stay tethered inside their Citadel
+    // (never flying away from the portal), and keep allied guards off each other / Wither.
+    for (w_ent, _, w_pos) in withers {
+        let owning_citadel = w_ent
+            .tags(host)
+            .and_then(|ts| {
+                ts.iter()
+                    .find_map(|t| t.strip_prefix("rift_bleed:rift_")?.parse::<u64>().ok())
+            })
+            .and_then(|rid| {
+                state.rifts.iter().find(|r| r.id == rid).and_then(|r| {
+                    state
+                        .citadels
+                        .iter()
+                        .copied()
+                        .min_by_key(|c| horiz_dist_sq(*c, r.center))
+                        .filter(|c| horiz_dist_sq(*c, r.center) <= 16 * 16)
+                        .or(Some(r.center))
+                })
+            })
+            .or_else(|| {
+                let wb = [w_pos[0] as i32, w_pos[1] as i32, w_pos[2] as i32];
+                state
+                    .citadels
+                    .iter()
+                    .copied()
+                    .min_by_key(|c| horiz_dist_sq(*c, wb))
+                    .filter(|c| horiz_dist_sq(*c, wb) <= 120 * 120)
+            });
+
         if let Some(mob) = host.mob(w_ent) {
             if let Some(goals) = mob.target_goals(host) {
                 let needs_fix = goals.iter().any(|g| g.id == "hurt_by_target")
@@ -427,10 +461,52 @@ fn process_predator_hunting_and_buffs(
             {
                 let _ = mob.set_target(host, None);
             }
+
+            if let Some(c) = owning_citadel {
+                let anchor_i = [c[0], (c[1] + 10).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 12), c[2]];
+                let _ = mob.restrict_to(host, anchor_i, 26);
+
+                let anchor = [
+                    f64::from(anchor_i[0]) + 0.5,
+                    f64::from(anchor_i[1]),
+                    f64::from(anchor_i[2]) + 0.5,
+                ];
+                let dx = w_pos[0] - anchor[0];
+                let dy = w_pos[1] - f64::from(c[1]);
+                let dz = w_pos[2] - anchor[2];
+                let hd2 = dx * dx + dz * dz;
+                if hd2 > 40.0 * 40.0 || dy > 36.0 || dy < -10.0 {
+                    let _ = w_ent.set_velocity(host, [0.0, 0.0, 0.0]);
+                    let _ = w_ent.teleport_to(host, anchor, None);
+                    if let Some(pal) = particles {
+                        let _ = level.send_particles(
+                            host,
+                            &ParticleOptions::simple(pal.smoke),
+                            None,
+                            anchor,
+                            [1.2, 1.0, 1.2],
+                            0.04,
+                            24,
+                        );
+                    }
+                } else if hd2 > 28.0 * 28.0 || dy > 28.0 || dy < -4.0 {
+                    let vdy = w_pos[1] - anchor[1];
+                    let dist = (hd2 + vdy * vdy).sqrt().max(1.0);
+                    let _ = w_ent.set_velocity(
+                        host,
+                        [
+                            (-dx / dist) * 0.48,
+                            (-vdy / dist) * 0.36,
+                            (-dz / dist) * 0.48,
+                        ],
+                    );
+                    let _ = mob.move_to(host, anchor, 1.35);
+                }
+            }
         }
     }
 
-    for (hunter_ent, _) in &hunters {
+    for (hunter_ent, _, _) in &hunters {
         if state.citadel_guards.contains(&hunter_ent.id())
             && let Some(mob) = host.mob(*hunter_ent)
             && let Some(tgt) = mob.target(host)
@@ -453,30 +529,77 @@ fn process_predator_hunting_and_buffs(
 
     let hunt_range_sq = 32.0 * 32.0;
 
-    for (hunter_ent, h_pos) in hunters {
+    for (hunter_ent, hunter_short, h_pos) in hunters {
         let Some(mob) = host.mob(hunter_ent) else {
             continue;
         };
+
+        // Ensure Magma Cubes have an active melee goal and actually strike adjacent
+        // Overworld animals rather than passively bouncing beside cows/pigs/sheep.
+        if hunter_short == "magma_cube" {
+            if let Some(goals) = mob.goals(host)
+                && !goals.iter().any(|g| g.id == "melee_attack")
+            {
+                let _ = mob.add_goal(
+                    host,
+                    2,
+                    &GoalSpec::MeleeAttack {
+                        speed: 1.3,
+                        follow_unseen: true,
+                    },
+                );
+            }
+            if let Some((close_prey, p_pos, _)) = prey
+                .iter()
+                .filter_map(|(pe, pp)| {
+                    let dx = h_pos[0] - pp[0];
+                    let dy = h_pos[1] - pp[1];
+                    let dz = h_pos[2] - pp[2];
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    (d2 <= 2.75 * 2.75).then_some((*pe, *pp, d2))
+                })
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+            {
+                let _ = close_prey.hurt(
+                    host,
+                    "minecraft:mob_attack",
+                    4.5,
+                    Some(hunter_ent),
+                    Some(hunter_ent),
+                );
+                let _ = mob.move_to(host, p_pos, 1.3);
+            }
+        }
+
         // Skip hunters that already have an active target so we don't re-trigger
         // aggro / angry sounds every second.
         if mob.target(host).is_some() {
+            if hunter_short == "magma_cube"
+                && let Some(tgt) = mob.target(host)
+                && let Some(tp) = tgt.entity().position(host)
+            {
+                let _ = mob.move_to(host, tp, 1.3);
+            }
             continue;
         }
-        let mut best: Option<(EntityRef, f64)> = None;
+        let mut best: Option<(EntityRef, [f64; 3], f64)> = None;
         for (prey_ent, p_pos) in &prey {
             let dx = h_pos[0] - p_pos[0];
             let dy = h_pos[1] - p_pos[1];
             let dz = h_pos[2] - p_pos[2];
             let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 <= hunt_range_sq && best.is_none_or(|(_, b)| d2 < b) {
-                best = Some((*prey_ent, d2));
+            if d2 <= hunt_range_sq && best.is_none_or(|(_, _, b)| d2 < b) {
+                best = Some((*prey_ent, *p_pos, d2));
             }
         }
-        if let Some((victim_ent, _)) = best
+        if let Some((victim_ent, v_pos, _)) = best
             && let Some(target_living) = host.living(victim_ent)
         {
             let _ = mob.set_target(host, Some(target_living));
             let _ = mob.set_brain_target(host, Some(target_living));
+            if hunter_short == "magma_cube" {
+                let _ = mob.move_to(host, v_pos, 1.3);
+            }
             if mob.is_aggressive(host) != Some(true) {
                 let _ = mob.set_aggressive(host, true);
             }
@@ -981,11 +1104,10 @@ pub fn augment_potential_spawns(
     }
 
     let near_corrupt = state.is_quart_corrupted(event.pos)
-        || state.rifts.iter().any(|r| {
-            !r.pacified
-                && !r.regressing
-                && horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 256).max(32 * 32)
-        });
+        || state
+            .rifts
+            .iter()
+            .any(|r| horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 512).max(48 * 48));
     if !near_corrupt {
         return;
     }

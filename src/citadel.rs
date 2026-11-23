@@ -999,6 +999,15 @@ fn spawn_citadel_garrison_and_wither(
         let _ = ent.set_custom_name(host, Some(Text::literal(format!("Rift #{rift_id} Sovereign"))));
         boss_uuid = ent.uuid(host);
         if let Some(mob) = host.mob(ent) {
+            let _ = mob.restrict_to(
+                host,
+                [
+                    center[0],
+                    (floor_y + 10).min(OVERWORLD_MAX_Y - 12),
+                    center[2],
+                ],
+                26,
+            );
             let _ = mob.remove_target_goal(host, "nearest_target");
             let _ = mob.remove_target_goal(host, "hurt_by_target");
             let _ = mob.add_target_goal(

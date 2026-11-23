@@ -28,6 +28,7 @@ pub struct ClientAtmosphere {
     pub in_overworld: bool,
     pub intensity: f32,
     pub target_intensity: f32,
+    pub cloud_suppress: f32,
     pub blended_rgb: [f32; 3],
     pub current_rgb: [f32; 3],
     pub has_rgb: bool,
@@ -169,6 +170,13 @@ pub fn step_client_atmosphere_values(
     atmo.target_intensity = (sample.corrupt_fraction * alt_factor).clamp(0.0, 1.0);
     atmo.intensity += (atmo.target_intensity - atmo.intensity) * INTENSITY_TEMPORAL_RATE;
 
+    // Suppress Overworld clouds whenever over corrupted Nether territory regardless of camera Y.
+    let target_cloud_suppress = (sample.corrupt_fraction * 2.2).clamp(0.0, 1.0);
+    atmo.cloud_suppress += (target_cloud_suppress - atmo.cloud_suppress) * INTENSITY_TEMPORAL_RATE;
+    if target_cloud_suppress >= 0.99 && atmo.cloud_suppress >= 0.99 {
+        atmo.cloud_suppress = 1.0;
+    }
+
     if sample.corrupt_fraction > 0.0 {
         atmo.blended_rgb = sample.blended_rgb;
         atmo.dominant_flavor = sample.dominant_flavor;
@@ -182,6 +190,9 @@ pub fn step_client_atmosphere_values(
         atmo.intensity = 0.0;
         atmo.has_rgb = false;
         atmo.dominant_flavor = None;
+    }
+    if atmo.cloud_suppress < 0.005 && sample.corrupt_fraction <= 0.0 {
+        atmo.cloud_suppress = 0.0;
     }
 }
 
@@ -209,6 +220,7 @@ pub fn tick_client_atmosphere(
     if !atmo.in_overworld {
         atmo.intensity = 0.0;
         atmo.target_intensity = 0.0;
+        atmo.cloud_suppress = 0.0;
         atmo.has_rgb = false;
         atmo.dominant_flavor = None;
         return;
@@ -311,32 +323,60 @@ pub fn apply_fog_color(atmo: &ClientAtmosphere, event: &mut ComputeFogColorEvent
     }
 }
 
-pub fn compute_fog_targets(intensity: f32) -> (f32, f32, f32, f32, f32, f32) {
+pub fn compute_fog_targets(
+    intensity: f32,
+    camera_y: f32,
+    cloud_suppress: f32,
+) -> (f32, f32, f32, f32, f32, f32) {
     let t = intensity.clamp(0.0, 1.0);
+    let depth_t = ((55.0 - camera_y) / 95.0).clamp(0.0, 1.0);
     let lerp = |a: f32, b: f32| a + (b - a) * t;
+
+    // Preserve a gentle contrast between open sky and deep caverns while keeping
+    // surface & underground sightlines wide enough to read the surrounding corruption.
+    let target_env_start = 28.0 - 10.0 * depth_t;
+    let target_env_end = 132.0 - 36.0 * depth_t;
+    let target_rd_start = 44.0 - 12.0 * depth_t;
+    let target_rd_end = 168.0 - 44.0 * depth_t;
+    let cloud_cap = (256.0 * (1.0 - cloud_suppress.clamp(0.0, 1.0))).max(0.0);
+
     (
-        lerp(64.0, 4.0),   // environmental_start
-        lerp(240.0, 44.0), // environmental_end
-        lerp(80.0, 8.0),   // render_distance_start
-        lerp(256.0, 58.0), // render_distance_end
-        lerp(200.0, 34.0), // sky_end
-        lerp(256.0, 48.0), // cloud_end
+        lerp(64.0, target_env_start), // environmental_start
+        lerp(240.0, target_env_end),  // environmental_end
+        lerp(80.0, target_rd_start),  // render_distance_start
+        lerp(256.0, target_rd_end),   // render_distance_end
+        lerp(200.0, 96.0),            // sky_end
+        cloud_cap,                    // cloud_end (0.0 hides Overworld clouds over Nether land)
     )
 }
 
 pub fn apply_render_fog(atmo: &ClientAtmosphere, event: &mut RenderFogEvent<'_>) {
-    if !atmo.in_overworld || atmo.intensity <= 0.005 || event.fog_type != FogType::Atmospheric {
+    if !atmo.in_overworld || event.fog_type != FogType::Atmospheric {
+        return;
+    }
+    if atmo.intensity <= 0.005 && atmo.cloud_suppress <= 0.01 {
         return;
     }
 
-    let (env_s, env_e, rd_s, rd_e, sky_e, cloud_e) = compute_fog_targets(atmo.intensity);
+    let (env_s, env_e, rd_s, rd_e, sky_e, cloud_e) =
+        compute_fog_targets(atmo.intensity, atmo.camera_y, atmo.cloud_suppress);
     let fog: &mut FogData = event.fog;
-    fog.environmental_start = fog.environmental_start.min(env_s);
-    fog.environmental_end = fog.environmental_end.min(env_e);
-    fog.render_distance_start = fog.render_distance_start.min(rd_s);
-    fog.render_distance_end = fog.render_distance_end.min(rd_e);
-    fog.sky_end = fog.sky_end.min(sky_e);
-    fog.cloud_end = fog.cloud_end.min(cloud_e);
+    if atmo.intensity > 0.005 {
+        fog.environmental_start = fog.environmental_start.min(env_s);
+        fog.environmental_end = fog
+            .environmental_end
+            .min(env_e)
+            .max(fog.environmental_start + 1.0);
+        fog.render_distance_start = fog.render_distance_start.min(rd_s);
+        fog.render_distance_end = fog
+            .render_distance_end
+            .min(rd_e)
+            .max(fog.render_distance_start + 1.0);
+        fog.sky_end = fog.sky_end.min(sky_e).max(0.0);
+    }
+    if atmo.cloud_suppress > 0.01 {
+        fog.cloud_end = fog.cloud_end.min(cloud_e).max(0.0);
+    }
 }
 
 pub fn select_nether_music(atmo: &ClientAtmosphere, current: Option<&str>) -> Option<Music> {
@@ -445,5 +485,30 @@ mod tests {
         assert_eq!(picked.sound, "minecraft:music.nether.basalt_deltas");
         assert!(select_nether_music(&atmo, Some("minecraft:music.menu")).is_none());
         assert!(select_nether_music(&atmo, Some("minecraft:music.dragon")).is_none());
+    }
+
+    #[test]
+    fn hides_clouds_and_keeps_wide_sight_distance_with_mild_depth_contrast() {
+        let mut atmo = ClientAtmosphere {
+            in_overworld: true,
+            ..ClientAtmosphere::default()
+        };
+        let full_nether = NeighborhoodSample {
+            corrupt_fraction: 1.0,
+            blended_rgb: [0.24, 0.04, 0.05],
+            dominant_flavor: Some(NetherFlavor::CrimsonForest),
+        };
+        for _ in 0..100 {
+            step_client_atmosphere_values(&mut atmo, full_nether, 230.0, 160.0);
+        }
+        // Even high in the sky (intensity -> 0), Nether-corrupted ground suppresses clouds to 0.
+        let (_, _, _, _, _, cloud_end) = compute_fog_targets(atmo.intensity, 230.0, atmo.cloud_suppress);
+        assert_eq!(cloud_end, 0.0);
+
+        // Surface sight reaches > 125 blocks, deep underground stays darker (~90-100) without blinding at 44.
+        let (surf_s, surf_e, _, surf_rd, _, _) = compute_fog_targets(1.0, 68.0, 1.0);
+        let (deep_s, deep_e, _, deep_rd, _, _) = compute_fog_targets(1.0, -40.0, 1.0);
+        assert!(surf_s >= 24.0 && surf_e >= 125.0 && surf_rd >= 160.0);
+        assert!(deep_e >= 90.0 && deep_e < surf_e && deep_s < surf_s && deep_rd < surf_rd);
     }
 }

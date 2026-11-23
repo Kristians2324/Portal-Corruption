@@ -120,9 +120,38 @@ pub fn try_handle_boss_death(
     };
 
     let center = state.rifts[rift_idx].center;
+    let max_r2 = state.rifts[rift_idx].max_radius_sq.max(64 * 64);
     let Some(rift_id) = pacify_and_start_regression(state, rift_idx) else {
         return false;
     };
+
+    // Release PersistenceRequired on surviving Citadel/Outpost Nether mobs around this Rift
+    // so they remain for the player to finish off, yet can also wander off and despawn naturally.
+    if let Some(ow) = host.level(OVERWORLD)
+        && let Some(ents) = ow.all_entities(host)
+    {
+        for ent in ents {
+            let Some(kind_key) = ent.kind(host) else {
+                continue;
+            };
+            if !crate::mobs::is_nether_predator(&kind_key.id(host)) {
+                continue;
+            }
+            let Some(epos) = ent.position(host) else {
+                continue;
+            };
+            let bp = [
+                epos[0].floor() as i32,
+                epos[1].floor() as i32,
+                epos[2].floor() as i32,
+            ];
+            if crate::types::horiz_dist_sq(center, bp) <= max_r2 + 48 * 48 {
+                let mut nbt = mod_api::Compound::new();
+                nbt.insert("PersistenceRequired".into(), mod_api::Tag::Byte(0));
+                let _ = ent.merge_nbt(host, nbt);
+            }
+        }
+    }
 
     let msg = format!(
         "[Rift Bleed] The Sovereign of Rift #{} at ({}, {}, {}) is vanquished! Corruption halts, the Overworld begins reclaiming the land, and this portal is now permanently safe.",
