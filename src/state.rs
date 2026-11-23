@@ -3,7 +3,7 @@ use crate::types::{
     quart_coords,
 };
 use mod_api::serde_json::{self, Map, Value};
-use mod_api::{ConfigPath, ServerHost, WorldEpoch};
+use mod_api::{BlockState, ConfigPath, ServerHost, WorldEpoch};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,12 +72,14 @@ pub struct RiftState {
     pub bastions: Vec<BastionSite>,
     pub outposts: Vec<OutpostSite>,
     pub citadels: Vec<[i32; 3]>,
-    pub corrupted_quarts: HashSet<[i32; 3]>,
     pub corrupted_quart_cols: HashSet<[i32; 2]>,
+    pub corrupted_quart_cols_list: Vec<[i32; 2]>,
     /// Tracks Overworld mobs buffed as Nether-Touched so loot & flames persist.
     pub nether_touched_mobs: HashSet<u32>,
     /// Tracks known living Nether predator entity IDs so `living_death` recognizes attackers cleanly.
     pub known_nether_mobs: HashSet<u32>,
+    /// Tracks Magma Cubes that already received their melee attack goal.
+    pub magma_melee_ready: HashSet<u32>,
     /// Tracks living Sovereign/Citadel Wither entity IDs for friendly-fire ceasefire checks.
     pub known_withers: HashSet<u32>,
     /// Tracks allied Citadel/Outpost garrison entity IDs (`rift_bleed:nether_ally`).
@@ -85,6 +87,8 @@ pub struct RiftState {
     /// Tracks Piglins/Brutes/Hoglins already stabilized with `IsImmuneToZombification: 1b`
     /// so vanilla Overworld zombification never triggers repeated conversion sounds.
     pub zombification_immune_mobs: HashSet<u32>,
+    /// Cached vanilla `BlockState` handles for hot-loop block placement without registry lookups.
+    pub block_state_cache: HashMap<&'static str, BlockState>,
     /// Active chunk tickets held by Rift Bleed via `ChunkRef::set_forced`.
     pub core_chunks: HashSet<[i32; 2]>,
     pub frontier_chunks: VecDeque<[i32; 2]>,
@@ -146,13 +150,15 @@ impl RiftState {
             bastions: Vec::new(),
             outposts: Vec::new(),
             citadels: Vec::new(),
-            corrupted_quarts: HashSet::new(),
             corrupted_quart_cols: HashSet::new(),
+            corrupted_quart_cols_list: Vec::new(),
             nether_touched_mobs: HashSet::new(),
             known_nether_mobs: HashSet::new(),
+            magma_melee_ready: HashSet::new(),
             known_withers: HashSet::new(),
             citadel_guards: HashSet::new(),
             zombification_immune_mobs: HashSet::new(),
+            block_state_cache: HashMap::new(),
             core_chunks: HashSet::new(),
             frontier_chunks: VecDeque::new(),
             regress_chunks: VecDeque::new(),
@@ -252,20 +258,29 @@ impl RiftState {
 
     pub fn is_quart_corrupted(&self, block_pos: [i32; 3]) -> bool {
         let q = quart_coords(block_pos);
-        self.corrupted_quarts.contains(&q) || self.corrupted_quart_cols.contains(&[q[0], q[2]])
+        self.corrupted_quart_cols.contains(&[q[0], q[2]])
     }
 
     pub fn mark_quart_corrupted(&mut self, block_pos: [i32; 3]) -> bool {
         let q = quart_coords(block_pos);
-        self.corrupted_quarts.insert(q);
-        self.corrupted_quart_cols.insert([q[0], q[2]])
+        let col = [q[0], q[2]];
+        if self.corrupted_quart_cols.insert(col) {
+            self.corrupted_quart_cols_list.push(col);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn unmark_quart_col(&mut self, x: i32, z: i32) {
         let qx = x >> 2;
         let qz = z >> 2;
-        self.corrupted_quart_cols.remove(&[qx, qz]);
-        self.corrupted_quarts.retain(|q| q[0] != qx || q[2] != qz);
+        let col = [qx, qz];
+        if self.corrupted_quart_cols.remove(&col)
+            && let Some(idx) = self.corrupted_quart_cols_list.iter().position(|c| *c == col)
+        {
+            self.corrupted_quart_cols_list.swap_remove(idx);
+        }
         self.session_deepened_cols
             .retain(|c| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
         self.session_cave_band_cols
@@ -427,14 +442,18 @@ impl RiftState {
                 obj.insert("pacified".into(), Value::from(r.pacified));
                 obj.insert("regressing".into(), Value::from(r.regressing));
                 obj.insert("regress_radius".into(), Value::from(r.regress_radius));
-                let ring_cols: Vec<Value> = r.ring_columns.iter().copied().map(col_to_json).collect();
-                obj.insert("ring_columns".into(), Value::Array(ring_cols));
-                let deep_cols: Vec<Value> =
-                    r.deepen_columns.iter().copied().map(col_to_json).collect();
-                obj.insert("deepen_columns".into(), Value::Array(deep_cols));
-                let reg_cols: Vec<Value> =
-                    r.regress_columns.iter().copied().map(col_to_json).collect();
-                obj.insert("regress_columns".into(), Value::Array(reg_cols));
+                obj.insert(
+                    "ring_columns".into(),
+                    flat_cols_iter_to_json(r.ring_columns.iter().copied()),
+                );
+                obj.insert(
+                    "deepen_columns".into(),
+                    flat_cols_iter_to_json(r.deepen_columns.iter().copied()),
+                );
+                obj.insert(
+                    "regress_columns".into(),
+                    flat_cols_iter_to_json(r.regress_columns.iter().copied()),
+                );
                 if let Some(([x, z], y, min_y)) = r.active_column {
                     obj.insert(
                         "active_column".into(),
@@ -490,16 +509,14 @@ impl RiftState {
             .collect();
         root.insert("outposts".into(), Value::Array(outposts));
 
-        let cols: Vec<Value> = self
-            .corrupted_quart_cols
-            .iter()
-            .copied()
-            .map(col_to_json)
-            .collect();
-        root.insert("corrupted_quart_cols".into(), Value::Array(cols));
-
-        let shores: Vec<Value> = self.shore_columns.iter().copied().map(col_to_json).collect();
-        root.insert("shore_columns".into(), Value::Array(shores));
+        root.insert(
+            "corrupted_quart_cols".into(),
+            flat_cols_iter_to_json(self.corrupted_quart_cols_list.iter().copied()),
+        );
+        root.insert(
+            "shore_columns".into(),
+            flat_cols_iter_to_json(self.shore_columns.iter().copied()),
+        );
 
         Value::Object(root)
     }
@@ -525,6 +542,7 @@ impl RiftState {
         }
 
         self.rifts.clear();
+        self.magma_melee_ready.clear();
         self.active_deepen_columns.clear();
         self.active_priority_deepen.clear();
         self.priority_deepen_cols.clear();
@@ -553,8 +571,7 @@ impl RiftState {
                     .unwrap_or(inferred_r);
                 let mut ring_columns: Vec<[i32; 2]> = item
                     .get("ring_columns")
-                    .and_then(|v| v.as_array())
-                    .map(|list| list.iter().filter_map(col_from_json).collect())
+                    .map(cols_from_json_any)
                     .unwrap_or_default();
                 if ring_columns.is_empty() {
                     ring_columns = build_ring_columns(center[0], center[2], ring_radius);
@@ -577,8 +594,7 @@ impl RiftState {
                         .unwrap_or(1);
                     let dc: Vec<[i32; 2]> = item
                         .get("deepen_columns")
-                        .and_then(|v| v.as_array())
-                        .map(|list| list.iter().filter_map(col_from_json).collect())
+                        .map(cols_from_json_any)
                         .unwrap_or_default();
                     (dr, dc)
                 };
@@ -611,8 +627,7 @@ impl RiftState {
                     .unwrap_or(0);
                 let regress_columns: Vec<[i32; 2]> = item
                     .get("regress_columns")
-                    .and_then(|v| v.as_array())
-                    .map(|list| list.iter().filter_map(col_from_json).collect())
+                    .map(cols_from_json_any)
                     .unwrap_or_default();
                 let regress_active_column = item
                     .get("regress_active_column")
@@ -705,31 +720,31 @@ impl RiftState {
             }
         }
 
-        self.corrupted_quarts.clear();
         self.corrupted_quart_cols.clear();
+        self.corrupted_quart_cols_list.clear();
         if let Some(arr) = doc.get("corrupted_quarts").and_then(|v| v.as_array()) {
             for item in arr {
                 if let Some(q) = pos_from_json(item) {
-                    self.corrupted_quarts.insert(q);
-                    self.corrupted_quart_cols.insert([q[0], q[2]]);
+                    let c = [q[0], q[2]];
+                    if self.corrupted_quart_cols.insert(c) {
+                        self.corrupted_quart_cols_list.push(c);
+                    }
                 }
             }
         }
-        if let Some(arr) = doc.get("corrupted_quart_cols").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(c) = col_from_json(item) {
-                    self.corrupted_quart_cols.insert(c);
+        if let Some(val) = doc.get("corrupted_quart_cols") {
+            for c in cols_from_json_any(val) {
+                if self.corrupted_quart_cols.insert(c) {
+                    self.corrupted_quart_cols_list.push(c);
                 }
             }
         }
         self.shore_columns.clear();
         self.shore_columns_set.clear();
-        if let Some(arr) = doc.get("shore_columns").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(c) = col_from_json(item) {
-                    if self.shore_columns_set.insert(c) {
-                        self.shore_columns.push_back(c);
-                    }
+        if let Some(val) = doc.get("shore_columns") {
+            for c in cols_from_json_any(val) {
+                if self.shore_columns_set.insert(c) {
+                    self.shore_columns.push_back(c);
                 }
             }
         }
@@ -757,8 +772,14 @@ fn pos_from_json(val: &Value) -> Option<[i32; 3]> {
     ])
 }
 
-fn col_to_json(col: [i32; 2]) -> Value {
-    Value::Array(vec![Value::from(col[0]), Value::from(col[1])])
+fn flat_cols_iter_to_json(iter: impl Iterator<Item = [i32; 2]>) -> Value {
+    let (_, upper) = iter.size_hint();
+    let mut vals = Vec::with_capacity(upper.unwrap_or(0) * 2);
+    for col in iter {
+        vals.push(Value::from(col[0]));
+        vals.push(Value::from(col[1]));
+    }
+    Value::Array(vals)
 }
 
 fn col_from_json(val: &Value) -> Option<[i32; 2]> {
@@ -767,6 +788,22 @@ fn col_from_json(val: &Value) -> Option<[i32; 2]> {
         return None;
     }
     Some([arr[0].as_i64()? as i32, arr[1].as_i64()? as i32])
+}
+
+fn cols_from_json_any(val: &Value) -> Vec<[i32; 2]> {
+    let Some(arr) = val.as_array() else {
+        return Vec::new();
+    };
+    if arr.first().is_some_and(|v| v.is_i64()) {
+        let mut out = Vec::with_capacity(arr.len() / 2);
+        for pair in arr.chunks_exact(2) {
+            if let (Some(x), Some(z)) = (pair[0].as_i64(), pair[1].as_i64()) {
+                out.push([x as i32, z as i32]);
+            }
+        }
+        return out;
+    }
+    arr.iter().filter_map(col_from_json).collect()
 }
 
 fn active_col_from_json(val: &Value) -> Option<([i32; 2], i32, i32)> {
@@ -860,6 +897,11 @@ mod tests {
         );
         assert_eq!(loaded.bastions.len(), 1);
         assert_eq!(loaded.bastions[0].center, [210, 70, -40]);
+        assert_eq!(loaded.rifts[0].ring_columns, vec![[125, -80], [130, -85]]);
+        assert_eq!(
+            cols_from_json_any(&serde_json::json!([[10, 20], [-5, 8]])),
+            vec![[10, 20], [-5, 8]]
+        );
         assert!(loaded.is_quart_corrupted([120, 64, -88]));
         // Full vertical column is covered too.
         assert!(loaded.is_quart_corrupted([120, 180, -88]));

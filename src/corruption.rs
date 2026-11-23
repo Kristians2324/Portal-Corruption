@@ -337,10 +337,10 @@ pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
 }
 
 /// Dedicated per-tick block budget for full-depth underground boring down to Bedrock (`-63`).
-/// Scaled ~3.5x larger than horizontal surface expansion because each underground column spans
-/// ~130 blocks vertically vs ~22 blocks for surface crust.
+/// Keeps underground work concentrated inside 1–2 columns per tick so shader/client chunk
+/// meshing stays smooth without multi-chunk hitching.
 pub fn effective_deepen_budget(base_budget: usize, ring_radius: i32) -> usize {
-    (effective_rift_budget(base_budget, ring_radius) * 4 + 16).clamp(48, 176)
+    (effective_rift_budget(base_budget, ring_radius) * 2 + 6).clamp(24, 68)
 }
 
 /// Computes how deep the underground deepening pass can sink at horizontal
@@ -1037,7 +1037,7 @@ mod tests {
                 == Some("minecraft:ancient_debris")
         });
         assert!(found_diamond_tier, "diamond-level mature deepslate should yield ancient debris");
-        assert!(effective_deepen_budget(14, 60) >= effective_rift_budget(14, 60) * 3);
+        assert!(effective_deepen_budget(14, 60) > effective_rift_budget(14, 60));
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub struct ClientAtmosphere {
     pub camera_y: f32,
     pub height_above_ground: f32,
     pub tick_counter: u64,
+    pub last_sample_tick: u64,
+    pub last_sample_pos: Option<[i32; 3]>,
+    pub cached_sample: Option<NeighborhoodSample>,
+    pub cached_ground_y: Option<i32>,
 }
 
 pub fn fog_target_rgb(flavor: NetherFlavor) -> [f32; 3] {
@@ -234,20 +238,35 @@ pub fn tick_client_atmosphere(
     let py = camera.position[1].floor() as i32;
     let pz = camera.position[2].floor() as i32;
 
-    let ground_y = host
-        .client_surface_heights(&[(px, pz)], Heightmap::MotionBlocking)
-        .ok()
-        .and_then(|v| v.first().copied().flatten())
-        .unwrap_or(py - 4);
-    let height_above_ground = (camera.position[1] as f32 - ground_y as f32).max(0.0);
-
-    let probe_y = py.clamp(OVERWORLD_MIN_Y + 4, OVERWORLD_MAX_Y - 4);
-    let sample = blend_biome_neighborhood(px, pz, atmo.dominant_flavor, |sx, sz| {
-        level
-            .client_biome(host, [sx, probe_y, sz])
-            .or_else(|| level.client_biome(host, [sx, 64, sz]))
-            .and_then(|b| NetherFlavor::from_name(&b))
+    let moved_far = atmo.last_sample_pos.is_none_or(|p| {
+        (px - p[0]).abs() >= 2 || (pz - p[2]).abs() >= 2 || (py - p[1]).abs() >= 4
     });
+    let stale_tick = atmo.tick_counter.saturating_sub(atmo.last_sample_tick) >= 4;
+
+    if atmo.cached_sample.is_none() || moved_far || stale_tick {
+        let ground_y = host
+            .client_surface_heights(&[(px, pz)], Heightmap::MotionBlocking)
+            .ok()
+            .and_then(|v| v.first().copied().flatten())
+            .unwrap_or(py - 4);
+        let probe_y = py.clamp(OVERWORLD_MIN_Y + 4, OVERWORLD_MAX_Y - 4);
+        let sample = blend_biome_neighborhood(px, pz, atmo.dominant_flavor, |sx, sz| {
+            level
+                .client_biome(host, [sx, probe_y, sz])
+                .or_else(|| level.client_biome(host, [sx, 64, sz]))
+                .and_then(|b| NetherFlavor::from_name(&b))
+        });
+        atmo.cached_ground_y = Some(ground_y);
+        atmo.cached_sample = Some(sample);
+        atmo.last_sample_pos = Some([px, py, pz]);
+        atmo.last_sample_tick = atmo.tick_counter;
+    }
+
+    let ground_y = atmo.cached_ground_y.unwrap_or(py - 4);
+    let height_above_ground = (camera.position[1] as f32 - ground_y as f32).max(0.0);
+    let Some(sample) = atmo.cached_sample else {
+        return;
+    };
 
     step_client_atmosphere_values(
         atmo,

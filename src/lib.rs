@@ -38,7 +38,7 @@ use mod_api::{
     ServerStartedEvent, ServerStoppingEvent, SoundSource, Text, WorldLifecycleEvent, WorldPhase,
     WorldSavedEvent,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 const MAX_CORE_FORCED_CHUNKS: usize = 8;
@@ -339,11 +339,14 @@ fn evaluate_rift_containment(host: &mut dyn ServerHost, level: LevelRef, state: 
         if state.rifts[idx].pacified {
             continue;
         }
-        let check_this = force_all
-            || periodic
-            || queued
-                .iter()
-                .any(|p| dist_sq(*p, state.rifts[idx].center) <= 22 * 22);
+        let queued_near = queued
+            .iter()
+            .any(|p| dist_sq(*p, state.rifts[idx].center) <= 22 * 22);
+        let check_this = if state.rifts[idx].citadel_spawned {
+            force_all || queued_near || (periodic && state.tick % 200 == 0)
+        } else {
+            force_all || periodic || queued_near
+        };
         if !check_this {
             continue;
         }
@@ -698,7 +701,7 @@ fn plug_exposed_ocean_wall_at_col(
         if !is_open {
             continue;
         }
-        if let Some(bs) = resolve_block(host, pick_volcanic_berm_block(pos))
+        if let Some(bs) = resolve_block_cached(&mut state.block_state_cache, host, pick_volcanic_berm_block(pos))
             && level
                 .set_block(
                     host,
@@ -955,7 +958,8 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             }
             match decide_water_corruption(host, level, state, pos) {
                 WaterCorruptAction::QuenchVolcanicBerm(berm_id) => {
-                    if let Some(berm_bs) = resolve_block(host, berm_id)
+                    if let Some(berm_bs) =
+                        resolve_block_cached(&mut state.block_state_cache, host, berm_id)
                         && level
                             .set_block(
                                 host,
@@ -1038,7 +1042,8 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
                     }
                 }
             }
-        } else if is_within_evap_basin(state, pos)
+        } else if !is_never_waterlogged(&bname)
+            && is_within_evap_basin(state, pos)
             && level.block_property(host, pos, "waterlogged").as_deref() == Some("true")
         {
             let _ = host.set_block_property(pos, "waterlogged", "false");
@@ -1047,17 +1052,16 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
         }
     }
 
-    // Continuous gentle surface & river sweep over existing corrupted quart columns
-    // so lingering ponds, snow, or ice patches (including beneath tall forest canopies)
-    // never survive inside corrupted lands, while any exposed ocean face is sealed.
-    if state.corrupted_quart_cols.is_empty() {
+    // Gentle throttled sweep over existing corrupted quart columns (no per-tick Vec clone)
+    // so lingering ponds, snow, or ice patches never survive while exposed ocean faces seal cleanly.
+    if state.tick % 4 != 0 || state.corrupted_quart_cols_list.is_empty() {
         return;
     }
-    let cols: Vec<[i32; 2]> = state.corrupted_quart_cols.iter().copied().collect();
-    for _ in 0..12 {
-        let idx = state.water_sweep_cursor % cols.len();
+    for _ in 0..2 {
+        let len = state.corrupted_quart_cols_list.len();
+        let idx = state.water_sweep_cursor % len;
         state.water_sweep_cursor = state.water_sweep_cursor.wrapping_add(1);
-        let qc = cols[idx];
+        let qc = state.corrupted_quart_cols_list[idx];
         let sub_x = (qc[0] << 2) + ((state.tick as i32) & 3);
         let sub_z = (qc[1] << 2) + (((state.tick >> 2) as i32) & 3);
         if !level.is_loaded(host, [sub_x, 64, sub_z]) {
@@ -1086,13 +1090,14 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
         for range in scan_y_ranges.into_iter().flatten() {
             for y in range.0..=range.1 {
                 let p = [sub_x, y, sub_z];
-                if level
-                    .block(host, p)
-                    .is_some_and(|k| {
-                        let id = k.id(host);
-                        is_water_like(&id) || is_snow_or_ice(&id)
-                    })
-                    || level.block_property(host, p, "waterlogged").as_deref() == Some("true")
+                let Some(k) = level.block(host, p) else {
+                    continue;
+                };
+                let id = k.id(host);
+                if is_water_like(&id)
+                    || is_snow_or_ice(&id)
+                    || (!is_never_waterlogged(&id)
+                        && level.block_property(host, p, "waterlogged").as_deref() == Some("true"))
                 {
                     state.queue_water_evap(p);
                 }
@@ -1109,18 +1114,18 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
 /// scorched seabed as the corruption front advances outward, while strictly refusing to lower any
 /// column beside live water so vertical water walls never form.
 fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
-    if state.paused || state.shore_columns.is_empty() {
+    if state.paused || state.tick % 2 != 0 || state.shore_columns.is_empty() {
         return;
     }
-    let Some(air) = host.block_state_id("minecraft:air") else {
+    let Some(air) = resolve_block_cached(&mut state.block_state_cache, host, "minecraft:air") else {
         return;
     };
 
-    let max_rotations = state.shore_columns.len().min(96);
+    let max_rotations = state.shore_columns.len().min(24);
     let mut eroded_ops = 0usize;
     let mut rotated = 0usize;
 
-    while eroded_ops < 16 && rotated < max_rotations {
+    while eroded_ops < 4 && rotated < max_rotations {
         let Some(col) = state.pop_shore_col() else {
             break;
         };
@@ -1210,7 +1215,8 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
                     is_air_like(&id) || is_water_like(&id)
                 });
                 if is_open
-                    && let Some(bs) = resolve_block(host, pick_volcanic_berm_block(p))
+                    && let Some(bs) =
+                        resolve_block_cached(&mut state.block_state_cache, host, pick_volcanic_berm_block(p))
                     && level
                         .set_block(
                             host,
@@ -1262,9 +1268,75 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
     }
 }
 
-fn resolve_block(host: &dyn ServerHost, id: &str) -> Option<mod_api::BlockState> {
-    host.block_state_id(id)
-        .or_else(|| host.block_key(id).and_then(|k| host.block_state_default(k)))
+fn resolve_block_cached(
+    cache: &mut HashMap<&'static str, mod_api::BlockState>,
+    host: &dyn ServerHost,
+    id: &'static str,
+) -> Option<mod_api::BlockState> {
+    if let Some(&bs) = cache.get(id) {
+        return Some(bs);
+    }
+    let bs = host
+        .block_state_id(id)
+        .or_else(|| host.block_key(id).and_then(|k| host.block_state_default(k)))?;
+    cache.insert(id, bs);
+    Some(bs)
+}
+
+fn is_never_waterlogged(id: &str) -> bool {
+    let s = strip_ns(id);
+    matches!(
+        s,
+        "air"
+            | "cave_air"
+            | "void_air"
+            | "water"
+            | "flowing_water"
+            | "lava"
+            | "flowing_lava"
+            | "stone"
+            | "deepslate"
+            | "granite"
+            | "diorite"
+            | "andesite"
+            | "tuff"
+            | "calcite"
+            | "dirt"
+            | "coarse_dirt"
+            | "rooted_dirt"
+            | "sand"
+            | "red_sand"
+            | "gravel"
+            | "grass_block"
+            | "podzol"
+            | "mycelium"
+            | "moss_block"
+            | "pale_moss_block"
+            | "netherrack"
+            | "crimson_nylium"
+            | "warped_nylium"
+            | "blackstone"
+            | "basalt"
+            | "smooth_basalt"
+            | "magma_block"
+            | "soul_sand"
+            | "soul_soil"
+            | "bedrock"
+            | "obsidian"
+            | "crying_obsidian"
+            | "ancient_debris"
+            | "sandstone"
+            | "red_sandstone"
+            | "dripstone_block"
+            | "sculk"
+            | "amethyst_block"
+            | "budding_amethyst"
+            | "raw_iron_block"
+            | "raw_copper_block"
+    ) || s.ends_with("_ore")
+        || s.ends_with("_log")
+        || s.ends_with("_wood")
+        || s.ends_with("_leaves")
 }
 
 fn pop_next_loaded_column(
@@ -1376,7 +1448,9 @@ fn apply_corruption_at(
         NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
     };
 
-    let was_waterlogged = level.block_property(host, pos, "waterlogged").as_deref() == Some("true");
+    let check_waterlogged = !is_never_waterlogged(current);
+    let was_waterlogged = check_waterlogged
+        && level.block_property(host, pos, "waterlogged").as_deref() == Some("true");
     if was_waterlogged {
         let _ = host.set_block_property(pos, "waterlogged", "false");
         state.queue_water_evap(pos);
@@ -1403,9 +1477,11 @@ fn apply_corruption_at(
 
     let mut changed = false;
     if let Some(target_id) = out.block
-        && let Some(block_state) = resolve_block(host, target_id)
+        && let Some(block_state) = resolve_block_cached(&mut state.block_state_cache, host, target_id)
     {
-        let flags = if target_id == "minecraft:air" {
+        let known_shape_solid =
+            !is_water_or_frozen && out.above.is_none() && out.below.is_none();
+        let flags = if target_id == "minecraft:air" || known_shape_solid {
             BlockUpdateFlags::CLIENTS
                 | BlockUpdateFlags::KNOWN_SHAPE
                 | BlockUpdateFlags::SUPPRESS_DROPS
@@ -1429,7 +1505,8 @@ fn apply_corruption_at(
             if let Some(above_id) = out.above
                 && y + 1 < OVERWORLD_MAX_Y
                 && is_air_like(&above)
-                && let Some(above_state) = resolve_block(host, above_id)
+                && let Some(above_state) =
+                    resolve_block_cached(&mut state.block_state_cache, host, above_id)
             {
                 let _ = level.set_block(
                     host,
@@ -1442,7 +1519,8 @@ fn apply_corruption_at(
             if let Some(below_id) = out.below
                 && y - 1 > OVERWORLD_MIN_Y
                 && is_air_like(&below)
-                && let Some(below_state) = resolve_block(host, below_id)
+                && let Some(below_state) =
+                    resolve_block_cached(&mut state.block_state_cache, host, below_id)
             {
                 let _ = level.set_block(
                     host,
@@ -1638,7 +1716,7 @@ fn refill_priority_deepen_cols(
     if state
         .last_deepen_probe_tick
         .get(&rift_id)
-        .is_some_and(|t| state.tick.saturating_sub(*t) < 15)
+        .is_some_and(|t| state.tick.saturating_sub(*t) < 40)
     {
         return;
     }
@@ -1679,7 +1757,7 @@ fn refill_priority_deepen_cols(
                 let cave_bot = (py - 28).max(BEDROCK_FLOOR_Y);
                 foci.push(ProbeFocus {
                     xz: [px, pz],
-                    scan_r: 26,
+                    scan_r: 18,
                     top_y: cave_top,
                     bottom_y: cave_bot,
                     cave_band: py >> 4,
@@ -1687,7 +1765,7 @@ fn refill_priority_deepen_cols(
             } else {
                 foci.push(ProbeFocus {
                     xz: [px, pz],
-                    scan_r: 20,
+                    scan_r: 14,
                     top_y: OVERWORLD_MAX_Y,
                     bottom_y: BEDROCK_FLOOR_Y,
                     cave_band: i32::MIN,
@@ -1698,7 +1776,7 @@ fn refill_priority_deepen_cols(
     // Always prioritize the epicenter core alongside active player neighborhoods.
     foci.push(ProbeFocus {
         xz: [center[0], center[2]],
-        scan_r: 24,
+        scan_r: 18,
         top_y: OVERWORLD_MAX_Y,
         bottom_y: BEDROCK_FLOOR_Y,
         cave_band: i32::MIN,
@@ -1715,7 +1793,7 @@ fn refill_priority_deepen_cols(
                 build_ring_columns(focus.xz[0], focus.xz[1], r)
             };
             for col in ring {
-                if batch.len() >= 280 {
+                if batch.len() >= 128 {
                     break;
                 }
                 if horiz_dist_sq(center, [col[0], 64, col[1]]) > max_r_sq {
@@ -1732,11 +1810,11 @@ fn refill_priority_deepen_cols(
                 }
                 batch.push_back((col, focus.top_y, focus.bottom_y, focus.cave_band));
             }
-            if batch.len() >= 280 {
+            if batch.len() >= 128 {
                 break;
             }
         }
-        if batch.len() >= 280 {
+        if batch.len() >= 128 {
             break;
         }
     }
@@ -1761,7 +1839,11 @@ fn next_deepen_column_for_stream(
                 || (band != i32::MIN && state.session_cave_band_cols.contains(&(col, band)));
             if !already_done && level.is_loaded(host, [col[0], 64, col[1]]) {
                 let start_y = if top_y >= OVERWORLD_MAX_Y {
-                    let (ws, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
+                    let ws = host
+                        .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+                        .ok()
+                        .and_then(|hs| hs.first().copied().flatten())
+                        .unwrap_or(rift_center[1] + 24);
                     (ws + 2).min(OVERWORLD_MAX_Y - 1)
                 } else {
                     top_y
@@ -1804,7 +1886,11 @@ fn next_deepen_column_for_stream(
     r.deepen_radius = d_rad;
     r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
     picked.map(|col| {
-        let (ws, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
+        let ws = host
+            .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+            .ok()
+            .and_then(|hs| hs.first().copied().flatten())
+            .unwrap_or(rift_center[1] + 24);
         let start_y = (ws + 2).min(OVERWORLD_MAX_Y - 1);
         (col, start_y, BEDROCK_FLOOR_Y, i32::MIN)
     })
@@ -1823,7 +1909,7 @@ fn bore_deepen_stream(
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
 
-    while *budget > 0 && skips < 3072 {
+    while *budget > 0 && skips < 512 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
@@ -1977,11 +2063,6 @@ fn corrupt_deepen_step(
     ring_budget += priority_budget;
     bore_deepen_stream(host, level, state, rift_idx, &mut ring_budget, false);
 
-    if ring_budget > 0 {
-        let mut extra = ring_budget;
-        bore_deepen_stream(host, level, state, rift_idx, &mut extra, true);
-        ring_budget = extra;
-    }
     *budget = ring_budget;
 }
 
@@ -2019,7 +2100,7 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         .map(|&idx| effective_deepen_budget(state.spread_budget, state.rifts[idx].ring_radius))
         .collect();
     let total_deep_raw: usize = deepen_raw.iter().sum();
-    let global_deep_cap = (state.spread_budget * 14).clamp(140, 260);
+    let global_deep_cap = (state.spread_budget * 6).clamp(64, 96);
 
     let count = uncontained_indices.len();
     let start = (state.tick as usize) % count;
@@ -2608,7 +2689,7 @@ impl Hooks for Mod {
         citadel::tick_citadel_emergence(server, event.level, &mut state);
         regression::tick_regression(server, event.level, &mut state);
 
-        if state.tick % 200 == 0 {
+        if state.tick % 1200 == 0 {
             state.save_to_host(server);
         }
     }

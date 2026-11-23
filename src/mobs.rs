@@ -362,9 +362,10 @@ fn process_predator_hunting_and_buffs(
                 if (state.tick + u64::from(*id)) % 80 < MOB_TICK_INTERVAL {
                     fire_buffs.push(*ent);
                 }
-                if pos_is_corrupted(host, level, state, bp)
-                    && state.zombification_immune_mobs.insert(*id)
+                if !state.zombification_immune_mobs.contains(id)
+                    && pos_is_corrupted(host, level, state, bp)
                 {
+                    state.zombification_immune_mobs.insert(*id);
                     immunize_mobs.push(*id);
                 }
             }
@@ -372,12 +373,21 @@ fn process_predator_hunting_and_buffs(
             prey.push((*ent, *pos));
         }
 
-        if is_nether_touched_candidate(kind) && location_unlocks_nether_mobs(state, bp) {
-            let newly_touched = state.nether_touched_mobs.insert(*id);
-            if newly_touched {
+        if is_nether_touched_candidate(kind) {
+            let already_touched = state.nether_touched_mobs.contains(id);
+            let active_touched = if already_touched {
+                state.is_quart_corrupted(bp)
+            } else if location_unlocks_nether_mobs(state, bp) {
+                state.nether_touched_mobs.insert(*id);
                 touched_buffs.push((*ent, *pos));
-            }
-            if let Some(pal) = particles {
+                true
+            } else {
+                false
+            };
+            if active_touched
+                && (state.tick + u64::from(*id)) % 40 < MOB_TICK_INTERVAL
+                && let Some(pal) = particles
+            {
                 let _ = level.send_particles(
                     host,
                     &ParticleOptions::simple(pal.small_flame),
@@ -392,6 +402,9 @@ fn process_predator_hunting_and_buffs(
     }
     state
         .zombification_immune_mobs
+        .retain(|id| state.known_nether_mobs.contains(id));
+    state
+        .magma_melee_ready
         .retain(|id| state.known_nether_mobs.contains(id));
 
     for id in immunize_mobs {
@@ -537,7 +550,8 @@ fn process_predator_hunting_and_buffs(
         // Ensure Magma Cubes have an active melee goal and actually strike adjacent
         // Overworld animals rather than passively bouncing beside cows/pigs/sheep.
         if hunter_short == "magma_cube" {
-            if let Some(goals) = mob.goals(host)
+            if state.magma_melee_ready.insert(hunter_ent.id())
+                && let Some(goals) = mob.goals(host)
                 && !goals.iter().any(|g| g.id == "melee_attack")
             {
                 let _ = mob.add_goal(
