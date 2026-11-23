@@ -34,10 +34,10 @@ use mod_api::{
     Heightmap, Hooks, Host, HostSide, Identifier, ItemStack, LevelDimension, LevelHost,
     LevelRandomHost, LevelRef, LevelTickPostEvent, LivingChangeTargetEvent,
     LivingConversionPreEvent, LivingDeathEvent, LivingIncomingDamageEvent, LootDropsEvent,
-    MusicEvent, ParticleOptions, PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent,
-    Registrar, RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost,
-    ServerStartedEvent, ServerStoppingEvent, SoundSource, Text, WorldLifecycleEvent, WorldPhase,
-    WorldSavedEvent,
+    MobSpawnPlacementCheckEvent, MobSpawnPositionCheckEvent, MusicEvent, ParticleOptions,
+    PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    ServerStoppingEvent, SoundSource, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -2736,15 +2736,35 @@ impl Hooks for Mod {
 
     fn finalize_spawn(
         &self,
-        _host: &dyn mod_api::Host,
+        host: &dyn mod_api::Host,
         event: &mut FinalizeSpawnEvent<'_>,
     ) -> Flow {
         if let Ok(state) = self.state.try_lock()
-            && mobs::should_cancel_finalize_spawn(&state, event)
+            && mobs::should_cancel_finalize_spawn(host, &state, event)
         {
             event.spawn_cancelled = true;
         }
         Flow::Continue
+    }
+
+    fn mob_spawn_placement_check(
+        &self,
+        host: &dyn mod_api::Host,
+        event: &mut MobSpawnPlacementCheckEvent<'_>,
+    ) {
+        if let Ok(state) = self.state.try_lock() {
+            mobs::handle_mob_spawn_placement_check(host, &state, event);
+        }
+    }
+
+    fn mob_spawn_position_check(
+        &self,
+        host: &dyn mod_api::Host,
+        event: &mut MobSpawnPositionCheckEvent<'_>,
+    ) {
+        if let Ok(state) = self.state.try_lock() {
+            mobs::handle_mob_spawn_position_check(host, &state, event);
+        }
     }
 
     fn potential_spawns(&self, host: &dyn mod_api::Host, event: &mut PotentialSpawnsEvent<'_>) -> Flow {

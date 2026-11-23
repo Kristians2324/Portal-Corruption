@@ -11,13 +11,14 @@ use mod_api::{
     ActiveEffect, BlockState, BlockUpdateFlags, Compound, EntityRef, EquipmentSlot,
     FinalizeSpawnEvent, GoalSpec, Heightmap, Host, Identifier, ItemStack, LevelRef,
     LivingChangeTargetEvent, LivingDeathEvent, LivingIncomingDamageEvent, MobFilter,
-    ParticleOptions, PotentialSpawnsEvent, ServerHost, SoundSource, SpawnEntry, SpawnReason, Tag,
+    MobSpawnPlacementCheckEvent, MobSpawnPositionCheckEvent, ParticleOptions, PotentialSpawnsEvent,
+    ServerHost, SoundSource, SpawnCheck, SpawnEntry, SpawnReason, Tag,
 };
 use std::collections::HashMap;
 
 const MOB_TICK_INTERVAL: u64 = 10;
 const HOGLIN_SPREAD_INTERVAL_TICKS: u64 = 24;
-const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
+const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 60;
 const STRIDER_SPAWN_INTERVAL_TICKS: u64 = 60;
 
 /// Mobs only unlock once corruption has converted a pretty large Nether biome
@@ -58,19 +59,77 @@ pub fn location_unlocks_nether_mobs(state: &RiftState, pos: [i32; 3]) -> bool {
     })
 }
 
-/// Blocks vanilla Nether mob spawns inside immature Rifts AND blocks ALL new Nether mob spawns
-/// inside pacified or regressing Rift zones (while letting already-alive survivors remain).
-pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEvent<'_>) -> bool {
+/// True for world-generated / natural / chunk / patrol / structure spawns whose ecology is
+/// governed by biome rules (as opposed to `/summon`, spawn eggs, conversion, or breeding).
+pub fn is_world_spawn_reason(reason: SpawnReason) -> bool {
+    matches!(
+        reason,
+        SpawnReason::Natural
+            | SpawnReason::ChunkGeneration
+            | SpawnReason::Spawner
+            | SpawnReason::TrialSpawner
+            | SpawnReason::Reinforcement
+            | SpawnReason::Patrol
+            | SpawnReason::Structure
+            | SpawnReason::Event
+            | SpawnReason::Jockey
+            | SpawnReason::Triggered
+    )
+}
+
+/// True ONLY for Nether fauna appropriate for converted Overworld Nether biomes.
+/// Rejects normal Overworld animals, monsters (zombies, creepers, skeletons, spiders,
+/// drowned, phantoms, slimes, witches, pillagers), bats, squids, and fish.
+pub fn is_allowed_in_nether_biome(kind: &str, flavor: Option<NetherFlavor>) -> bool {
+    let short = strip_ns(kind);
+    if is_nether_predator(kind) || matches!(short, "strider" | "wither") {
+        return true;
+    }
+    match (short, flavor) {
+        (
+            "enderman",
+            Some(NetherFlavor::WarpedForest | NetherFlavor::SoulSandValley) | None,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// Pure decision helper shared by `finalize_spawn` and unit tests:
+/// 1) Never lets normal Overworld mobs naturally spawn inside converted Nether biomes/quarts.
+/// 2) Still blocks premature Nether mob spawns around immature (`< 55k` / `< 32` radius)
+///    or pacified/regressing Rifts.
+pub fn should_cancel_world_spawn_kind(
+    kind: &str,
+    reason: SpawnReason,
+    in_nether_zone: bool,
+    biome_flavor: Option<NetherFlavor>,
+    unlocks_nether_mobs: bool,
+    near_any_rift: bool,
+) -> bool {
+    if !is_world_spawn_reason(reason) {
+        return false;
+    }
+    if in_nether_zone && !is_allowed_in_nether_biome(kind, biome_flavor) {
+        return true;
+    }
+    if (is_nether_predator(kind) || strip_ns(kind) == "strider")
+        && near_any_rift
+        && !unlocks_nether_mobs
+    {
+        return true;
+    }
+    false
+}
+
+/// Blocks normal Overworld mobs inside converted Nether biomes AND blocks premature Nether
+/// spawns inside immature / pacified / regressing Rifts (while letting commands, spawn eggs,
+/// conversions, and already-alive survivors remain).
+pub fn should_cancel_finalize_spawn(
+    host: &dyn Host,
+    state: &RiftState,
+    event: &FinalizeSpawnEvent<'_>,
+) -> bool {
     if event.dimension != OVERWORLD {
-        return false;
-    }
-    if !is_nether_predator(event.kind) && strip_ns(event.kind) != "strider" {
-        return false;
-    }
-    if matches!(
-        event.reason,
-        SpawnReason::Command | SpawnReason::SpawnItemUse | SpawnReason::Conversion
-    ) {
         return false;
     }
     let bp = [
@@ -78,12 +137,211 @@ pub fn should_cancel_finalize_spawn(state: &RiftState, event: &FinalizeSpawnEven
         event.pos[1].floor() as i32,
         event.pos[2].floor() as i32,
     ];
-    let near_any_rift = state.is_quart_corrupted(bp)
+    let biome_flavor = host
+        .level(OVERWORLD)
+        .and_then(|l| local_corrupt_flavor(host, l, bp));
+    let in_nether_zone = biome_flavor.is_some() || state.is_quart_corrupted(bp);
+    let near_any_rift = in_nether_zone
         || state
             .rifts
             .iter()
             .any(|r| horiz_dist_sq(r.center, bp) <= (r.max_radius_sq + 512).max(48 * 48));
-    near_any_rift && !location_unlocks_nether_mobs(state, bp)
+    if !near_any_rift {
+        return false;
+    }
+    should_cancel_world_spawn_kind(
+        event.kind,
+        event.reason,
+        in_nether_zone,
+        biome_flavor,
+        location_unlocks_nether_mobs(state, bp),
+        near_any_rift,
+    )
+}
+
+fn is_nether_open_headroom(name: &str) -> bool {
+    is_open_space(name)
+        || matches!(
+            strip_ns(name),
+            "crimson_roots"
+                | "warped_roots"
+                | "nether_sprouts"
+                | "crimson_fungus"
+                | "warped_fungus"
+                | "twisting_vines"
+                | "twisting_vines_plant"
+                | "weeping_vines"
+                | "weeping_vines_plant"
+                | "fire"
+                | "soul_fire"
+        )
+}
+
+fn is_standable_nether_ground(name: &str) -> bool {
+    let short = strip_ns(name);
+    !name.is_empty()
+        && !is_air_like(name)
+        && !crate::corruption::is_water_like(name)
+        && !is_nether_open_headroom(name)
+        && !matches!(
+            short,
+            "lava"
+                | "flowing_lava"
+                | "bedrock"
+                | "barrier"
+                | "nether_wart_block"
+                | "warped_wart_block"
+        )
+}
+
+fn valid_nether_spawn_spot(
+    host: &dyn Host,
+    level: LevelRef,
+    kind: &str,
+    bp: [i32; 3],
+) -> bool {
+    if !level.is_loaded(host, bp) {
+        return false;
+    }
+    let short = strip_ns(kind);
+    if short == "ghast" {
+        if bp[1] < 48 || (spatial_hash(bp[0], bp[1], bp[2], 0x6A57) % 4) != 0 {
+            return false;
+        }
+        return [
+            bp,
+            [bp[0], bp[1] + 1, bp[2]],
+            [bp[0], bp[1] + 2, bp[2]],
+            [bp[0] + 1, bp[1] + 1, bp[2]],
+            [bp[0], bp[1] + 1, bp[2] + 1],
+        ]
+        .into_iter()
+        .all(|p| level.block(host, p).is_some_and(|k| is_air_like(&k.id(host))));
+    }
+    if short == "strider" {
+        let on_lava = level
+            .block(host, bp)
+            .is_some_and(|k| strip_ns(&k.id(host)) == "lava")
+            || (bp[1] > OVERWORLD_MIN_Y
+                && level
+                    .block(host, [bp[0], bp[1] - 1, bp[2]])
+                    .is_some_and(|k| strip_ns(&k.id(host)) == "lava"));
+        let clear = bp[1] < OVERWORLD_MAX_Y
+            && level
+                .block(host, [bp[0], bp[1] + 1, bp[2]])
+                .is_some_and(|k| is_nether_open_headroom(&k.id(host)));
+        return on_lava && clear;
+    }
+
+    if bp[1] <= OVERWORLD_MIN_Y || bp[1] + 2 >= OVERWORLD_MAX_Y {
+        return false;
+    }
+    let below_ok = level
+        .block(host, [bp[0], bp[1] - 1, bp[2]])
+        .is_some_and(|k| is_standable_nether_ground(&k.id(host)));
+    if !below_ok {
+        return false;
+    }
+    let body_clear = level
+        .block(host, bp)
+        .is_some_and(|k| is_nether_open_headroom(&k.id(host)))
+        && level
+            .block(host, [bp[0], bp[1] + 1, bp[2]])
+            .is_some_and(|k| is_nether_open_headroom(&k.id(host)));
+    if !body_clear {
+        return false;
+    }
+    if matches!(short, "enderman" | "wither_skeleton" | "hoglin") {
+        let top_clear = level
+            .block(host, [bp[0], bp[1] + 2, bp[2]])
+            .is_some_and(|k| is_nether_open_headroom(&k.id(host)));
+        if !top_clear {
+            return false;
+        }
+    }
+    true
+}
+
+fn evaluate_nether_spawn_check(
+    host: &dyn Host,
+    state: &RiftState,
+    dimension: &str,
+    kind: &str,
+    reason: SpawnReason,
+    bp: [i32; 3],
+    level: LevelRef,
+) -> SpawnCheck {
+    if dimension != OVERWORLD || !is_world_spawn_reason(reason) {
+        return SpawnCheck::Default;
+    }
+    let biome_flavor = local_corrupt_flavor(host, level, bp);
+    let in_nether_zone = biome_flavor.is_some() || state.is_quart_corrupted(bp);
+    if !in_nether_zone {
+        return SpawnCheck::Default;
+    }
+    if !is_allowed_in_nether_biome(kind, biome_flavor) {
+        return SpawnCheck::Fail;
+    }
+    if !location_unlocks_nether_mobs(state, bp) {
+        return SpawnCheck::Fail;
+    }
+    let peaceful = level.difficulty(host) == Some("peaceful");
+    if peaceful && strip_ns(kind) != "strider" {
+        return SpawnCheck::Fail;
+    }
+    if valid_nether_spawn_spot(host, level, kind, bp) {
+        SpawnCheck::Succeed
+    } else {
+        SpawnCheck::Fail
+    }
+}
+
+/// Ensures normal Overworld mobs fail early at `mob_spawn_placement_check` inside Nether biomes,
+/// while allowing unlocked Nether mobs to pass Overworld daylight checks on valid Nether ground.
+pub fn handle_mob_spawn_placement_check(
+    host: &dyn Host,
+    state: &RiftState,
+    event: &mut MobSpawnPlacementCheckEvent<'_>,
+) {
+    let bp = [event.pos.x, event.pos.y, event.pos.z];
+    let check = evaluate_nether_spawn_check(
+        host,
+        state,
+        event.dimension,
+        event.kind,
+        event.reason,
+        bp,
+        event.level,
+    );
+    if check != SpawnCheck::Default {
+        *event.result = check;
+    }
+}
+
+/// Mirrors placement checks at `mob_spawn_position_check` so Overworld skylight (`Monster` dark
+/// check) or Ghast 5% rolls don't reject valid unlocked Nether biome spawns a second time.
+pub fn handle_mob_spawn_position_check(
+    host: &dyn Host,
+    state: &RiftState,
+    event: &mut MobSpawnPositionCheckEvent<'_>,
+) {
+    let bp = [
+        event.pos[0].floor() as i32,
+        event.pos[1].floor() as i32,
+        event.pos[2].floor() as i32,
+    ];
+    let check = evaluate_nether_spawn_check(
+        host,
+        state,
+        event.dimension,
+        event.kind,
+        event.reason,
+        bp,
+        event.level,
+    );
+    if check != SpawnCheck::Default {
+        *event.result = check;
+    }
 }
 
 /// True for Nether mobs native to or brought forth by Rifts.
@@ -1223,9 +1481,10 @@ fn pick_mob_for_flavor(flavor: NetherFlavor, roll: u64, rift_blocks: u64) -> &'s
         (NetherFlavor::WarpedForest, 0..=4) => "minecraft:enderman",
         (NetherFlavor::WarpedForest, 5..=7) => "minecraft:piglin",
         (NetherFlavor::WarpedForest, _) if rift_blocks >= 85_000 => "minecraft:blaze",
-        (NetherFlavor::WarpedForest, _) => "minecraft:strider",
+        (NetherFlavor::WarpedForest, _) => "minecraft:enderman",
         (NetherFlavor::SoulSandValley, 0..=4) => "minecraft:wither_skeleton",
-        (NetherFlavor::SoulSandValley, 5..=7) => "minecraft:skeleton",
+        (NetherFlavor::SoulSandValley, 5..=6) => "minecraft:enderman",
+        (NetherFlavor::SoulSandValley, 7) => "minecraft:blaze",
         (NetherFlavor::SoulSandValley, _) if rift_blocks >= 85_000 => "minecraft:ghast",
         (NetherFlavor::SoulSandValley, _) => "minecraft:wither_skeleton",
         (NetherFlavor::BasaltDeltas, 0..=6) => "minecraft:magma_cube",
@@ -1265,8 +1524,8 @@ fn pick_underground_mob_for_flavor(flavor: NetherFlavor, roll: u64, headroom: i3
         (NetherFlavor::WarpedForest, 5..=7) => "minecraft:piglin",
         (NetherFlavor::WarpedForest, 8) => "minecraft:blaze",
         (NetherFlavor::WarpedForest, _) => "minecraft:zombified_piglin",
-        (NetherFlavor::SoulSandValley, 0..=4) => "minecraft:wither_skeleton",
-        (NetherFlavor::SoulSandValley, 5..=7) => "minecraft:skeleton",
+        (NetherFlavor::SoulSandValley, 0..=5) => "minecraft:wither_skeleton",
+        (NetherFlavor::SoulSandValley, 6..=7) => "minecraft:enderman",
         (NetherFlavor::SoulSandValley, 8) => "minecraft:blaze",
         (NetherFlavor::SoulSandValley, _) => "minecraft:magma_cube",
         (NetherFlavor::BasaltDeltas, 0..=6) => "minecraft:magma_cube",
@@ -1284,18 +1543,14 @@ pub fn tune_underground_spawn_entries(entries: &mut Vec<SpawnEntry>, y: i32) {
     if y >= 48 {
         return;
     }
-    // Keep cramped cave tunnels free of giant ghasts while balancing Overworld vs Nether odds
-    // so Nether mobs still appear underground (rarer deep below y=0 than mid-depth).
-    entries.retain(|e| strip_ns(&e.entity) != "ghast");
-    for entry in entries.iter_mut() {
-        let is_nether = is_nether_predator(&entry.entity) || strip_ns(&entry.entity) == "strider";
-        if is_nether {
-            if y < 0 {
-                entry.weight = ((entry.weight * 6) / 10).max(2);
-            }
-        } else {
-            let cap = if y < 0 { 28 } else { 18 };
-            entry.weight = entry.weight.min(cap).max(1);
+    // Strip giant ghasts AND any normal Overworld mobs in subterranean Nether biomes,
+    // while keeping deep Nether mob weights sparser near bedrock than upper caves/surface.
+    entries.retain(|e| {
+        strip_ns(&e.entity) != "ghast" && is_allowed_in_nether_biome(&e.entity, None)
+    });
+    if y < 0 {
+        for entry in entries.iter_mut() {
+            entry.weight = ((entry.weight * 6) / 10).max(2);
         }
     }
 }
@@ -1360,6 +1615,9 @@ fn process_supplemental_spawns(
     state: &mut RiftState,
     entities: &[(EntityRef, u32, String, [f64; 3])],
 ) {
+    if level.difficulty(host) == Some("peaceful") {
+        return;
+    }
     // Wait until at least one active rift (or connected wasteland) forms a pretty large Nether biome.
     if !state
         .rifts
@@ -1370,15 +1628,28 @@ fn process_supplemental_spawns(
         return;
     }
 
-    let nether_mob_count = entities
-        .iter()
-        .filter(|(_, _, k, _)| is_nether_predator(k))
-        .count();
-    if nether_mob_count >= 34 {
+    // Count only outdoor/roaming Nether mobs (exclude Outpost/Citadel garrison guards so
+    // having structures loaded never starves the surrounding corrupted biome!).
+    const MAX_GLOBAL_ROAMING_NETHER: usize = 96;
+    const MAX_LOCAL_ROAMING_NETHER: usize = 28;
+
+    let mut roaming_positions: Vec<[i32; 3]> = Vec::new();
+    for (_, id, k, pos) in entities {
+        if (is_nether_predator(k) || strip_ns(k) == "enderman")
+            && !state.citadel_guards.contains(id)
+        {
+            roaming_positions.push([
+                pos[0].floor() as i32,
+                pos[1].floor() as i32,
+                pos[2].floor() as i32,
+            ]);
+        }
+    }
+    if roaming_positions.len() >= MAX_GLOBAL_ROAMING_NETHER {
         return;
     }
 
-    let mut spawn_anchor: Option<(u64, NetherFlavor, u64, [i32; 3])> = None;
+    let mut candidate_anchors: Vec<(u64, NetherFlavor, u64, [i32; 3])> = Vec::new();
 
     for player in host.players().server_players() {
         let Some(dim) = player.dimension(host) else {
@@ -1402,87 +1673,228 @@ fn process_supplemental_spawns(
             .filter(|(idx, r)| {
                 r.is_actively_spreading()
                     && rift_mobs_unlocked_in_state(state, *idx)
-                    && horiz_dist_sq(r.center, pp) <= 96 * 96
+                    && (state.is_quart_corrupted(pp)
+                        || horiz_dist_sq(r.center, pp)
+                            <= (r.max_radius_sq + 96 * 96).max(96 * 96))
             })
             .min_by_key(|(_, r)| dist_sq(r.center, pp))
         {
             let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
-            spawn_anchor = Some((rift.id, rift.flavor, w_blocks, pp));
-            break;
+            candidate_anchors.push((rift.id, rift.flavor, w_blocks, pp));
         }
     }
 
-    if spawn_anchor.is_none()
-        && let Some((idx, rift)) = state
-            .rifts
-            .iter()
-            .enumerate()
-            .find(|(idx, r)| r.is_actively_spreading() && rift_mobs_unlocked_in_state(state, *idx))
-    {
-        let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
-        spawn_anchor = Some((rift.id, rift.flavor, w_blocks, rift.center));
+    if candidate_anchors.is_empty() {
+        for (idx, rift) in state.rifts.iter().enumerate() {
+            if r_is_spawn_ready(state, idx, rift) {
+                let w_blocks = state.connected_wasteland_for(idx).total_corrupted_blocks;
+                candidate_anchors.push((rift.id, rift.flavor, w_blocks, rift.center));
+            }
+        }
+    }
+    if candidate_anchors.is_empty() {
+        return;
     }
 
-    let Some((rift_id, fallback_flavor, corrupted_blocks, anchor)) = spawn_anchor else {
-        return;
-    };
+    let cycle = (state.tick / SUPPLEMENTAL_SPAWN_INTERVAL_TICKS) as usize;
+    let chosen = candidate_anchors[cycle % candidate_anchors.len()];
+    let (rift_id, fallback_flavor, corrupted_blocks, anchor) = chosen;
 
-    let h = spatial_hash(anchor[0], anchor[1], anchor[2], state.tick ^ rift_id);
-    let dx = ((h & 31) as i32) - 16;
-    let dz = (((h >> 8) & 31) as i32) - 16;
-    let sx = anchor[0] + dx;
-    let sz = anchor[2] + dz;
+    let local_roaming = roaming_positions
+        .iter()
+        .filter(|rp| horiz_dist_sq(**rp, anchor) <= 64 * 64)
+        .count();
+    if local_roaming >= MAX_LOCAL_ROAMING_NETHER {
+        return;
+    }
+
+    let mut probes: Vec<(i32, i32)> = Vec::with_capacity(9);
+    let loaded_y = anchor[1].clamp(OVERWORLD_MIN_Y + 2, OVERWORLD_MAX_Y - 4);
+    for i in 0..8usize {
+        let h = spatial_hash(
+            anchor[0],
+            anchor[1],
+            anchor[2],
+            state.tick ^ rift_id ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        let dist = 14 + (h % 33) as i32; // 14..=46 blocks
+        let angle = ((h >> 12) % 360) as f64 * std::f64::consts::TAU / 360.0;
+        let sx = anchor[0] + (f64::from(dist) * angle.cos()).round() as i32;
+        let sz = anchor[2] + (f64::from(dist) * angle.sin()).round() as i32;
+        if level.is_loaded(host, [sx, loaded_y, sz]) {
+            probes.push((sx, sz));
+        }
+    }
+    if probes.is_empty() {
+        return;
+    }
+    let probe_count = probes.len();
+    probes.push((anchor[0], anchor[2]));
+
     let Ok(heights) =
-        host.surface_heights(OVERWORLD, &[(sx, sz), (anchor[0], anchor[2])], Heightmap::MotionBlockingNoLeaves)
+        host.surface_heights(OVERWORLD, &probes, Heightmap::MotionBlockingNoLeaves)
     else {
         return;
     };
-    let Some(Some(sy)) = heights.first().copied() else {
+    let anchor_sy = heights
+        .get(probe_count)
+        .copied()
+        .flatten()
+        .unwrap_or(anchor[1] + 2);
+
+    let remaining_budget = (MAX_GLOBAL_ROAMING_NETHER - roaming_positions.len())
+        .min(MAX_LOCAL_ROAMING_NETHER - local_roaming);
+    if remaining_budget == 0 {
         return;
-    };
-    let anchor_sy = heights.get(1).copied().flatten().unwrap_or(sy);
+    }
 
-    let (ground, spawn_pos, mob_kind) = if anchor[1] < anchor_sy - 10 {
+    let is_underground = anchor[1] < anchor_sy - 10;
+    if is_underground {
+        let roll = spatial_hash(anchor[0], anchor[1], anchor[2], state.tick ^ rift_id);
         let chance = underground_spawn_chance_pct(anchor[1], anchor_sy);
-        if ((h >> 24) % 100) >= chance {
+        if (roll % 100) >= chance {
             return;
         }
-        let Some((cave_y, headroom)) =
-            find_underground_spawn_spot(host, level, sx, sz, anchor[1], sy)
-        else {
-            return;
-        };
-        let g = [sx, cave_y - 1, sz];
-        if !location_unlocks_nether_mobs(state, g) {
-            return;
-        }
-        let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
-        let kind = pick_underground_mob_for_flavor(local_flavor, h >> 16, headroom);
-        (g, [f64::from(sx) + 0.5, f64::from(cave_y), f64::from(sz) + 0.5], kind)
-    } else {
-        let g = [sx, sy - 1, sz];
-        if !location_unlocks_nether_mobs(state, g) {
-            return;
-        }
-        let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
-        let kind = pick_mob_for_flavor(local_flavor, h >> 16, corrupted_blocks);
-        let spawn_y = if kind == "minecraft:ghast" {
-            f64::from(sy + 14)
-        } else {
-            f64::from(sy)
-        };
-        (g, [f64::from(sx) + 0.5, spawn_y, f64::from(sz) + 0.5], kind)
-    };
-    let _ = ground;
+    }
 
-    let mut nbt = Compound::new();
-    if is_piglin_or_hoglin(mob_kind) {
-        nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
-        nbt.insert("TimeInOverworld".into(), Tag::Int(0));
+    for (idx, ((sx, sz), opt_sy)) in probes
+        .into_iter()
+        .take(probe_count)
+        .zip(heights.into_iter())
+        .enumerate()
+    {
+        let Some(sy) = opt_sy else {
+            continue;
+        };
+        let h = spatial_hash(
+            sx,
+            sy,
+            sz,
+            state.tick ^ rift_id ^ (idx as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
+        );
+
+        let (base_y, mob_kind, pack_size) = if is_underground {
+            let Some((cave_y, headroom)) =
+                find_underground_spawn_spot(host, level, sx, sz, anchor[1], sy)
+            else {
+                continue;
+            };
+            let g = [sx, cave_y - 1, sz];
+            if !location_unlocks_nether_mobs(state, g) {
+                continue;
+            }
+            let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
+            let kind = pick_underground_mob_for_flavor(local_flavor, h >> 16, headroom);
+            let count = (1 + ((h >> 24) % 2) as usize).min(remaining_budget);
+            (cave_y, kind, count)
+        } else {
+            if sy <= OVERWORLD_MIN_Y + 4 || sy + 4 >= OVERWORLD_MAX_Y {
+                continue;
+            }
+            let floor_y = resolve_surface_floor_y(host, level, sx, sy, sz);
+            let Some(floor_y) = floor_y else {
+                continue;
+            };
+            let g = [sx, floor_y - 1, sz];
+            if !location_unlocks_nether_mobs(state, g) {
+                continue;
+            }
+            let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
+            let kind = pick_mob_for_flavor(local_flavor, h >> 16, corrupted_blocks);
+            if kind == "minecraft:ghast" {
+                let air_ok = level
+                    .block(host, [sx, sy + 12, sz])
+                    .is_some_and(|k| is_air_like(&k.id(host)))
+                    && level
+                        .block(host, [sx, sy + 15, sz])
+                        .is_some_and(|k| is_air_like(&k.id(host)));
+                if !air_ok {
+                    continue;
+                }
+                (sy + 14, kind, 1)
+            } else {
+                let count = (2 + ((h >> 24) % 2) as usize).min(remaining_budget);
+                (floor_y, kind, count)
+            }
+        };
+
+        let mut spawned_any = false;
+        for member in 0..pack_size {
+            let mh = spatial_hash(sx, base_y, sz, (member as u64) ^ h);
+            let (ox, oz) = if member == 0 || mob_kind == "minecraft:ghast" {
+                (0, 0)
+            } else {
+                let dx = ((mh & 3) as i32) - 1;
+                let dz = (((mh >> 4) & 3) as i32) - 1;
+                let adj_ground = level
+                    .block(host, [sx + dx, base_y - 1, sz + dz])
+                    .is_some_and(|k| is_standable_nether_ground(&k.id(host)));
+                let adj_clear = level
+                    .block(host, [sx + dx, base_y, sz + dz])
+                    .is_some_and(|k| is_nether_open_headroom(&k.id(host)))
+                    && level
+                        .block(host, [sx + dx, base_y + 1, sz + dz])
+                        .is_some_and(|k| is_nether_open_headroom(&k.id(host)));
+                if adj_ground && adj_clear {
+                    (dx, dz)
+                } else {
+                    (0, 0)
+                }
+            };
+            let spawn_pos = [
+                f64::from(sx + ox) + 0.5,
+                f64::from(base_y),
+                f64::from(sz + oz) + 0.5,
+            ];
+            let mut nbt = Compound::new();
+            if is_piglin_or_hoglin(mob_kind) {
+                nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
+                nbt.insert("TimeInOverworld".into(), Tag::Int(0));
+            }
+            if let Some(id) = host.summon(OVERWORLD, mob_kind, spawn_pos, nbt) {
+                state.known_nether_mobs.insert(id);
+                spawned_any = true;
+            }
+        }
+        if spawned_any {
+            return;
+        }
     }
-    if let Some(id) = host.summon(OVERWORLD, mob_kind, spawn_pos, nbt) {
-        state.known_nether_mobs.insert(id);
+}
+
+fn r_is_spawn_ready(state: &RiftState, idx: usize, rift: &crate::types::RiftSource) -> bool {
+    rift.is_actively_spreading() && rift_mobs_unlocked_in_state(state, idx)
+}
+
+/// Resolves a standable terrain surface `y` at `(sx, sz)` by stepping down past
+/// giant-fungus wart canopies / shroomlight so forest floors stay populated.
+fn resolve_surface_floor_y(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    sx: i32,
+    top_sy: i32,
+    sz: i32,
+) -> Option<i32> {
+    let min_y = (top_sy - 12).max(OVERWORLD_MIN_Y + 2);
+    for y in (min_y..=top_sy).rev() {
+        let Some(below) = level.block(host, [sx, y - 1, sz]) else {
+            continue;
+        };
+        let b_id = below.id(host);
+        if !is_standable_nether_ground(&b_id) {
+            continue;
+        }
+        let open = level
+            .block(host, [sx, y, sz])
+            .is_some_and(|k| is_nether_open_headroom(&k.id(host)))
+            && level
+                .block(host, [sx, y + 1, sz])
+                .is_some_and(|k| is_nether_open_headroom(&k.id(host)));
+        if open {
+            return Some(y);
+        }
     }
+    None
 }
 
 fn active_strider_anchor(state: &RiftState, host: &mut dyn ServerHost) -> Option<[i32; 3]> {
@@ -1655,37 +2067,15 @@ fn try_spawn_lava_striders(
     }
 }
 
-pub fn augment_potential_spawns(
-    host: &dyn Host,
-    state: &RiftState,
-    event: &mut PotentialSpawnsEvent<'_>,
+pub fn filter_and_populate_nether_spawn_entries(
+    entries: &mut Vec<SpawnEntry>,
+    category: &str,
+    flavor: NetherFlavor,
+    y: i32,
 ) {
-    if event.dimension != OVERWORLD {
-        return;
-    }
-
-    let near_corrupt = state.is_quart_corrupted(event.pos)
-        || state
-            .rifts
-            .iter()
-            .any(|r| horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 512).max(48 * 48));
-    if !near_corrupt {
-        return;
-    }
-
-    // Before the corrupted area becomes a pretty large Nether biome, block premature
-    // Nether mob spawns even if vanilla biome cells already started converting.
-    if !location_unlocks_nether_mobs(state, event.pos) {
-        event
-            .entries
-            .retain(|e| !is_nether_predator(&e.entity) && strip_ns(&e.entity) != "strider");
-        return;
-    }
-
-    let flavor = host
-        .level(OVERWORLD)
-        .and_then(|l| local_corrupt_flavor(host, l, event.pos))
-        .unwrap_or_else(|| NetherFlavor::pick_for_region(event.pos[0], event.pos[2], state.seed));
+    // Strip ALL normal Overworld fauna (cows, sheep, zombies, skeletons, bats, squids, etc.)
+    // so only native Nether mobs can ever populate a converted Nether biome.
+    entries.retain(|e| is_allowed_in_nether_biome(&e.entity, Some(flavor)));
 
     let push_if_missing =
         |entries: &mut Vec<SpawnEntry>, entity: &str, weight: u32, min: u32, max: u32| {
@@ -1700,47 +2090,96 @@ pub fn augment_potential_spawns(
             }
         };
 
-    match (event.category, flavor) {
+    match (category, flavor) {
         ("monster", NetherFlavor::CrimsonForest) => {
-            push_if_missing(&mut event.entries, "minecraft:piglin", 24, 2, 4);
-            push_if_missing(&mut event.entries, "minecraft:zombified_piglin", 6, 1, 2);
+            push_if_missing(entries, "minecraft:piglin", 28, 2, 4);
+            push_if_missing(entries, "minecraft:hoglin", 18, 1, 3);
+            push_if_missing(entries, "minecraft:zombified_piglin", 8, 1, 2);
         }
         ("monster", NetherFlavor::WarpedForest) => {
-            push_if_missing(&mut event.entries, "minecraft:enderman", 20, 1, 3);
-            push_if_missing(&mut event.entries, "minecraft:piglin", 8, 1, 2);
-            push_if_missing(&mut event.entries, "minecraft:blaze", 3, 1, 1);
+            push_if_missing(entries, "minecraft:enderman", 26, 2, 4);
+            push_if_missing(entries, "minecraft:piglin", 10, 1, 2);
+            push_if_missing(entries, "minecraft:blaze", 4, 1, 2);
+            push_if_missing(entries, "minecraft:magma_cube", 4, 1, 2);
         }
         ("monster", NetherFlavor::SoulSandValley) => {
-            push_if_missing(&mut event.entries, "minecraft:wither_skeleton", 16, 1, 2);
-            push_if_missing(&mut event.entries, "minecraft:skeleton", 14, 2, 3);
-            push_if_missing(&mut event.entries, "minecraft:ghast", 10, 1, 1);
-            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+            push_if_missing(entries, "minecraft:wither_skeleton", 24, 1, 3);
+            push_if_missing(entries, "minecraft:ghast", 12, 1, 1);
+            push_if_missing(entries, "minecraft:enderman", 8, 1, 2);
+            push_if_missing(entries, "minecraft:blaze", 6, 1, 2);
         }
         ("monster", NetherFlavor::BasaltDeltas) => {
-            push_if_missing(&mut event.entries, "minecraft:magma_cube", 28, 2, 4);
-            push_if_missing(&mut event.entries, "minecraft:ghast", 10, 1, 1);
-            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+            push_if_missing(entries, "minecraft:magma_cube", 32, 2, 4);
+            push_if_missing(entries, "minecraft:ghast", 12, 1, 1);
+            push_if_missing(entries, "minecraft:blaze", 8, 1, 2);
+            push_if_missing(entries, "minecraft:piglin", 4, 1, 2);
         }
         ("monster", NetherFlavor::NetherWastes) => {
-            push_if_missing(&mut event.entries, "minecraft:piglin", 20, 2, 4);
-            push_if_missing(&mut event.entries, "minecraft:zombified_piglin", 12, 1, 3);
-            push_if_missing(&mut event.entries, "minecraft:magma_cube", 8, 1, 2);
-            push_if_missing(&mut event.entries, "minecraft:ghast", 6, 1, 1);
-            push_if_missing(&mut event.entries, "minecraft:blaze", 4, 1, 1);
+            push_if_missing(entries, "minecraft:piglin", 24, 2, 4);
+            push_if_missing(entries, "minecraft:zombified_piglin", 18, 2, 4);
+            push_if_missing(entries, "minecraft:magma_cube", 10, 1, 2);
+            push_if_missing(entries, "minecraft:ghast", 8, 1, 1);
+            push_if_missing(entries, "minecraft:blaze", 6, 1, 2);
         }
         ("creature", NetherFlavor::CrimsonForest) => {
-            push_if_missing(&mut event.entries, "minecraft:hoglin", 20, 1, 3);
-            push_if_missing(&mut event.entries, "minecraft:strider", 10, 1, 3);
+            push_if_missing(entries, "minecraft:hoglin", 24, 1, 3);
+            push_if_missing(entries, "minecraft:strider", 10, 1, 3);
         }
         ("creature", _) => {
-            push_if_missing(&mut event.entries, "minecraft:strider", 10, 1, 3);
+            push_if_missing(entries, "minecraft:strider", 10, 1, 3);
         }
         _ => {}
     }
 
-    if event.category == "monster" {
-        tune_underground_spawn_entries(&mut event.entries, event.pos[1]);
+    if category == "monster" {
+        tune_underground_spawn_entries(entries, y);
     }
+}
+
+pub fn augment_potential_spawns(
+    host: &dyn Host,
+    state: &RiftState,
+    event: &mut PotentialSpawnsEvent<'_>,
+) {
+    if event.dimension != OVERWORLD {
+        return;
+    }
+
+    let biome_flavor = host
+        .level(OVERWORLD)
+        .and_then(|l| local_corrupt_flavor(host, l, event.pos));
+    let in_nether_zone = biome_flavor.is_some() || state.is_quart_corrupted(event.pos);
+    let near_corrupt = in_nether_zone
+        || state
+            .rifts
+            .iter()
+            .any(|r| horiz_dist_sq(r.center, event.pos) <= (r.max_radius_sq + 512).max(48 * 48));
+    if !near_corrupt {
+        return;
+    }
+
+    // Before the corrupted area becomes a pretty large Nether biome, block premature
+    // Nether mob spawns — and inside converted Nether biomes, block normal Overworld mobs too!
+    if !location_unlocks_nether_mobs(state, event.pos) {
+        event
+            .entries
+            .retain(|e| !is_nether_predator(&e.entity) && strip_ns(&e.entity) != "strider");
+        if in_nether_zone {
+            event
+                .entries
+                .retain(|e| is_allowed_in_nether_biome(&e.entity, biome_flavor));
+        }
+        return;
+    }
+
+    let effective_flavor = biome_flavor
+        .unwrap_or_else(|| NetherFlavor::pick_for_region(event.pos[0], event.pos[2], state.seed));
+    filter_and_populate_nether_spawn_entries(
+        &mut event.entries,
+        event.category,
+        effective_flavor,
+        event.pos[1],
+    );
 }
 
 fn push_item_drop(host: &dyn ServerHost, drops: &mut Vec<ItemStack>, id: &str, count: u32) {
@@ -2028,17 +2467,126 @@ mod tests {
         ];
         tune_underground_spawn_entries(&mut deep_entries, -40);
         assert!(!deep_entries.iter().any(|e| e.entity == "minecraft:ghast"));
-        let z_w = deep_entries
-            .iter()
-            .find(|e| e.entity == "minecraft:zombie")
-            .unwrap()
-            .weight;
+        assert!(!deep_entries.iter().any(|e| e.entity == "minecraft:zombie"));
         let m_w = deep_entries
             .iter()
             .find(|e| e.entity == "minecraft:magma_cube")
             .unwrap()
             .weight;
-        assert!(z_w <= 28 && m_w >= 10 && m_w < 20);
+        assert!((10..20).contains(&m_w));
+    }
+
+    #[test]
+    fn normal_overworld_mobs_are_blocked_and_nether_mobs_populated_in_nether_biomes() {
+        for normal in [
+            "minecraft:cow",
+            "minecraft:pig",
+            "minecraft:sheep",
+            "minecraft:chicken",
+            "minecraft:zombie",
+            "minecraft:creeper",
+            "minecraft:spider",
+            "minecraft:skeleton",
+            "minecraft:drowned",
+            "minecraft:slime",
+            "minecraft:bat",
+            "minecraft:squid",
+            "minecraft:glow_squid",
+            "minecraft:cod",
+            "minecraft:phantom",
+            "minecraft:pillager",
+            "minecraft:wandering_trader",
+        ] {
+            for flavor in [
+                NetherFlavor::CrimsonForest,
+                NetherFlavor::WarpedForest,
+                NetherFlavor::SoulSandValley,
+                NetherFlavor::BasaltDeltas,
+                NetherFlavor::NetherWastes,
+            ] {
+                assert!(
+                    !is_allowed_in_nether_biome(normal, Some(flavor)),
+                    "{normal} must NOT be allowed in {flavor:?}"
+                );
+            }
+            for reason in [
+                SpawnReason::Natural,
+                SpawnReason::ChunkGeneration,
+                SpawnReason::Patrol,
+                SpawnReason::Event,
+                SpawnReason::Reinforcement,
+            ] {
+                assert!(should_cancel_world_spawn_kind(
+                    normal,
+                    reason,
+                    true,
+                    Some(NetherFlavor::CrimsonForest),
+                    true,
+                    true,
+                ));
+                // Uncorrupted Overworld chunks still allow normal spawns.
+                assert!(!should_cancel_world_spawn_kind(
+                    normal,
+                    reason,
+                    false,
+                    None,
+                    false,
+                    false,
+                ));
+            }
+            // Player commands and conversions inside Nether biomes are still respected.
+            assert!(!should_cancel_world_spawn_kind(
+                normal,
+                SpawnReason::Command,
+                true,
+                Some(NetherFlavor::CrimsonForest),
+                true,
+                true,
+            ));
+        }
+
+        // Potential spawns list strips Overworld zombies/cows/squids and injects rich Nether spawns.
+        let mut monster_entries = vec![
+            SpawnEntry {
+                entity: "minecraft:zombie".to_owned(),
+                weight: 95,
+                min: 2,
+                max: 4,
+                constant: false,
+            },
+            SpawnEntry {
+                entity: "minecraft:creeper".to_owned(),
+                weight: 95,
+                min: 1,
+                max: 4,
+                constant: false,
+            },
+        ];
+        filter_and_populate_nether_spawn_entries(
+            &mut monster_entries,
+            "monster",
+            NetherFlavor::CrimsonForest,
+            70,
+        );
+        assert!(!monster_entries.iter().any(|e| e.entity == "minecraft:zombie"));
+        assert!(!monster_entries.iter().any(|e| e.entity == "minecraft:creeper"));
+        assert!(monster_entries.iter().any(|e| e.entity == "minecraft:piglin"));
+        assert!(monster_entries.iter().any(|e| e.entity == "minecraft:hoglin"));
+
+        let mut water_entries = vec![SpawnEntry {
+            entity: "minecraft:squid".to_owned(),
+            weight: 10,
+            min: 1,
+            max: 4,
+            constant: false,
+        }];
+        filter_and_populate_nether_spawn_entries(
+            &mut water_entries,
+            "water_creature",
+            NetherFlavor::NetherWastes,
+            60,
+        );
+        assert!(water_entries.is_empty());
     }
 
     #[test]
