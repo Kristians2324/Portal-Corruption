@@ -11,10 +11,25 @@ use mod_api::{
 };
 use std::collections::{HashSet, VecDeque};
 
-const NETHER_FOB_CHECK_INTERVAL_TICKS: u64 = 160;
-const NETHER_FOB_OFFSET_TICK: u64 = 95;
+const NETHER_FOB_CHECK_INTERVAL_TICKS: u64 = 80;
+const NETHER_FOB_OFFSET_TICK: u64 = 35;
 const MIN_NETHER_FOB_SPACING: i64 = 52;
 pub const NETHER_FOB_HALF_EXTENT: i32 = 22;
+
+fn expected_nether_fob_chunks(center_xz: [i32; 2]) -> Vec<[i32; 2]> {
+    let pad = NETHER_FOB_HALF_EXTENT + 4;
+    let min_cx = (center_xz[0] - pad) >> 4;
+    let max_cx = (center_xz[0] + pad) >> 4;
+    let min_cz = (center_xz[1] - pad) >> 4;
+    let max_cz = (center_xz[1] + pad) >> 4;
+    let mut out = Vec::new();
+    for ccx in min_cx..=max_cx {
+        for ccz in min_cz..=max_cz {
+            out.push([ccx, ccz]);
+        }
+    }
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -166,21 +181,12 @@ fn stage_pending_nether_fob(
     flavor: NetherFlavor,
     roll: u64,
 ) {
-    let pad = NETHER_FOB_HALF_EXTENT + 6;
-    let min_cx = (center_xz[0] - pad) >> 4;
-    let max_cx = (center_xz[0] + pad) >> 4;
-    let min_cz = (center_xz[1] - pad) >> 4;
-    let max_cz = (center_xz[1] + pad) >> 4;
-
     let mut forced_chunks = Vec::new();
-    for ccx in min_cx..=max_cx {
-        for ccz in min_cz..=max_cz {
-            let chunk = [ccx, ccz];
-            if let Some(cref) = nether.chunk_ref(host, chunk)
-                && cref.set_forced(host, true)
-            {
-                forced_chunks.push(chunk);
-            }
+    for chunk in expected_nether_fob_chunks(center_xz) {
+        if let Some(cref) = nether.chunk_ref(host, chunk)
+            && cref.set_forced(host, true)
+        {
+            forced_chunks.push(chunk);
         }
     }
 
@@ -317,20 +323,34 @@ fn process_pending_nether_fob(host: &mut dyn ServerHost, nether: LevelRef, state
         return;
     }
 
-    if state.tick.saturating_sub(pending.queued_tick) > 240 {
+    if state.tick.saturating_sub(pending.queued_tick) > 480 {
         release_nether_fob_chunks(host, state);
         return;
     }
 
-    let all_loaded = pending
-        .forced_chunks
-        .iter()
-        .all(|[cx, cz]| nether.is_loaded(host, [cx << 4, 64, cz << 4]));
+    let expected = expected_nether_fob_chunks(pending.center_xz);
+    let mut all_loaded = !expected.is_empty();
+    for [cx, cz] in &expected {
+        if !nether.is_loaded(host, [*cx << 4, 64, *cz << 4]) {
+            all_loaded = false;
+            if !pending.forced_chunks.contains(&[*cx, *cz])
+                && let Some(cref) = nether.chunk_ref(host, [*cx, *cz])
+                && cref.set_forced(host, true)
+                && let Some(mut_pending) = state.pending_nether_fob.as_mut()
+            {
+                mut_pending.forced_chunks.push([*cx, *cz]);
+            }
+        }
+    }
     if !all_loaded {
         return;
     }
 
-    state.pending_nether_fob = None;
+    let final_forced = state
+        .pending_nether_fob
+        .take()
+        .map(|p| p.forced_chunks)
+        .unwrap_or(pending.forced_chunks);
 
     let (center, protected) = if let Some((existing_center, prot)) =
         find_existing_nether_portal(host, nether, pending.center_xz[0], pending.center_xz[1])
@@ -361,7 +381,7 @@ fn process_pending_nether_fob(host: &mut dyn ServerHost, nether: LevelRef, state
 
     state.nether_fob_rifts.insert(pending.rift_id);
     state.nether_fobs.push(center);
-    state.nether_fob_release_chunks = pending.forced_chunks;
+    state.nether_fob_release_chunks = final_forced;
     state.nether_fob_release_ttl = 8;
     state.dirty = true;
 

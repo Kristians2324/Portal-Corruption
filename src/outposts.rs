@@ -11,12 +11,12 @@ use mod_api::{
     Identifier, ItemStack, LevelRef, ServerHost, SoundSource, Tag, Text,
 };
 
-const OUTPOST_CHECK_INTERVAL_TICKS: u64 = 200;
-const OUTPOST_OFFSET_TICK: u64 = 130;
-const MIN_OUTPOST_PORTAL_DIST: i64 = 54;
-const MIN_OUTPOST_SPACING: i64 = 84;
-const MIN_OUTPOST_BASTION_SPACING: i64 = 72;
-const MIN_PLAYER_DIST_FOR_OUTPOST: i64 = 68;
+const OUTPOST_CHECK_INTERVAL_TICKS: u64 = 60;
+const OUTPOST_OFFSET_TICK: u64 = 30;
+const MIN_OUTPOST_PORTAL_DIST: i64 = 48;
+const MIN_OUTPOST_SPACING: i64 = 60;
+const MIN_OUTPOST_BASTION_SPACING: i64 = 56;
+const MIN_PLAYER_DIST_FOR_OUTPOST: i64 = 36;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -73,16 +73,19 @@ pub fn wasteland_eligible_for_outpost(
         return None;
     }
 
-    // Dynamic scaling: outposts unlock early and keep populating indefinitely as corruption
-    // engulfs huge tracts of land, constrained only by physical world spacing.
+    // Dynamic scaling: outposts unlock early and scale briskly with corrupted area
+    // so vast corrupted regions pack in tons of diverse Nether structures.
     let (min_blocks, min_ring) = match wasteland.total_outposts_placed {
-        0 => (45_000, 50),
-        1 => (95_000, 64),
-        2 => (155_000, 78),
-        n => (
-            155_000 + ((n - 2) as u64) * 75_000,
-            78 + ((n - 2) as i32) * 10,
-        ),
+        0 => (45_000, 48),
+        1 => (75_000, 56),
+        2 => (110_000, 64),
+        n => {
+            let extra = (n - 2) as u64;
+            (
+                110_000 + extra * 34_000,
+                64 + (((extra as f64).sqrt() * 11.0).round() as i32),
+            )
+        }
     };
     if wasteland.total_corrupted_blocks < min_blocks || wasteland.max_ring_radius < min_ring {
         return None;
@@ -158,10 +161,16 @@ pub fn tick_outposts(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
     if state.paused || state.tick % OUTPOST_CHECK_INTERVAL_TICKS != OUTPOST_OFFSET_TICK {
         return;
     }
+    if state.rifts.is_empty() {
+        return;
+    }
 
     let player_positions = overworld_player_positions(host);
+    let len = state.rifts.len();
+    let start = ((state.tick / OUTPOST_CHECK_INTERVAL_TICKS) as usize) % len;
 
-    for idx in 0..state.rifts.len() {
+    for off in 0..len {
+        let idx = (start + off) % len;
         let wasteland = state.connected_wasteland_for(idx);
         let rift = &state.rifts[idx];
         let Some(kind) = wasteland_eligible_for_outpost(rift, wasteland) else {
@@ -169,15 +178,16 @@ pub fn tick_outposts(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
         };
 
         let half = outpost_half_extent(kind);
-        let radius = ((rift.max_radius_sq as f64).sqrt() as i32).max(rift.ring_radius);
+        let radius = ((rift.max_radius_sq.max(wasteland.total_area_radius_sq) as f64).sqrt() as i32)
+            .max(rift.ring_radius);
         let inner = (MIN_OUTPOST_PORTAL_DIST as i32) + 4;
-        let outer = (radius - (half + 4)).max(inner + 4);
-        if radius < inner + 8 {
+        let outer = (radius - (half / 2 + 2)).max(inner + 4);
+        if radius < inner + 4 {
             continue;
         }
 
         let mut picked: Option<([i32; 3], u64)> = None;
-        for attempt in 0..32u64 {
+        for attempt in 0..48u64 {
             let h = spatial_hash(
                 rift.center[0],
                 rift.outposts_placed as i32,
@@ -195,6 +205,26 @@ pub fn tick_outposts(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
             }
             if !all_players_far_from(&player_positions, [cx, 64, cz], MIN_PLAYER_DIST_FOR_OUTPOST) {
                 continue;
+            }
+            if !state.is_quart_corrupted([cx, rift.center[1], cz]) {
+                continue;
+            }
+            let corners_loaded = [(-half, -half), (-half, half), (half, -half), (half, half), (0, 0)]
+                .into_iter()
+                .all(|(dx, dz)| level.is_loaded(host, [cx + dx, 64, cz + dz]));
+            if corners_loaded {
+                let dummy = PendingOutpost {
+                    rift_id: rift.id,
+                    center: [cx, rift.center[1], cz],
+                    kind,
+                    flavor: rift.flavor,
+                    roll: h,
+                    forced_chunks: Vec::new(),
+                    queued_tick: state.tick,
+                };
+                if validate_and_resolve_outpost_floor(host, level, state, &dummy).is_none() {
+                    continue;
+                }
             }
             picked = Some(([cx, rift.center[1], cz], h));
             break;
@@ -270,15 +300,16 @@ fn process_pending_outpost(host: &mut dyn ServerHost, level: LevelRef, state: &m
         return;
     }
 
-    if state.tick.saturating_sub(pending.queued_tick) > 160 {
+    if state.tick.saturating_sub(pending.queued_tick) > 240 {
         release_outpost_chunks(host, level, state);
         return;
     }
 
-    let all_loaded = pending
-        .forced_chunks
-        .iter()
-        .all(|[cx, cz]| level.is_loaded(host, [cx << 4, 64, cz << 4]));
+    let all_loaded = !pending.forced_chunks.is_empty()
+        && pending
+            .forced_chunks
+            .iter()
+            .all(|[cx, cz]| level.is_loaded(host, [cx << 4, 64, cz << 4]));
     if !all_loaded {
         return;
     }
@@ -382,12 +413,13 @@ fn validate_and_resolve_outpost_floor(
 
     let min_h = *hs.iter().min()?;
     let max_h = *hs.iter().max()?;
-    if max_h - min_h > 20 || min_h < 48 || max_h > 165 {
+    if max_h - min_h > 24 || min_h < 42 || max_h > 190 {
         return None;
     }
 
     let mut corrupted_hits = 0usize;
     let mut water_hits = 0usize;
+    let mut lava_hits = 0usize;
     for (idx, (px, pz)) in probe_cols.iter().enumerate() {
         let p = [*px, hs[idx] - 1, *pz];
         if state.is_quart_corrupted(p) {
@@ -395,9 +427,17 @@ fn validate_and_resolve_outpost_floor(
         }
         if let Some(key) = ow.block(host, p) {
             let name = key.id(host);
+            let s = strip_ns(&name);
             if is_water_like(&name) {
                 water_hits += 1;
-            } else if is_nether_terrain_block(&name) {
+            } else if matches!(s, "lava" | "flowing_lava") {
+                lava_hits += 1;
+            } else if is_nether_terrain_block(&name)
+                || matches!(
+                    s,
+                    "obsidian" | "basalt" | "blackstone" | "magma_block" | "polished_basalt"
+                )
+            {
                 corrupted_hits += 1;
             }
         }
@@ -408,7 +448,7 @@ fn validate_and_resolve_outpost_floor(
         }
     }
 
-    if water_hits > 1 || corrupted_hits < 6 {
+    if water_hits > 1 || lava_hits > 3 || corrupted_hits < 5 {
         return None;
     }
 

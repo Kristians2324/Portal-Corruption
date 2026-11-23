@@ -11,12 +11,12 @@ use mod_api::{
 };
 use std::collections::HashSet;
 
-const CITADEL_CHECK_INTERVAL_TICKS: u64 = 200;
-/// Citadel only emerges once corruption is truly massive ("a lot, a lot") AND
+const CITADEL_CHECK_INTERVAL_TICKS: u64 = 80;
+/// Citadel only emerges once corruption is truly massive AND
 /// at least 2 Bastions have spawned on the outskirts.
-pub const MIN_BLOCKS_FOR_CITADEL: u64 = 650_000;
-pub const MIN_RING_RADIUS_FOR_CITADEL: i32 = 130;
-pub const MIN_DEEPEN_RADIUS_FOR_CITADEL: i32 = 40;
+pub const MIN_BLOCKS_FOR_CITADEL: u64 = 450_000;
+pub const MIN_RING_RADIUS_FOR_CITADEL: i32 = 105;
+pub const MIN_DEEPEN_RADIUS_FOR_CITADEL: i32 = 30;
 pub const MIN_BASTIONS_FOR_CITADEL: u32 = 2;
 /// Players within 42 blocks are right inside the 57x57 footprint; wait until they
 /// step outside 42 blocks so walls never entomb anyone alive.
@@ -68,13 +68,16 @@ pub fn tick_citadel_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
         return;
     }
 
-    if state.paused || state.tick % CITADEL_CHECK_INTERVAL_TICKS != 45 {
+    if state.paused || state.tick % CITADEL_CHECK_INTERVAL_TICKS != 45 || state.rifts.is_empty() {
         return;
     }
 
     let player_positions = overworld_player_positions(host);
+    let len = state.rifts.len();
+    let start = ((state.tick / CITADEL_CHECK_INTERVAL_TICKS) as usize) % len;
 
-    for idx in 0..state.rifts.len() {
+    for off in 0..len {
+        let idx = (start + off) % len;
         let wasteland = state.connected_wasteland_for(idx);
         let rift = &state.rifts[idx];
         if !wasteland_eligible_for_citadel(rift, wasteland) {

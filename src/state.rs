@@ -444,7 +444,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(9));
+        root.insert("version".into(), Value::from(10));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -629,6 +629,19 @@ impl RiftState {
                     .get("pacified")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let raw_deepen_radius = item
+                    .get("deepen_radius")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| (v as i32).max(1))
+                    .unwrap_or(1);
+                let corrupted_blocks = item
+                    .get("corrupted_blocks")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let bastions_placed = item
+                    .get("bastions_placed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 let (deepen_radius, deepen_columns) = if version < 9 && !is_pacified {
                     // Older saves either stopped shallow (~10 blocks), stalled on low deepen
                     // throughput, or bypassed inner rings; re-sweep active rifts from ring 1
@@ -636,27 +649,37 @@ impl RiftState {
                     self.dirty = true;
                     (1, build_ring_columns(center[0], center[2], 1))
                 } else {
-                    let dr = item
-                        .get("deepen_radius")
-                        .and_then(|v| v.as_i64())
-                        .map(|v| (v as i32).max(1))
-                        .unwrap_or(1);
                     let dc: Vec<[i32; 2]> = item
                         .get("deepen_columns")
                         .map(cols_from_json_any)
                         .unwrap_or_default();
-                    (dr, dc)
+                    (raw_deepen_radius, dc)
                 };
                 let active_column = item.get("active_column").and_then(active_col_from_json);
-                let max_deepen_reached = item
-                    .get("max_deepen_reached")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| (v as i32).max(deepen_radius))
-                    .unwrap_or(deepen_radius);
                 let citadel_spawned = item
                     .get("citadel_spawned")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let mut max_deepen_reached = item
+                    .get("max_deepen_reached")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(raw_deepen_radius)
+                    .max(raw_deepen_radius)
+                    .max(deepen_radius);
+                // Worlds saved at v8->v9 reset `deepen_radius` to 1 without preserving prior
+                // deepen progress on already-huge rifts; restore earned depth so Bastions,
+                // Citadels, and Nether FOBs unlock immediately.
+                if version <= 9
+                    && !is_pacified
+                    && (corrupted_blocks >= 160_000 || bastions_placed > 0 || citadel_spawned)
+                {
+                    let earned = (ring_radius / 2).clamp(24, 48).min(ring_radius.max(1));
+                    if max_deepen_reached < earned {
+                        max_deepen_reached = earned;
+                        self.dirty = true;
+                    }
+                }
                 let boss_uuid = item
                     .get("boss_uuid")
                     .and_then(|v| v.as_str())
@@ -697,10 +720,7 @@ impl RiftState {
                         item.get("flavor").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
                     ),
                     age_ticks: item.get("age_ticks").and_then(|v| v.as_u64()).unwrap_or(0),
-                    corrupted_blocks: item
-                        .get("corrupted_blocks")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    corrupted_blocks,
                     max_radius_sq,
                     ring_radius,
                     ring_columns,
@@ -708,10 +728,7 @@ impl RiftState {
                     deepen_radius,
                     deepen_columns,
                     max_deepen_reached,
-                    bastions_placed: item
-                        .get("bastions_placed")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32,
+                    bastions_placed,
                     outposts_placed: item
                         .get("outposts_placed")
                         .and_then(|v| v.as_u64())
@@ -997,6 +1014,23 @@ mod tests {
         loaded.apply_json(&v8_shallow);
         assert_eq!(loaded.rifts.len(), 1);
         assert_eq!(loaded.rifts[0].deepen_radius, 1);
+
+        // Huge v9 worlds whose max_deepen_reached stayed stuck at 1 after v8->v9 reset
+        // recover earned depth immediately so Bastions/Citadels/FOBs aren't permanently starved.
+        let v9_stalled = serde_json::json!({
+            "version": 9,
+            "rifts": [{
+                "id": 9,
+                "center": [0, 64, 0],
+                "corrupted_blocks": 700_000,
+                "ring_radius": 140,
+                "deepen_radius": 1,
+                "max_deepen_reached": 1,
+                "pacified": false
+            }]
+        });
+        loaded.apply_json(&v9_stalled);
+        assert!(loaded.rifts[0].max_deepen_reached >= 40);
     }
 
     #[test]

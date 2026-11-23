@@ -10,20 +10,21 @@ use mod_api::{
     Text,
 };
 
-const BASTION_CHECK_INTERVAL_TICKS: u64 = 360;
+const BASTION_CHECK_INTERVAL_TICKS: u64 = 80;
+const BASTION_OFFSET_TICK: u64 = 40;
 const MIN_RIFT_BLOCKS_FOR_BASTION: u64 = 160_000;
 const MIN_RADIUS_SQ_FOR_BASTION: i64 = 96 * 96;
 const MIN_DEEPEN_RADIUS_FOR_BASTION: i32 = 22;
-const SECOND_BASTION_BLOCKS: u64 = 500_000;
-const SECOND_BASTION_RING_RADIUS: i32 = 115;
-const EXTRA_BASTION_BLOCKS_STEP: u64 = 350_000;
-const EXTRA_BASTION_RING_STEP: i32 = 30;
-const MIN_BASTION_SPACING: i64 = 176;
+const SECOND_BASTION_BLOCKS: u64 = 380_000;
+const SECOND_BASTION_RING_RADIUS: i32 = 104;
+const THIRD_BASTION_BLOCKS: u64 = 600_000;
+const THIRD_BASTION_RING_RADIUS: i32 = 125;
+const EXTRA_BASTION_BLOCKS_STEP: u64 = 140_000;
+const MIN_BASTION_SPACING: i64 = 112;
 /// Keeps Bastions strictly on the corrupted outskirts so the portal epicenter
 /// stays clear for the unique central Citadel.
 pub const MIN_BASTION_PORTAL_DIST: i64 = 88;
-const MIN_PLAYER_DIST_FOR_BASTION: i64 = 112;
-const BASTION_RARITY_DENOM: u64 = 4;
+const MIN_PLAYER_DIST_FOR_BASTION: i64 = 52;
 
 /// Follows `#minecraft:has_structure/bastion_remnant`: Bastion Remnants form in
 /// Crimson Forest, Warped Forest, Soul Sand Valley, and Nether Wastes — never Basalt Deltas.
@@ -92,29 +93,26 @@ pub fn tick_bastion_emergence(host: &mut dyn ServerHost, level: LevelRef, state:
         return;
     }
 
-    if state.paused || state.tick % BASTION_CHECK_INTERVAL_TICKS != 90 {
+    if state.paused || state.tick % BASTION_CHECK_INTERVAL_TICKS != BASTION_OFFSET_TICK {
+        return;
+    }
+    if state.rifts.is_empty() {
         return;
     }
 
     let player_positions = overworld_player_positions(host);
+    let len = state.rifts.len();
+    let start = ((state.tick / BASTION_CHECK_INTERVAL_TICKS) as usize) % len;
 
-    for idx in 0..state.rifts.len() {
+    for off in 0..len {
+        let idx = (start + off) % len;
         let wasteland = state.connected_wasteland_for(idx);
         let rift = &state.rifts[idx];
         if !wasteland_eligible_for_bastion(rift, wasteland) {
             continue;
         }
-        let roll = spatial_hash(
-            rift.center[0],
-            rift.bastions_placed as i32,
-            rift.center[2],
-            state.seed ^ state.tick,
-        );
-        if roll % BASTION_RARITY_DENOM != 0 {
-            continue;
-        }
         if let Some((origin, flavor, cand_roll)) =
-            find_bastion_site(host, level, state, rift, &player_positions)
+            find_bastion_site(host, level, state, rift, wasteland.total_area_radius_sq, &player_positions)
         {
             stage_pending_bastion(host, level, state, rift.id, origin, flavor, cand_roll);
             break;
@@ -132,15 +130,23 @@ pub fn wasteland_eligible_for_bastion(rift: &RiftSource, wasteland: ConnectedWas
     {
         return false;
     }
-    if wasteland.total_bastions_placed >= 1 {
-        let extra = (wasteland.total_bastions_placed - 1) as u64;
-        let req_blocks = SECOND_BASTION_BLOCKS + extra * EXTRA_BASTION_BLOCKS_STEP;
-        let req_ring = SECOND_BASTION_RING_RADIUS + (extra as i32) * EXTRA_BASTION_RING_STEP;
-        if wasteland.total_corrupted_blocks < req_blocks || wasteland.max_ring_radius < req_ring {
-            return false;
+    match wasteland.total_bastions_placed {
+        0 => true,
+        1 => {
+            wasteland.total_corrupted_blocks >= SECOND_BASTION_BLOCKS
+                && wasteland.max_ring_radius >= SECOND_BASTION_RING_RADIUS
+        }
+        2 => {
+            wasteland.total_corrupted_blocks >= THIRD_BASTION_BLOCKS
+                && wasteland.max_ring_radius >= THIRD_BASTION_RING_RADIUS
+        }
+        n => {
+            let extra = (n - 2) as u64;
+            let req_blocks = THIRD_BASTION_BLOCKS + extra * EXTRA_BASTION_BLOCKS_STEP;
+            let req_ring = THIRD_BASTION_RING_RADIUS + (((extra as f64).sqrt() * 14.0) as i32);
+            wasteland.total_corrupted_blocks >= req_blocks && wasteland.max_ring_radius >= req_ring
         }
     }
-    true
 }
 
 #[cfg(test)]
@@ -183,6 +189,7 @@ pub fn all_players_far_from(players: &[[i32; 3]], pos: [i32; 3], min_dist: i64) 
     players.iter().all(|p| horiz_dist_sq(*p, pos) >= min_sq)
 }
 
+#[cfg(test)]
 pub fn area_metrics_qualify(
     quart_corrupted_count: usize,
     nether_surface_count: usize,
@@ -207,7 +214,7 @@ pub fn site_outside_epicenters(state: &RiftState, cx: i32, cz: i32) -> bool {
         .citadels
         .iter()
         .all(|c| horiz_dist_sq(*c, [cx, 64, cz]) >= min_sq);
-    let out_sq = 72 * 72;
+    let out_sq = 56 * 56;
     let clear_outposts = state
         .outposts
         .iter()
@@ -220,16 +227,18 @@ fn find_bastion_site(
     ow: LevelRef,
     state: &RiftState,
     rift: &RiftSource,
+    wasteland_radius_sq: i64,
     overworld_players: &[[i32; 3]],
 ) -> Option<([i32; 3], NetherFlavor, u64)> {
-    let radius = (rift.max_radius_sq as f64).sqrt() as i32;
+    let radius = ((rift.max_radius_sq.max(wasteland_radius_sq) as f64).sqrt() as i32)
+        .max(rift.ring_radius);
     let inner = MIN_BASTION_PORTAL_DIST as i32;
     if radius < inner + 6 {
         return None;
     }
-    let outer = (radius - 10).max(inner);
+    let outer = (radius - 8).max(inner + 4);
 
-    for attempt in 0..16u64 {
+    for attempt in 0..48u64 {
         let h = spatial_hash(
             rift.center[0],
             rift.bastions_placed as i32,
@@ -242,8 +251,7 @@ fn find_bastion_site(
         let cx = rift.center[0] + (angle.cos() * f64::from(dist)).round() as i32;
         let cz = rift.center[2] + (angle.sin() * f64::from(dist)).round() as i32;
 
-        // Keep away from world spawn, rift cores (epicenters), citadels, and other bastions.
-        if horiz_dist_sq([cx, 64, cz], [0, 64, 0]) < 96 * 96 {
+        if horiz_dist_sq([cx, 64, cz], [0, 64, 0]) < 80 * 80 {
             continue;
         }
         if !site_outside_epicenters(state, cx, cz) {
@@ -256,8 +264,6 @@ fn find_bastion_site(
         {
             continue;
         }
-
-        // Never build a Bastion where any Overworld player can watch it appear out of thin air.
         if !all_players_far_from(
             overworld_players,
             [cx + 8, 64, cz + 8],
@@ -265,74 +271,143 @@ fn find_bastion_site(
         ) {
             continue;
         }
-
-        // Probe a 5x5 grid across the candidate footprint to verify gentle slope & heavy corruption.
-        let mut probe_cols = Vec::with_capacity(25);
-        for dx in [-8, 0, 8, 16, 24] {
-            for dz in [-8, 0, 8, 16, 24] {
-                probe_cols.push((cx + dx, cz + dz));
-            }
-        }
-
-        let Ok(heights) =
-            host.surface_heights(OVERWORLD, &probe_cols, Heightmap::MotionBlockingNoLeaves)
-        else {
-            continue;
-        };
-        if heights.iter().any(Option::is_none) {
-            continue;
-        }
-        let hs: Vec<i32> = heights.into_iter().flatten().collect();
-        let min_h = *hs.iter().min().unwrap_or(&0);
-        let max_h = *hs.iter().max().unwrap_or(&0);
-        let avg_h = hs.iter().sum::<i32>() / (hs.len() as i32);
-        if max_h - min_h > 12 || avg_h < 52 || avg_h > 125 {
+        if !state.is_quart_corrupted([cx + 8, rift.center[1], cz + 8]) {
             continue;
         }
 
-        let mut quart_corrupt = 0usize;
-        let mut nether_surface = 0usize;
-        let mut water_hits = 0usize;
-        let mut biome_counts = [0usize; 5];
-
-        for (idx, (px, pz)) in probe_cols.iter().enumerate() {
-            let sy = hs[idx] - 1;
-            let p = [*px, sy, *pz];
-            if state.is_quart_corrupted(p) {
-                quart_corrupt += 1;
-            }
-            if let Some(bname) = ow.biome_at(host, [*px, sy.clamp(-56, 200), *pz])
-                && let Some(bf) = NetherFlavor::from_name(&bname)
+        // If the entire candidate footprint is already loaded, validate slope, liquid, and
+        // biome immediately so bad sites never waste a forced-chunk staging cycle.
+        let corners_loaded = [(-8, -8), (-8, 24), (24, -8), (24, 24), (8, 8)]
+            .into_iter()
+            .all(|(dx, dz)| ow.is_loaded(host, [cx + dx, 64, cz + dz]));
+        if corners_loaded {
+            let dummy = PendingBastion {
+                rift_id: rift.id,
+                origin: [cx, rift.center[1], cz],
+                flavor: rift.flavor,
+                roll: h,
+                forced_chunks: Vec::new(),
+                queued_tick: state.tick,
+            };
+            if let Some((resolved_origin, resolved_flavor)) =
+                validate_and_resolve_bastion_origin(host, ow, state, &dummy)
             {
-                biome_counts[bf.to_u8() as usize] += 1;
+                return Some((resolved_origin, resolved_flavor, h));
             }
-            if let Some(key) = ow.block(host, p) {
-                let name = key.id(host);
-                if is_water_like(&name) {
-                    water_hits += 1;
-                } else if is_nether_terrain_block(&name) {
-                    nether_surface += 1;
-                }
-            }
-            if let Some(top_key) = ow.block(host, [*px, hs[idx], *pz])
-                && is_water_like(&top_key.id(host))
-            {
-                water_hits += 1;
-            }
-        }
-
-        if !area_metrics_qualify(quart_corrupt, nether_surface, water_hits, probe_cols.len()) {
             continue;
         }
 
-        let Some(flavor) = select_dominant_bastion_biome(&biome_counts, probe_cols.len()) else {
-            continue;
-        };
-        let base_y = min_h - 1;
-        return Some(([cx, base_y, cz], flavor, h));
+        return Some(([cx, rift.center[1], cz], rift.flavor, h));
     }
 
     None
+}
+
+fn validate_and_resolve_bastion_origin(
+    host: &dyn ServerHost,
+    ow: LevelRef,
+    state: &RiftState,
+    pending: &PendingBastion,
+) -> Option<([i32; 3], NetherFlavor)> {
+    let cx = pending.origin[0];
+    let cz = pending.origin[2];
+
+    let mut probe_cols = Vec::with_capacity(25);
+    for dx in [-8, 0, 8, 16, 24] {
+        for dz in [-8, 0, 8, 16, 24] {
+            probe_cols.push((cx + dx, cz + dz));
+        }
+    }
+
+    let heights = host
+        .surface_heights(OVERWORLD, &probe_cols, Heightmap::MotionBlockingNoLeaves)
+        .ok()?;
+    if heights.iter().any(Option::is_none) {
+        return None;
+    }
+    let hs: Vec<i32> = heights.into_iter().flatten().collect();
+    let min_h = *hs.iter().min()?;
+    let max_h = *hs.iter().max()?;
+    let avg_h = hs.iter().sum::<i32>() / (hs.len() as i32);
+    if max_h - min_h > 22 || avg_h < 46 || avg_h > 165 {
+        return None;
+    }
+
+    let mut quart_corrupt = 0usize;
+    let mut nether_surface = 0usize;
+    let mut water_hits = 0usize;
+    let mut lava_hits = 0usize;
+    let mut biome_counts = [0usize; 5];
+
+    for (idx, (px, pz)) in probe_cols.iter().enumerate() {
+        let sy = hs[idx] - 1;
+        let p = [*px, sy, *pz];
+        if state.is_quart_corrupted(p) {
+            quart_corrupt += 1;
+        }
+        if let Some(bname) = ow.biome_at(host, [*px, sy.clamp(-56, 200), *pz])
+            && let Some(bf) = NetherFlavor::from_name(&bname)
+        {
+            biome_counts[bf.to_u8() as usize] += 1;
+        }
+        if let Some(key) = ow.block(host, p) {
+            let name = key.id(host);
+            let s = strip_ns(&name);
+            if is_water_like(&name) {
+                water_hits += 1;
+            } else if matches!(s, "lava" | "flowing_lava") {
+                lava_hits += 1;
+            } else if is_nether_terrain_block(&name)
+                || matches!(
+                    s,
+                    "obsidian" | "basalt" | "blackstone" | "magma_block" | "polished_basalt"
+                )
+            {
+                nether_surface += 1;
+            }
+        }
+        if let Some(top_key) = ow.block(host, [*px, hs[idx], *pz])
+            && is_water_like(&top_key.id(host))
+        {
+            water_hits += 1;
+        }
+    }
+
+    if water_hits > 2 || lava_hits > 6 || quart_corrupt < 15 || nether_surface < 13 {
+        return None;
+    }
+
+    let flavor = select_dominant_bastion_biome(&biome_counts, probe_cols.len()).or_else(|| {
+        if biome_counts[NetherFlavor::BasaltDeltas.to_u8() as usize] > 6 {
+            return None;
+        }
+        let non_basalt_total: usize = [
+            NetherFlavor::CrimsonForest,
+            NetherFlavor::WarpedForest,
+            NetherFlavor::SoulSandValley,
+            NetherFlavor::NetherWastes,
+        ]
+        .iter()
+        .map(|f| biome_counts[f.to_u8() as usize])
+        .sum();
+        if non_basalt_total < 10 {
+            return None;
+        }
+        [
+            NetherFlavor::CrimsonForest,
+            NetherFlavor::WarpedForest,
+            NetherFlavor::SoulSandValley,
+            NetherFlavor::NetherWastes,
+        ]
+        .into_iter()
+        .max_by_key(|f| biome_counts[f.to_u8() as usize])
+    })?;
+
+    let mut sorted = hs;
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let base_y = (median - 2).clamp(OVERWORLD_MIN_Y + 8, OVERWORLD_MAX_Y - 36);
+    Some(([cx, base_y, cz], flavor))
 }
 
 fn stage_pending_bastion(
@@ -344,11 +419,11 @@ fn stage_pending_bastion(
     flavor: NetherFlavor,
     roll: u64,
 ) {
-    let ccx = origin[0] >> 4;
-    let ccz = origin[2] >> 4;
-    let mut forced_chunks = Vec::with_capacity(81);
-    for dx in -4..=4 {
-        for dz in -4..=4 {
+    let ccx = (origin[0] + 8) >> 4;
+    let ccz = (origin[2] + 8) >> 4;
+    let mut forced_chunks = Vec::with_capacity(25);
+    for dx in -2..=2 {
+        for dz in -2..=2 {
             let chunk = [ccx + dx, ccz + dz];
             if let Some(chunk_ref) = ow.chunk_ref(host, chunk)
                 && chunk_ref.set_forced(host, true)
@@ -384,42 +459,51 @@ fn process_pending_bastion(host: &mut dyn ServerHost, ow: LevelRef, state: &mut 
         return;
     }
 
-    // Timeout safety if chunks cannot load after 8 seconds.
-    if state.tick.saturating_sub(pending.queued_tick) > 160 {
+    // Timeout safety if chunks cannot load after 12 seconds.
+    if state.tick.saturating_sub(pending.queued_tick) > 240 {
         release_bastion_chunks(host, ow, state);
         return;
     }
 
-    let all_loaded = pending
-        .forced_chunks
-        .iter()
-        .all(|[cx, cz]| ow.is_loaded(host, [cx << 4, 64, cz << 4]));
+    let all_loaded = !pending.forced_chunks.is_empty()
+        && pending
+            .forced_chunks
+            .iter()
+            .all(|[cx, cz]| ow.is_loaded(host, [cx << 4, 64, cz << 4]));
     if !all_loaded {
         return;
     }
 
     state.pending_bastion = None;
 
+    let Some((resolved_origin, resolved_flavor)) =
+        validate_and_resolve_bastion_origin(host, ow, state, &pending)
+    else {
+        state.bastion_release_chunks = pending.forced_chunks;
+        state.bastion_release_ttl = 6;
+        return;
+    };
+
     let cmd = format!(
         "execute in minecraft:overworld run place jigsaw minecraft:bastion/starts minecraft:empty 4 {} {} {}",
-        pending.origin[0], pending.origin[1], pending.origin[2]
+        resolved_origin[0], resolved_origin[1], resolved_origin[2]
     );
     let placed_jigsaw = host.commands().run_command_with_output(&cmd).success;
 
     if placed_jigsaw {
-        scrub_and_ground_bastion(host, ow, pending.origin, pending.flavor);
+        scrub_and_ground_bastion(host, ow, resolved_origin, resolved_flavor);
     } else {
-        build_fallback_bastion_keep(host, ow, pending.origin, pending.flavor, pending.roll);
+        build_fallback_bastion_keep(host, ow, resolved_origin, resolved_flavor, pending.roll);
     }
 
-    mark_bastion_footprint_biomes(host, ow, state, pending.origin, pending.flavor);
+    mark_bastion_footprint_biomes(host, ow, state, resolved_origin, resolved_flavor);
 
     if let Some(rift) = state.rifts.iter_mut().find(|r| r.id == pending.rift_id) {
         rift.bastions_placed += 1;
     }
     state.bastions.push(BastionSite {
-        center: pending.origin,
-        flavor: pending.flavor,
+        center: resolved_origin,
+        flavor: resolved_flavor,
     });
     state.bastion_release_chunks = pending.forced_chunks;
     state.bastion_release_ttl = 6;
@@ -435,7 +519,7 @@ fn process_pending_bastion(host: &mut dyn ServerHost, ow: LevelRef, state: &mut 
         let Some(pos) = player.entity().position(host) else {
             continue;
         };
-        if horiz_dist_sq([pos[0] as i32, 64, pos[2] as i32], pending.origin) <= 340 * 340 {
+        if horiz_dist_sq([pos[0] as i32, 64, pos[2] as i32], resolved_origin) <= 340 * 340 {
             let _ = player.tell(
                 host,
                 Text::literal(
