@@ -1,18 +1,21 @@
 use crate::atmosphere::ParticlePalette;
-use crate::corruption::{is_air_like, is_open_space};
+use crate::corruption::{
+    is_air_like, is_nether_terrain_block, is_open_space, is_water_like, transform_block,
+};
 use crate::state::RiftState;
 use crate::types::{
     NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, dist_sq, horiz_dist_sq,
     spatial_hash, strip_ns,
 };
 use mod_api::{
-    ActiveEffect, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, GoalSpec, Heightmap,
-    Host, Identifier, ItemStack, LevelRef, LivingChangeTargetEvent, LivingDeathEvent,
+    ActiveEffect, BlockState, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, GoalSpec,
+    Heightmap, Host, Identifier, ItemStack, LevelRef, LivingChangeTargetEvent, LivingDeathEvent,
     LivingIncomingDamageEvent, MobFilter, ParticleOptions, PotentialSpawnsEvent, ServerHost,
     SoundSource, SpawnEntry, SpawnReason, Tag,
 };
+use std::collections::HashMap;
 
-const MOB_TICK_INTERVAL: u64 = 20;
+const MOB_TICK_INTERVAL: u64 = 10;
 const HOGLIN_SPREAD_INTERVAL_TICKS: u64 = 24;
 const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
 
@@ -96,6 +99,45 @@ pub fn is_nether_predator(kind: &str) -> bool {
             | "magma_cube"
             | "ghast"
     )
+}
+
+/// True for Overworld hostiles and golems that immediately rally to fight Nether invaders on sight.
+pub fn is_overworld_defender_mob(kind: &str) -> bool {
+    matches!(
+        strip_ns(kind),
+        "zombie"
+            | "husk"
+            | "drowned"
+            | "zombie_villager"
+            | "skeleton"
+            | "stray"
+            | "bogged"
+            | "spider"
+            | "cave_spider"
+            | "pillager"
+            | "vindicator"
+            | "evoker"
+            | "ravager"
+            | "witch"
+            | "slime"
+            | "breeze"
+            | "phantom"
+            | "silverfish"
+            | "warden"
+            | "iron_golem"
+            | "snow_golem"
+    )
+}
+
+/// True when a battle death involving a Nether combatant should scorch uncorrupted ground beneath it.
+pub fn should_corrupt_kill_patch(
+    attacker_is_nether: bool,
+    victim_is_nether: bool,
+    attacker_has_id: bool,
+    attacker_is_player: bool,
+) -> bool {
+    (attacker_is_nether && !victim_is_nether)
+        || (victim_is_nether && attacker_has_id && !attacker_is_player)
 }
 
 /// Maps any Overworld creature killed by Nether mobs (or dying inside an established
@@ -305,6 +347,7 @@ fn process_predator_hunting_and_buffs(
 ) {
     let mut hunters: Vec<(EntityRef, String, [f64; 3])> = Vec::new();
     let mut prey: Vec<(EntityRef, [f64; 3])> = Vec::new();
+    let mut defenders: Vec<(EntityRef, [f64; 3])> = Vec::new();
     let mut fire_buffs: Vec<EntityRef> = Vec::new();
     let mut immunize_mobs: Vec<u32> = Vec::new();
     let mut touched_buffs: Vec<(EntityRef, [f64; 3])> = Vec::new();
@@ -371,6 +414,11 @@ fn process_predator_hunting_and_buffs(
             }
         } else if nether_death_conversion_target(kind).is_some() {
             prey.push((*ent, *pos));
+            if is_overworld_defender_mob(kind) {
+                defenders.push((*ent, *pos));
+            }
+        } else if is_overworld_defender_mob(kind) {
+            defenders.push((*ent, *pos));
         }
 
         if is_nether_touched_candidate(kind) {
@@ -536,84 +584,116 @@ fn process_predator_hunting_and_buffs(
         }
     }
 
-    if hunters.is_empty() || prey.is_empty() {
+    if hunters.is_empty() {
         return;
     }
 
     let hunt_range_sq = 32.0 * 32.0;
 
-    for (hunter_ent, hunter_short, h_pos) in hunters {
-        let Some(mob) = host.mob(hunter_ent) else {
+    if !prey.is_empty() {
+        for &(hunter_ent, ref hunter_short, h_pos) in &hunters {
+            let Some(mob) = host.mob(hunter_ent) else {
+                continue;
+            };
+
+            // Ensure Magma Cubes have an active melee goal and actually strike adjacent
+            // Overworld animals rather than passively bouncing beside cows/pigs/sheep.
+            if hunter_short == "magma_cube" {
+                if state.magma_melee_ready.insert(hunter_ent.id())
+                    && let Some(goals) = mob.goals(host)
+                    && !goals.iter().any(|g| g.id == "melee_attack")
+                {
+                    let _ = mob.add_goal(
+                        host,
+                        2,
+                        &GoalSpec::MeleeAttack {
+                            speed: 1.3,
+                            follow_unseen: true,
+                        },
+                    );
+                }
+                if let Some((close_prey, p_pos, _)) = prey
+                    .iter()
+                    .filter_map(|(pe, pp)| {
+                        let dx = h_pos[0] - pp[0];
+                        let dy = h_pos[1] - pp[1];
+                        let dz = h_pos[2] - pp[2];
+                        let d2 = dx * dx + dy * dy + dz * dz;
+                        (d2 <= 2.75 * 2.75).then_some((*pe, *pp, d2))
+                    })
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+                {
+                    let _ = close_prey.hurt(
+                        host,
+                        "minecraft:mob_attack",
+                        4.5,
+                        Some(hunter_ent),
+                        Some(hunter_ent),
+                    );
+                    let _ = mob.move_to(host, p_pos, 1.3);
+                }
+            }
+
+            // Skip hunters that already have an active target so we don't re-trigger
+            // aggro / angry sounds repeatedly.
+            if mob.target(host).is_some() {
+                if hunter_short == "magma_cube"
+                    && let Some(tgt) = mob.target(host)
+                    && let Some(tp) = tgt.entity().position(host)
+                {
+                    let _ = mob.move_to(host, tp, 1.3);
+                }
+                continue;
+            }
+            let mut best: Option<(EntityRef, [f64; 3], f64)> = None;
+            for (prey_ent, p_pos) in &prey {
+                let dx = h_pos[0] - p_pos[0];
+                let dy = h_pos[1] - p_pos[1];
+                let dz = h_pos[2] - p_pos[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= hunt_range_sq && best.is_none_or(|(_, _, b)| d2 < b) {
+                    best = Some((*prey_ent, *p_pos, d2));
+                }
+            }
+            if let Some((victim_ent, v_pos, _)) = best
+                && let Some(target_living) = host.living(victim_ent)
+            {
+                let _ = mob.set_target(host, Some(target_living));
+                let _ = mob.set_brain_target(host, Some(target_living));
+                if hunter_short == "magma_cube" {
+                    let _ = mob.move_to(host, v_pos, 1.3);
+                }
+                if mob.is_aggressive(host) != Some(true) {
+                    let _ = mob.set_aggressive(host, true);
+                }
+            }
+        }
+    }
+
+    // Overworld mobs (zombies, skeletons, spiders, illagers, golems) immediately fight back
+    // and target nearby Nether enemies on sight.
+    for &(def_ent, d_pos) in &defenders {
+        let Some(mob) = host.mob(def_ent) else {
             continue;
         };
-
-        // Ensure Magma Cubes have an active melee goal and actually strike adjacent
-        // Overworld animals rather than passively bouncing beside cows/pigs/sheep.
-        if hunter_short == "magma_cube" {
-            if state.magma_melee_ready.insert(hunter_ent.id())
-                && let Some(goals) = mob.goals(host)
-                && !goals.iter().any(|g| g.id == "melee_attack")
-            {
-                let _ = mob.add_goal(
-                    host,
-                    2,
-                    &GoalSpec::MeleeAttack {
-                        speed: 1.3,
-                        follow_unseen: true,
-                    },
-                );
-            }
-            if let Some((close_prey, p_pos, _)) = prey
-                .iter()
-                .filter_map(|(pe, pp)| {
-                    let dx = h_pos[0] - pp[0];
-                    let dy = h_pos[1] - pp[1];
-                    let dz = h_pos[2] - pp[2];
-                    let d2 = dx * dx + dy * dy + dz * dz;
-                    (d2 <= 2.75 * 2.75).then_some((*pe, *pp, d2))
-                })
-                .min_by(|a, b| a.2.total_cmp(&b.2))
-            {
-                let _ = close_prey.hurt(
-                    host,
-                    "minecraft:mob_attack",
-                    4.5,
-                    Some(hunter_ent),
-                    Some(hunter_ent),
-                );
-                let _ = mob.move_to(host, p_pos, 1.3);
-            }
-        }
-
-        // Skip hunters that already have an active target so we don't re-trigger
-        // aggro / angry sounds every second.
         if mob.target(host).is_some() {
-            if hunter_short == "magma_cube"
-                && let Some(tgt) = mob.target(host)
-                && let Some(tp) = tgt.entity().position(host)
-            {
-                let _ = mob.move_to(host, tp, 1.3);
-            }
             continue;
         }
-        let mut best: Option<(EntityRef, [f64; 3], f64)> = None;
-        for (prey_ent, p_pos) in &prey {
-            let dx = h_pos[0] - p_pos[0];
-            let dy = h_pos[1] - p_pos[1];
-            let dz = h_pos[2] - p_pos[2];
+        let mut best_nether: Option<(EntityRef, f64)> = None;
+        for &(hunter_ent, _, h_pos) in &hunters {
+            let dx = d_pos[0] - h_pos[0];
+            let dy = d_pos[1] - h_pos[1];
+            let dz = d_pos[2] - h_pos[2];
             let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 <= hunt_range_sq && best.is_none_or(|(_, _, b)| d2 < b) {
-                best = Some((*prey_ent, *p_pos, d2));
+            if d2 <= hunt_range_sq && best_nether.is_none_or(|(_, b)| d2 < b) {
+                best_nether = Some((hunter_ent, d2));
             }
         }
-        if let Some((victim_ent, v_pos, _)) = best
-            && let Some(target_living) = host.living(victim_ent)
+        if let Some((target_ent, _)) = best_nether
+            && let Some(target_living) = host.living(target_ent)
         {
             let _ = mob.set_target(host, Some(target_living));
             let _ = mob.set_brain_target(host, Some(target_living));
-            if hunter_short == "magma_cube" {
-                let _ = mob.move_to(host, v_pos, 1.3);
-            }
             if mob.is_aggressive(host) != Some(true) {
                 let _ = mob.set_aggressive(host, true);
             }
@@ -718,8 +798,154 @@ pub fn should_cancel_incoming_damage(
     )
 }
 
+fn resolve_mob_block_cached(
+    cache: &mut HashMap<&'static str, BlockState>,
+    host: &dyn ServerHost,
+    id: &'static str,
+) -> Option<BlockState> {
+    if let Some(&bs) = cache.get(id) {
+        return Some(bs);
+    }
+    let bs = host
+        .block_state_id(id)
+        .or_else(|| host.block_key(id).and_then(|k| host.block_state_default(k)))?;
+    cache.insert(id, bs);
+    Some(bs)
+}
+
+/// Scorches an organic ~3-block patch of uncorrupted land beneath a Nether battle kill.
+fn corrupt_kill_patch(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    bp: [i32; 3],
+    particles: Option<&ParticlePalette>,
+) {
+    if !level.is_loaded(host, bp) {
+        return;
+    }
+    // Never stain a peaceful/healing zone where a Sovereign Wither has been defeated.
+    if state.rifts.iter().any(|r| {
+        (r.pacified || r.regressing) && horiz_dist_sq(r.center, bp) <= r.max_radius_sq.max(48 * 48)
+    }) {
+        return;
+    }
+
+    let ground_block = level
+        .block(host, [bp[0], (bp[1] - 1).max(OVERWORLD_MIN_Y), bp[2]])
+        .map(|k| k.id(host))
+        .unwrap_or_default();
+    if state.is_quart_corrupted(bp) && is_nether_terrain_block(&ground_block) {
+        return;
+    }
+
+    let nearest = state
+        .rifts
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.pacified)
+        .min_by_key(|(_, r)| horiz_dist_sq(r.center, bp));
+    let nearest_idx = nearest.map(|(i, _)| i);
+    let flavor = nearest
+        .map(|(_, r)| r.flavor)
+        .unwrap_or_else(|| NetherFlavor::pick_for_region(bp[0], bp[2], state.seed));
+    let mature = nearest.is_some_and(|(_, r)| r.corrupted_blocks >= 35_000 || r.age_ticks >= 5_000);
+
+    let min_y = (bp[1] - 3).max(OVERWORLD_MIN_Y + 1);
+    let max_y = (bp[1] + 2).min(OVERWORLD_MAX_Y - 1);
+    let mut converted_here = 0u64;
+
+    for dx in -3..=3 {
+        for dz in -3..=3 {
+            let px = bp[0] + dx;
+            let pz = bp[2] + dz;
+            let h = spatial_hash(px, bp[1], pz, state.seed ^ 0xB100_D111);
+            if dx * dx + dz * dz > 9 + (h % 4) as i32 {
+                continue;
+            }
+            if !level.is_loaded(host, [px, bp[1].clamp(OVERWORLD_MIN_Y, OVERWORLD_MAX_Y), pz]) {
+                continue;
+            }
+            for y in (min_y..=max_y).rev() {
+                let pos = [px, y, pz];
+                let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
+                if current.is_empty() || is_air_like(&current) || is_water_like(&current) {
+                    continue;
+                }
+                let above = if y + 1 <= OVERWORLD_MAX_Y {
+                    level
+                        .block(host, [px, y + 1, pz])
+                        .map(|k| k.id(host))
+                        .unwrap_or_else(|| "minecraft:air".to_owned())
+                } else {
+                    "minecraft:air".to_owned()
+                };
+                let below = if y - 1 >= OVERWORLD_MIN_Y {
+                    level
+                        .block(host, [px, y - 1, pz])
+                        .map(|k| k.id(host))
+                        .unwrap_or_else(|| "minecraft:bedrock".to_owned())
+                } else {
+                    "minecraft:bedrock".to_owned()
+                };
+
+                let out = transform_block(pos, &current, &above, &below, flavor, mature);
+                if let Some(target_id) = out.block
+                    && let Some(bs) = resolve_mob_block_cached(&mut state.block_state_cache, host, target_id)
+                {
+                    let flags = if target_id == "minecraft:air" || out.above.is_none() {
+                        BlockUpdateFlags::CLIENTS
+                            | BlockUpdateFlags::KNOWN_SHAPE
+                            | BlockUpdateFlags::SUPPRESS_DROPS
+                    } else {
+                        BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS
+                    };
+                    if level.set_block(host, pos, bs, flags).unwrap_or(false) {
+                        converted_here += 1;
+                        if let Some(above_id) = out.above
+                            && y + 1 < OVERWORLD_MAX_Y
+                            && is_air_like(&above)
+                            && let Some(above_bs) =
+                                resolve_mob_block_cached(&mut state.block_state_cache, host, above_id)
+                        {
+                            let _ = level.set_block(
+                                host,
+                                [px, y + 1, pz],
+                                above_bs,
+                                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                            );
+                        }
+                    }
+                }
+                if out.is_corrupt && state.mark_quart_corrupted(pos) {
+                    paint_biome_column(level, host, px, pz, flavor);
+                }
+            }
+        }
+    }
+
+    if converted_here > 0 {
+        if let Some(r_idx) = nearest_idx {
+            state.rifts[r_idx].corrupted_blocks += converted_here;
+        }
+        state.dirty = true;
+        if let Some(pal) = particles {
+            let _ = level.send_particles(
+                host,
+                &ParticleOptions::simple(pal.crimson_spore),
+                None,
+                [f64::from(bp[0]) + 0.5, f64::from(bp[1]) + 0.25, f64::from(bp[2]) + 0.5],
+                [1.4, 0.35, 1.4],
+                0.025,
+                20,
+            );
+        }
+    }
+}
+
 /// Converts any Overworld creature killed by a Nether mob (or slain inside an already-large
-/// corrupted Nether biome) into its Nether version on death.
+/// corrupted Nether biome) into its Nether version on death, and corrupts uncorrupted terrain
+/// underneath Nether battle kills.
 pub fn handle_living_death(
     host: &mut dyn ServerHost,
     state: &mut RiftState,
@@ -729,9 +955,6 @@ pub fn handle_living_death(
     if strip_ns(event.kind) == "player" {
         return;
     }
-    let Some(target_kind) = nether_death_conversion_target(event.kind) else {
-        return;
-    };
     let Some(level) = host.level(OVERWORLD) else {
         return;
     };
@@ -753,14 +976,31 @@ pub fn handle_living_death(
         .filter(|&v| v > 0)
         .or_else(|| u32::try_from(event.source.direct).ok().filter(|&v| v > 0));
 
+    let victim_is_nether = is_nether_predator(event.kind) || strip_ns(event.kind) == "strider";
+    let attacker_kind = attacker_id.and_then(|aid| host.entity(aid).and_then(|e| e.kind(host)));
+    let attacker_is_player = attacker_kind
+        .as_ref()
+        .is_some_and(|k| strip_ns(&k.id(host)) == "player");
     let attacker_is_nether = attacker_id.is_some_and(|aid| {
         state.known_nether_mobs.contains(&aid)
             || state.nether_touched_mobs.contains(&aid)
-            || host
-                .entity(aid)
-                .and_then(|e| e.kind(host))
+            || attacker_kind
+                .as_ref()
                 .is_some_and(|k| is_nether_predator(&k.id(host)))
     });
+
+    if should_corrupt_kill_patch(
+        attacker_is_nether,
+        victim_is_nether,
+        attacker_id.is_some(),
+        attacker_is_player,
+    ) {
+        corrupt_kill_patch(host, level, state, bp, particles);
+    }
+
+    let Some(target_kind) = nether_death_conversion_target(event.kind) else {
+        return;
+    };
 
     if !attacker_is_nether && !location_unlocks_nether_mobs(state, bp) {
         return;
@@ -1624,5 +1864,25 @@ mod tests {
             .unwrap()
             .weight;
         assert!(z_w <= 28 && m_w >= 10 && m_w < 20);
+    }
+
+    #[test]
+    fn overworld_defenders_fight_back_and_kill_patch_triggers_appropriately() {
+        assert!(is_overworld_defender_mob("minecraft:zombie"));
+        assert!(is_overworld_defender_mob("minecraft:skeleton"));
+        assert!(is_overworld_defender_mob("minecraft:iron_golem"));
+        assert!(!is_overworld_defender_mob("minecraft:piglin"));
+        assert!(!is_overworld_defender_mob("minecraft:cow"));
+
+        // Nether kills Overworld -> scorches uncorrupted patch.
+        assert!(should_corrupt_kill_patch(true, false, true, false));
+        // Overworld defender kills Nether -> scorches uncorrupted patch.
+        assert!(should_corrupt_kill_patch(false, true, true, false));
+        // Player killing a stray Nether invader on clean land won't grief their own lawn.
+        assert!(!should_corrupt_kill_patch(false, true, true, true));
+        // Pure Overworld-on-Overworld fight never spawns Nether corruption.
+        assert!(!should_corrupt_kill_patch(false, false, true, false));
+        // Natural despawn / fall with no attacker does not trigger a kill patch.
+        assert!(!should_corrupt_kill_patch(false, true, false, false));
     }
 }
