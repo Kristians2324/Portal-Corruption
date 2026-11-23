@@ -112,10 +112,12 @@ pub struct RiftState {
     /// Independent runtime vertical cursor `([x, z], next_y_down, min_y)` for each
     /// rift's simultaneous underground deepening pass, keyed by rift id.
     pub active_deepen_columns: HashMap<u64, ([i32; 2], i32, i32)>,
-    /// Runtime priority deep-bore cursor & queue around loaded players / epicenter.
-    pub active_priority_deepen: HashMap<u64, ([i32; 2], i32, i32)>,
-    pub priority_deepen_cols: HashMap<u64, VecDeque<[i32; 2]>>,
+    /// Runtime priority deep-bore cursor & queue `(col, top_y, bottom_y, cave_band)` around
+    /// loaded players / epicenter (`cave_band == i32::MIN` indicates a full surface-to-bedrock col).
+    pub active_priority_deepen: HashMap<u64, ([i32; 2], i32, i32, i32)>,
+    pub priority_deepen_cols: HashMap<u64, VecDeque<([i32; 2], i32, i32, i32)>>,
     pub session_deepened_cols: HashSet<[i32; 2]>,
+    pub session_cave_band_cols: HashSet<([i32; 2], i32)>,
     pub last_deepen_probe_tick: HashMap<u64, u64>,
     /// Runtime queue of recently evaporated/melted water, ice, or snow positions
     /// for emitting throttled black smoke effects without saving to disk.
@@ -175,6 +177,7 @@ impl RiftState {
             active_priority_deepen: HashMap::new(),
             priority_deepen_cols: HashMap::new(),
             session_deepened_cols: HashSet::new(),
+            session_cave_band_cols: HashSet::new(),
             last_deepen_probe_tick: HashMap::new(),
             pending_melt_fx: Vec::new(),
             last_melt_sound_tick: 0,
@@ -186,6 +189,13 @@ impl RiftState {
             self.session_deepened_cols.clear();
         }
         self.session_deepened_cols.insert(col);
+    }
+
+    pub fn mark_session_cave_col_deepened(&mut self, col: [i32; 2], band: i32) {
+        if self.session_cave_band_cols.len() >= 32_768 {
+            self.session_cave_band_cols.clear();
+        }
+        self.session_cave_band_cols.insert((col, band));
     }
 
     pub fn queue_melt_fx(&mut self, pos: [i32; 3]) {
@@ -258,6 +268,8 @@ impl RiftState {
         self.corrupted_quarts.retain(|q| q[0] != qx || q[2] != qz);
         self.session_deepened_cols
             .retain(|c| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
+        self.session_cave_band_cols
+            .retain(|(c, _)| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
     }
 
     /// True if any *other* active (unpacified) Rift still reaches `(x, z)` so one
@@ -517,6 +529,7 @@ impl RiftState {
         self.active_priority_deepen.clear();
         self.priority_deepen_cols.clear();
         self.session_deepened_cols.clear();
+        self.session_cave_band_cols.clear();
         self.last_deepen_probe_tick.clear();
         if let Some(arr) = doc.get("rifts").and_then(|v| v.as_array()) {
             for item in arr {

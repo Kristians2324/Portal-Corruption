@@ -1638,13 +1638,21 @@ fn refill_priority_deepen_cols(
     if state
         .last_deepen_probe_tick
         .get(&rift_id)
-        .is_some_and(|t| state.tick.saturating_sub(*t) < 25)
+        .is_some_and(|t| state.tick.saturating_sub(*t) < 15)
     {
         return;
     }
     state.last_deepen_probe_tick.insert(rift_id, state.tick);
 
-    let mut foci: Vec<([i32; 2], i32)> = Vec::new();
+    struct ProbeFocus {
+        xz: [i32; 2],
+        scan_r: i32,
+        top_y: i32,
+        bottom_y: i32,
+        cave_band: i32,
+    }
+
+    let mut foci: Vec<ProbeFocus> = Vec::new();
     for player in host.players().server_players() {
         if !player
             .dimension(host)
@@ -1656,43 +1664,79 @@ fn refill_priority_deepen_cols(
             continue;
         };
         let px = epos[0].floor() as i32;
+        let py = epos[1].floor() as i32;
         let pz = epos[2].floor() as i32;
         if horiz_dist_sq(center, [px, 64, pz]) <= i64::from(rift.ring_radius + 6).pow(2) {
-            foci.push(([px, pz], 20));
+            let surf_y = host
+                .surface_heights(OVERWORLD, &[(px, pz)], Heightmap::OceanFloor)
+                .ok()
+                .and_then(|hs| hs.first().copied().flatten())
+                .unwrap_or(center[1]);
+            if py < surf_y - 12 {
+                // Player is underground: target cavern walls, floors, and diamond strata at
+                // their actual depth first before boring upper unseen rock.
+                let cave_top = (py + 22).min(surf_y + 2).min(OVERWORLD_MAX_Y - 1);
+                let cave_bot = (py - 28).max(BEDROCK_FLOOR_Y);
+                foci.push(ProbeFocus {
+                    xz: [px, pz],
+                    scan_r: 26,
+                    top_y: cave_top,
+                    bottom_y: cave_bot,
+                    cave_band: py >> 4,
+                });
+            } else {
+                foci.push(ProbeFocus {
+                    xz: [px, pz],
+                    scan_r: 20,
+                    top_y: OVERWORLD_MAX_Y,
+                    bottom_y: BEDROCK_FLOOR_Y,
+                    cave_band: i32::MIN,
+                });
+            }
         }
     }
     // Always prioritize the epicenter core alongside active player neighborhoods.
-    foci.push(([center[0], center[2]], 24));
+    foci.push(ProbeFocus {
+        xz: [center[0], center[2]],
+        scan_r: 24,
+        top_y: OVERWORLD_MAX_Y,
+        bottom_y: BEDROCK_FLOOR_Y,
+        cave_band: i32::MIN,
+    });
 
     let max_r_sq = i64::from(max_r) * i64::from(max_r);
-    let mut batch: VecDeque<[i32; 2]> = VecDeque::new();
-    for (focus, scan_r) in foci {
-        let limit_r = scan_r.min(max_r);
+    let mut batch: VecDeque<([i32; 2], i32, i32, i32)> = VecDeque::new();
+    for focus in foci {
+        let limit_r = focus.scan_r.min(max_r);
         for r in 0..=limit_r {
             let ring = if r == 0 {
-                vec![focus]
+                vec![focus.xz]
             } else {
-                build_ring_columns(focus[0], focus[1], r)
+                build_ring_columns(focus.xz[0], focus.xz[1], r)
             };
             for col in ring {
-                if batch.len() >= 192 {
+                if batch.len() >= 280 {
                     break;
                 }
                 if horiz_dist_sq(center, [col[0], 64, col[1]]) > max_r_sq {
                     continue;
                 }
                 if state.session_deepened_cols.contains(&col)
+                    || (focus.cave_band != i32::MIN
+                        && state
+                            .session_cave_band_cols
+                            .contains(&(col, focus.cave_band)))
                     || !level.is_loaded(host, [col[0], 64, col[1]])
                 {
                     continue;
                 }
-                batch.push_back(col);
+                batch.push_back((col, focus.top_y, focus.bottom_y, focus.cave_band));
             }
-            if batch.len() >= 192 {
+            if batch.len() >= 280 {
                 break;
             }
         }
-        if batch.len() >= 192 {
+        if batch.len() >= 280 {
             break;
         }
     }
@@ -1709,13 +1753,22 @@ fn next_deepen_column_for_stream(
     rift_id: u64,
     rift_center: [i32; 3],
     priority: bool,
-) -> Option<[i32; 2]> {
+) -> Option<([i32; 2], i32, i32, i32)> {
     if priority {
         let q = state.priority_deepen_cols.get_mut(&rift_id)?;
-        while let Some(col) = q.pop_front() {
-            if !state.session_deepened_cols.contains(&col) && level.is_loaded(host, [col[0], 64, col[1]])
-            {
-                return Some(col);
+        while let Some((col, top_y, bottom_y, band)) = q.pop_front() {
+            let already_done = state.session_deepened_cols.contains(&col)
+                || (band != i32::MIN && state.session_cave_band_cols.contains(&(col, band)));
+            if !already_done && level.is_loaded(host, [col[0], 64, col[1]]) {
+                let start_y = if top_y >= OVERWORLD_MAX_Y {
+                    let (ws, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
+                    (ws + 2).min(OVERWORLD_MAX_Y - 1)
+                } else {
+                    top_y
+                };
+                if start_y >= bottom_y {
+                    return Some((col, start_y, bottom_y, band));
+                }
             }
         }
         return None;
@@ -1750,7 +1803,11 @@ fn next_deepen_column_for_stream(
     }
     r.deepen_radius = d_rad;
     r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
-    picked
+    picked.map(|col| {
+        let (ws, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
+        let start_y = (ws + 2).min(OVERWORLD_MAX_Y - 1);
+        (col, start_y, BEDROCK_FLOOR_Y, i32::MIN)
+    })
 }
 
 fn bore_deepen_stream(
@@ -1777,7 +1834,7 @@ fn bore_deepen_stream(
             !state.active_deepen_columns.contains_key(&rift_id)
         };
         if active_missing {
-            let Some(col) = next_deepen_column_for_stream(
+            let Some((col, start_y, min_y, band)) = next_deepen_column_for_stream(
                 host,
                 level,
                 state,
@@ -1788,30 +1845,40 @@ fn bore_deepen_stream(
             ) else {
                 break;
             };
-            let (world_surface, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
-            let start_y = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
-            let cursor = (col, start_y, BEDROCK_FLOOR_Y);
             if priority {
-                state.active_priority_deepen.insert(rift_id, cursor);
+                state
+                    .active_priority_deepen
+                    .insert(rift_id, (col, start_y, min_y, band));
             } else {
-                state.active_deepen_columns.insert(rift_id, cursor);
+                state
+                    .active_deepen_columns
+                    .insert(rift_id, (col, start_y, min_y));
             }
         }
 
-        let Some((col, y, min_y)) = (if priority {
+        let Some((col, y, min_y, band)) = (if priority {
             state.active_priority_deepen.get(&rift_id).copied()
         } else {
-            state.active_deepen_columns.get(&rift_id).copied()
+            state
+                .active_deepen_columns
+                .get(&rift_id)
+                .copied()
+                .map(|(c, y, m)| (c, y, m, i32::MIN))
         }) else {
             break;
         };
         if y < min_y {
             if priority {
                 state.active_priority_deepen.remove(&rift_id);
+                if band == i32::MIN {
+                    state.mark_session_col_deepened(col);
+                } else {
+                    state.mark_session_cave_col_deepened(col, band);
+                }
             } else {
                 state.active_deepen_columns.remove(&rift_id);
+                state.mark_session_col_deepened(col);
             }
-            state.mark_session_col_deepened(col);
             continue;
         }
 
@@ -1829,18 +1896,21 @@ fn bore_deepen_stream(
             if priority {
                 state
                     .active_priority_deepen
-                    .insert(rift_id, (col, y - 1, min_y));
+                    .insert(rift_id, (col, y - 1, min_y, band));
             } else {
                 state
                     .active_deepen_columns
                     .insert(rift_id, (col, y - 1, min_y));
             }
-        } else {
-            if priority {
-                state.active_priority_deepen.remove(&rift_id);
+        } else if priority {
+            state.active_priority_deepen.remove(&rift_id);
+            if band == i32::MIN {
+                state.mark_session_col_deepened(col);
             } else {
-                state.active_deepen_columns.remove(&rift_id);
+                state.mark_session_cave_col_deepened(col, band);
             }
+        } else {
+            state.active_deepen_columns.remove(&rift_id);
             state.mark_session_col_deepened(col);
         }
 
@@ -1949,7 +2019,7 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         .map(|&idx| effective_deepen_budget(state.spread_budget, state.rifts[idx].ring_radius))
         .collect();
     let total_deep_raw: usize = deepen_raw.iter().sum();
-    let global_deep_cap = (state.spread_budget * 10).clamp(110, 220);
+    let global_deep_cap = (state.spread_budget * 14).clamp(140, 260);
 
     let count = uncontained_indices.len();
     let start = (state.tick as usize) % count;

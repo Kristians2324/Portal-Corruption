@@ -981,6 +981,120 @@ fn pick_mob_for_flavor(flavor: NetherFlavor, roll: u64, rift_blocks: u64) -> &'s
     }
 }
 
+/// Depth-scaled chance (`%`) of an extra Nether creature emerging in subterranean caves:
+/// still active underground so dark caverns feel Nether-haunted, while gradually thinning out
+/// the deeper you go toward bedrock compared with surface hordes.
+pub fn underground_spawn_chance_pct(player_y: i32, surface_y: i32) -> u64 {
+    if player_y >= surface_y - 10 {
+        100
+    } else if player_y >= 16 {
+        65
+    } else if player_y >= -16 {
+        45
+    } else {
+        30
+    }
+}
+
+fn pick_underground_mob_for_flavor(flavor: NetherFlavor, roll: u64, headroom: i32) -> &'static str {
+    match (flavor, roll % 10) {
+        (NetherFlavor::CrimsonForest, 0..=3) if headroom >= 3 => "minecraft:hoglin",
+        (NetherFlavor::CrimsonForest, 0..=6) => "minecraft:piglin",
+        (NetherFlavor::CrimsonForest, 7..=8) => "minecraft:zombified_piglin",
+        (NetherFlavor::CrimsonForest, _) => "minecraft:magma_cube",
+        (NetherFlavor::WarpedForest, 0..=4) => "minecraft:enderman",
+        (NetherFlavor::WarpedForest, 5..=7) => "minecraft:piglin",
+        (NetherFlavor::WarpedForest, 8) => "minecraft:blaze",
+        (NetherFlavor::WarpedForest, _) => "minecraft:zombified_piglin",
+        (NetherFlavor::SoulSandValley, 0..=4) => "minecraft:wither_skeleton",
+        (NetherFlavor::SoulSandValley, 5..=7) => "minecraft:skeleton",
+        (NetherFlavor::SoulSandValley, 8) => "minecraft:blaze",
+        (NetherFlavor::SoulSandValley, _) => "minecraft:magma_cube",
+        (NetherFlavor::BasaltDeltas, 0..=6) => "minecraft:magma_cube",
+        (NetherFlavor::BasaltDeltas, 7..=8) => "minecraft:blaze",
+        (NetherFlavor::BasaltDeltas, _) => "minecraft:zombified_piglin",
+        (NetherFlavor::NetherWastes, 0..=3) => "minecraft:piglin",
+        (NetherFlavor::NetherWastes, 4..=6) => "minecraft:zombified_piglin",
+        (NetherFlavor::NetherWastes, 7) => "minecraft:magma_cube",
+        (NetherFlavor::NetherWastes, 8) => "minecraft:wither_skeleton",
+        (NetherFlavor::NetherWastes, _) => "minecraft:blaze",
+    }
+}
+
+pub fn tune_underground_spawn_entries(entries: &mut Vec<SpawnEntry>, y: i32) {
+    if y >= 48 {
+        return;
+    }
+    // Keep cramped cave tunnels free of giant ghasts while balancing Overworld vs Nether odds
+    // so Nether mobs still appear underground (rarer deep below y=0 than mid-depth).
+    entries.retain(|e| strip_ns(&e.entity) != "ghast");
+    for entry in entries.iter_mut() {
+        let is_nether = is_nether_predator(&entry.entity) || strip_ns(&entry.entity) == "strider";
+        if is_nether {
+            if y < 0 {
+                entry.weight = ((entry.weight * 6) / 10).max(2);
+            }
+        } else {
+            let cap = if y < 0 { 28 } else { 18 };
+            entry.weight = entry.weight.min(cap).max(1);
+        }
+    }
+}
+
+fn find_underground_spawn_spot(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    sx: i32,
+    sz: i32,
+    center_y: i32,
+    surface_y: i32,
+) -> Option<(i32, i32)> {
+    let min_y = (center_y - 8).max(OVERWORLD_MIN_Y + 2);
+    let max_y = (center_y + 8).min(surface_y - 4);
+    if min_y > max_y {
+        return None;
+    }
+    for y in min_y..=max_y {
+        let below = [sx, y - 1, sz];
+        let head1 = [sx, y, sz];
+        let head2 = [sx, y + 1, sz];
+        if !level.is_loaded(host, head1) {
+            return None;
+        }
+        let Some(bk) = level.block(host, below) else {
+            continue;
+        };
+        let b_id = bk.id(host);
+        let b_short = strip_ns(&b_id);
+        if is_air_like(&b_id)
+            || crate::corruption::is_water_like(&b_id)
+            || matches!(b_short, "lava" | "flowing_lava" | "magma_block" | "fire" | "soul_fire")
+        {
+            continue;
+        }
+        let a1 = level
+            .block(host, head1)
+            .map(|k| is_air_like(&k.id(host)))
+            .unwrap_or(false);
+        let a2 = level
+            .block(host, head2)
+            .map(|k| is_air_like(&k.id(host)))
+            .unwrap_or(false);
+        if a1 && a2 {
+            let headroom = if level
+                .block(host, [sx, y + 2, sz])
+                .is_some_and(|k| is_air_like(&k.id(host)))
+            {
+                3
+            } else {
+                2
+            };
+            return Some((y, headroom));
+        }
+    }
+    None
+}
+
 fn process_supplemental_spawns(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -1060,36 +1174,54 @@ fn process_supplemental_spawns(
     let sx = anchor[0] + dx;
     let sz = anchor[2] + dz;
     let Ok(heights) =
-        host.surface_heights(OVERWORLD, &[(sx, sz)], Heightmap::MotionBlockingNoLeaves)
+        host.surface_heights(OVERWORLD, &[(sx, sz), (anchor[0], anchor[2])], Heightmap::MotionBlockingNoLeaves)
     else {
         return;
     };
     let Some(Some(sy)) = heights.first().copied() else {
         return;
     };
-    let ground = [sx, sy - 1, sz];
-    if !location_unlocks_nether_mobs(state, ground) {
-        return;
-    }
+    let anchor_sy = heights.get(1).copied().flatten().unwrap_or(sy);
 
-    let local_flavor = local_corrupt_flavor(host, level, ground).unwrap_or(fallback_flavor);
-    let mob_kind = pick_mob_for_flavor(local_flavor, h >> 16, corrupted_blocks);
-    let spawn_y = if mob_kind == "minecraft:ghast" {
-        f64::from(sy + 14)
+    let (ground, spawn_pos, mob_kind) = if anchor[1] < anchor_sy - 10 {
+        let chance = underground_spawn_chance_pct(anchor[1], anchor_sy);
+        if ((h >> 24) % 100) >= chance {
+            return;
+        }
+        let Some((cave_y, headroom)) =
+            find_underground_spawn_spot(host, level, sx, sz, anchor[1], sy)
+        else {
+            return;
+        };
+        let g = [sx, cave_y - 1, sz];
+        if !location_unlocks_nether_mobs(state, g) {
+            return;
+        }
+        let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
+        let kind = pick_underground_mob_for_flavor(local_flavor, h >> 16, headroom);
+        (g, [f64::from(sx) + 0.5, f64::from(cave_y), f64::from(sz) + 0.5], kind)
     } else {
-        f64::from(sy)
+        let g = [sx, sy - 1, sz];
+        if !location_unlocks_nether_mobs(state, g) {
+            return;
+        }
+        let local_flavor = local_corrupt_flavor(host, level, g).unwrap_or(fallback_flavor);
+        let kind = pick_mob_for_flavor(local_flavor, h >> 16, corrupted_blocks);
+        let spawn_y = if kind == "minecraft:ghast" {
+            f64::from(sy + 14)
+        } else {
+            f64::from(sy)
+        };
+        (g, [f64::from(sx) + 0.5, spawn_y, f64::from(sz) + 0.5], kind)
     };
+    let _ = ground;
+
     let mut nbt = Compound::new();
     if is_piglin_or_hoglin(mob_kind) {
         nbt.insert("IsImmuneToZombification".into(), Tag::Byte(1));
         nbt.insert("TimeInOverworld".into(), Tag::Int(0));
     }
-    if let Some(id) = host.summon(
-        OVERWORLD,
-        mob_kind,
-        [f64::from(sx) + 0.5, spawn_y, f64::from(sz) + 0.5],
-        nbt,
-    ) {
+    if let Some(id) = host.summon(OVERWORLD, mob_kind, spawn_pos, nbt) {
         state.known_nether_mobs.insert(id);
     }
 }
@@ -1175,6 +1307,10 @@ pub fn augment_potential_spawns(
             push_if_missing(&mut event.entries, "minecraft:strider", 6, 1, 2);
         }
         _ => {}
+    }
+
+    if event.category == "monster" {
+        tune_underground_spawn_entries(&mut event.entries, event.pos[1]);
     }
 }
 
@@ -1429,5 +1565,50 @@ mod tests {
             Some(999),
             None,
         ));
+    }
+
+    #[test]
+    fn underground_spawns_scale_by_depth_and_balance_overworld_caves() {
+        assert_eq!(underground_spawn_chance_pct(64, 65), 100);
+        assert!(underground_spawn_chance_pct(24, 65) > underground_spawn_chance_pct(-5, 65));
+        assert!(underground_spawn_chance_pct(-5, 65) > underground_spawn_chance_pct(-45, 65));
+        assert!(underground_spawn_chance_pct(-45, 65) > 0);
+
+        let mut deep_entries = vec![
+            SpawnEntry {
+                entity: "minecraft:zombie".to_owned(),
+                weight: 100,
+                min: 2,
+                max: 4,
+                constant: false,
+            },
+            SpawnEntry {
+                entity: "minecraft:magma_cube".to_owned(),
+                weight: 20,
+                min: 1,
+                max: 3,
+                constant: false,
+            },
+            SpawnEntry {
+                entity: "minecraft:ghast".to_owned(),
+                weight: 10,
+                min: 1,
+                max: 1,
+                constant: true,
+            },
+        ];
+        tune_underground_spawn_entries(&mut deep_entries, -40);
+        assert!(!deep_entries.iter().any(|e| e.entity == "minecraft:ghast"));
+        let z_w = deep_entries
+            .iter()
+            .find(|e| e.entity == "minecraft:zombie")
+            .unwrap()
+            .weight;
+        let m_w = deep_entries
+            .iter()
+            .find(|e| e.entity == "minecraft:magma_cube")
+            .unwrap()
+            .weight;
+        assert!(z_w <= 28 && m_w >= 10 && m_w < 20);
     }
 }

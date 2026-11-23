@@ -340,7 +340,7 @@ pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
 /// Scaled ~3.5x larger than horizontal surface expansion because each underground column spans
 /// ~130 blocks vertically vs ~22 blocks for surface crust.
 pub fn effective_deepen_budget(base_budget: usize, ring_radius: i32) -> usize {
-    (effective_rift_budget(base_budget, ring_radius) * 3 + 12).clamp(36, 144)
+    (effective_rift_budget(base_budget, ring_radius) * 4 + 16).clamp(48, 176)
 }
 
 /// Computes how deep the underground deepening pass can sink at horizontal
@@ -605,9 +605,17 @@ fn transform_stone_family(
         return None;
     }
 
-    // Leave ~2% rare scarred Overworld stone/cobble traces as subtle remnants of what
-    // used to be there, while the surrounding stone overwhelms into Nether rock.
-    if in_remnant_cluster(pos, 0x5CA2_1001, 2) {
+    // Upper rock leaves ~2% rare Overworld stone/cobble scars; mid/deep rock leaves slightly
+    // more (~8-14%) weathered Overworld remnants since deep earth resists full penetration while
+    // still keeping underground stone heavily corrupted (~86-92%).
+    let scar_pct = if pos[1] >= 36 {
+        2
+    } else if pos[1] >= 0 {
+        8
+    } else {
+        14
+    };
+    if in_remnant_cluster(pos, 0x5CA2_1001, scar_pct) {
         if short == "stone" && h % 2 == 0 {
             return Some(TransformOutcome::replace("minecraft:cobblestone"));
         }
@@ -1098,7 +1106,7 @@ mod tests {
             "minecraft:raw_copper_block",
         ] {
             let mut conv = 0;
-            for x in 0..40 {
+            for x in 0..200 {
                 let out = transform_block(
                     [x, -45, x * 3],
                     cave_block,
@@ -1111,7 +1119,10 @@ mod tests {
                     conv += 1;
                 }
             }
-            assert!(conv >= 38, "{cave_block} should convert underground (got {conv}/40)");
+            assert!(
+                conv >= 150,
+                "{cave_block} should convert heavily underground while leaving rare traces (got {conv}/200)"
+            );
         }
     }
 
