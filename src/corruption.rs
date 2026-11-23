@@ -296,9 +296,9 @@ pub fn is_nether_terrain_block(name: &str) -> bool {
 
 /// How many blocks below solid ground (`OceanFloor`) the outer surface expansion
 /// pass converts before moving to the next column on the circular ring.
-/// Penetrates solidly past soil into bedrock-facing mountain/surface stone so
-/// the leading surface edge never stops right where stone begins.
-pub const SURFACE_CRUST_DEPTH: i32 = 10;
+/// Penetrates deep through surface dirt and upper cave stone immediately, while the
+/// dedicated deep-boring pass drives all the way down to Bedrock (`-63`).
+pub const SURFACE_CRUST_DEPTH: i32 = 22;
 
 /// Computes the vertical `[top_y, min_y]` sweep for an outer surface-expansion column.
 /// Normal surface/mountain portals sweep from the column's highest block (up to `Y = 319`)
@@ -334,6 +334,13 @@ pub fn surface_column_y_range(
 pub fn effective_rift_budget(base_budget: usize, ring_radius: i32) -> usize {
     let scaled = (8usize + (ring_radius.max(1) as usize) / 2).clamp(8, 52);
     ((scaled * base_budget.max(1) + 7) / 14).max(2)
+}
+
+/// Dedicated per-tick block budget for full-depth underground boring down to Bedrock (`-63`).
+/// Scaled ~3.5x larger than horizontal surface expansion because each underground column spans
+/// ~130 blocks vertically vs ~22 blocks for surface crust.
+pub fn effective_deepen_budget(base_budget: usize, ring_radius: i32) -> usize {
+    (effective_rift_budget(base_budget, ring_radius) * 3 + 12).clamp(36, 144)
 }
 
 /// Computes how deep the underground deepening pass can sink at horizontal
@@ -472,6 +479,11 @@ fn is_burnable_overworld_growth(short: &str) -> bool {
             | "frogspawn"
             | "chorus_plant"
             | "chorus_flower"
+            | "sculk_vein"
+            | "small_amethyst_bud"
+            | "medium_amethyst_bud"
+            | "large_amethyst_bud"
+            | "amethyst_cluster"
     )
 }
 
@@ -545,9 +557,31 @@ fn transform_stone_family(
     rift_mature: bool,
     h: u64,
 ) -> Option<TransformOutcome> {
+    if short == "raw_iron_block" {
+        return Some(TransformOutcome::replace("minecraft:nether_gold_ore"));
+    }
+    if short == "raw_copper_block" {
+        return Some(TransformOutcome::replace("minecraft:nether_quartz_ore"));
+    }
+    if matches!(short, "amethyst_block" | "budding_amethyst") {
+        return Some(TransformOutcome::replace(if h % 5 == 0 {
+            "minecraft:crying_obsidian"
+        } else {
+            "minecraft:blackstone"
+        }));
+    }
+
     let deep_rock = matches!(
         short,
-        "deepslate" | "cobbled_deepslate" | "infested_deepslate" | "tuff"
+        "deepslate"
+            | "cobbled_deepslate"
+            | "infested_deepslate"
+            | "tuff"
+            | "sculk"
+            | "sculk_catalyst"
+            | "sculk_sensor"
+            | "calibrated_sculk_sensor"
+            | "sculk_shrieker"
     );
     let normal_rock = matches!(
         short,
@@ -580,10 +614,16 @@ fn transform_stone_family(
         return Some(TransformOutcome::unchanged(true));
     }
 
-    // Deep Ancient Debris only in mature rifts, deep underground (-32..-60).
-    if rift_mature && pos[1] <= -32 && pos[1] >= -60 {
+    // Deep Ancient Debris in mature rifts across diamond depth (`-16..-60`), richest deep down.
+    if rift_mature && pos[1] <= -16 && pos[1] >= -60 {
         let debris_roll = scar_roll(pos, 0xDE82_1500);
-        let odds = if pos[1] <= -46 { 250 } else { 380 };
+        let odds = if pos[1] <= -46 {
+            160
+        } else if pos[1] <= -32 {
+            260
+        } else {
+            450
+        };
         if debris_roll % odds == 0 {
             return Some(TransformOutcome::replace("minecraft:ancient_debris"));
         }
@@ -618,6 +658,19 @@ fn transform_stone_family(
             _ if (h % 20) <= 10 => "minecraft:blackstone",
             _ if (h % 20) <= 15 => "minecraft:basalt",
             _ => "minecraft:netherrack",
+        }
+    } else if pos[1] < 24 {
+        match flavor {
+            NetherFlavor::BasaltDeltas if (h % 20) < 12 => "minecraft:basalt",
+            NetherFlavor::BasaltDeltas => "minecraft:blackstone",
+            NetherFlavor::SoulSandValley if (h % 20) < 6 => "minecraft:soul_soil",
+            NetherFlavor::SoulSandValley if (h % 20) < 14 => "minecraft:blackstone",
+            NetherFlavor::SoulSandValley => "minecraft:netherrack",
+            _ if (h % 20) <= 6 => "minecraft:blackstone",
+            _ if (h % 20) <= 9 => "minecraft:basalt",
+            _ if (h % 20) <= 18 => "minecraft:netherrack",
+            _ if is_air_like(below) => "minecraft:netherrack",
+            _ => "minecraft:magma_block",
         }
     } else {
         match flavor {
@@ -960,6 +1013,23 @@ mod tests {
             }
         }
         assert!(found_deep_mature, "mature deep deepslate should occasionally yield ancient debris");
+
+        // Diamond-level stone/deepslate (-24) in mature rifts also seeds occasional Ancient Debris
+        // and dedicated deep-boring budget stays well above surface budget for vertical volume.
+        let found_diamond_tier = (0..1800).any(|x| {
+            transform_block(
+                [x, -24, x * 5],
+                "minecraft:deepslate",
+                "minecraft:deepslate",
+                "minecraft:deepslate",
+                NetherFlavor::NetherWastes,
+                true,
+            )
+            .block
+                == Some("minecraft:ancient_debris")
+        });
+        assert!(found_diamond_tier, "diamond-level mature deepslate should yield ancient debris");
+        assert!(effective_deepen_budget(14, 60) >= effective_rift_budget(14, 60) * 3);
     }
 
     #[test]
@@ -1017,6 +1087,31 @@ mod tests {
                 converted >= 32,
                 "{block} should overwhelmingly convert even at high mountain Y=195 (got {converted}/40)"
             );
+        }
+        // Deep Dark & amethyst cave blocks convert cleanly near diamond level too.
+        for cave_block in [
+            "minecraft:sculk",
+            "minecraft:sculk_catalyst",
+            "minecraft:amethyst_block",
+            "minecraft:budding_amethyst",
+            "minecraft:raw_iron_block",
+            "minecraft:raw_copper_block",
+        ] {
+            let mut conv = 0;
+            for x in 0..40 {
+                let out = transform_block(
+                    [x, -45, x * 3],
+                    cave_block,
+                    "minecraft:air",
+                    "minecraft:deepslate",
+                    NetherFlavor::CrimsonForest,
+                    true,
+                );
+                if out.block.is_some() {
+                    conv += 1;
+                }
+            }
+            assert!(conv >= 38, "{cave_block} should convert underground (got {conv}/40)");
         }
     }
 

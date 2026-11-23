@@ -13,7 +13,8 @@ mod types;
 use atmosphere::{ClientAtmosphere, ParticlePalette};
 use containment::{ContainmentOutcome, ContainmentView, evaluate_chamber, inspect_portal_cluster};
 use corruption::{
-    SURFACE_CRUST_DEPTH, effective_rift_budget, is_air_like, is_snow_or_ice, is_water_like,
+    SURFACE_CRUST_DEPTH, effective_deepen_budget, effective_rift_budget, is_air_like,
+    is_nether_terrain_block, is_preserved_ore, is_protected_block, is_snow_or_ice, is_water_like,
     surface_column_y_range, transform_block,
 };
 use loot::ItemPalette;
@@ -1580,87 +1581,290 @@ fn corrupt_surface_step(
 }
 
 /// Simultaneously sweeps inner rings from the highest mountain surface (`WorldSurface + 2`)
-/// all the way down to Bedrock (`-63`) using its own cursor so deep stone, underground caves,
-/// overhangs, and tall peaks never stop corrupting at shallow depth.
-fn corrupt_deepen_step(
+/// all the way down to Bedrock (`-63`) with both player/epicenter proximity priority and full-disk
+/// deepening cursors so deep stone, caverns, blackstone layers, and diamond-level Ancient Debris
+/// always develop rapidly underground.
+fn pop_next_deepen_column(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    cols: &mut Vec<[i32; 2]>,
+    deepen_radius: &mut i32,
+    ring_radius: i32,
+    center: [i32; 3],
+) -> Option<[i32; 2]> {
+    let max_r = (ring_radius - 1).max(1);
+    for _ in 0..8 {
+        if cols.is_empty() {
+            *deepen_radius = if *deepen_radius >= max_r {
+                1
+            } else {
+                *deepen_radius + 1
+            };
+            *cols = build_ring_columns(center[0], center[2], *deepen_radius);
+        }
+        if let Some(pos_idx) = cols
+            .iter()
+            .rposition(|c| level.is_loaded(host, [c[0], 64, c[1]]))
+        {
+            return Some(cols.swap_remove(pos_idx));
+        }
+        if cols.len() > 64 {
+            break;
+        }
+    }
+    None
+}
+
+fn refill_priority_deepen_cols(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+) {
+    let rift = &state.rifts[rift_idx];
+    let rift_id = rift.id;
+    let center = rift.center;
+    let max_r = (rift.ring_radius - 1).max(1);
+    if max_r < 2 {
+        return;
+    }
+    if state
+        .priority_deepen_cols
+        .get(&rift_id)
+        .is_some_and(|q| !q.is_empty())
+    {
+        return;
+    }
+    if state
+        .last_deepen_probe_tick
+        .get(&rift_id)
+        .is_some_and(|t| state.tick.saturating_sub(*t) < 25)
+    {
+        return;
+    }
+    state.last_deepen_probe_tick.insert(rift_id, state.tick);
+
+    let mut foci: Vec<([i32; 2], i32)> = Vec::new();
+    for player in host.players().server_players() {
+        if !player
+            .dimension(host)
+            .is_some_and(|d| d.to_string() == OVERWORLD)
+        {
+            continue;
+        }
+        let Some(epos) = player.entity().position(host) else {
+            continue;
+        };
+        let px = epos[0].floor() as i32;
+        let pz = epos[2].floor() as i32;
+        if horiz_dist_sq(center, [px, 64, pz]) <= i64::from(rift.ring_radius + 6).pow(2) {
+            foci.push(([px, pz], 20));
+        }
+    }
+    // Always prioritize the epicenter core alongside active player neighborhoods.
+    foci.push(([center[0], center[2]], 24));
+
+    let max_r_sq = i64::from(max_r) * i64::from(max_r);
+    let mut batch: VecDeque<[i32; 2]> = VecDeque::new();
+    for (focus, scan_r) in foci {
+        let limit_r = scan_r.min(max_r);
+        for r in 0..=limit_r {
+            let ring = if r == 0 {
+                vec![focus]
+            } else {
+                build_ring_columns(focus[0], focus[1], r)
+            };
+            for col in ring {
+                if batch.len() >= 192 {
+                    break;
+                }
+                if horiz_dist_sq(center, [col[0], 64, col[1]]) > max_r_sq {
+                    continue;
+                }
+                if state.session_deepened_cols.contains(&col)
+                    || !level.is_loaded(host, [col[0], 64, col[1]])
+                {
+                    continue;
+                }
+                batch.push_back(col);
+            }
+            if batch.len() >= 192 {
+                break;
+            }
+        }
+        if batch.len() >= 192 {
+            break;
+        }
+    }
+    if !batch.is_empty() {
+        state.priority_deepen_cols.insert(rift_id, batch);
+    }
+}
+
+fn next_deepen_column_for_stream(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+    rift_id: u64,
+    rift_center: [i32; 3],
+    priority: bool,
+) -> Option<[i32; 2]> {
+    if priority {
+        let q = state.priority_deepen_cols.get_mut(&rift_id)?;
+        while let Some(col) = q.pop_front() {
+            if !state.session_deepened_cols.contains(&col) && level.is_loaded(host, [col[0], 64, col[1]])
+            {
+                return Some(col);
+            }
+        }
+        return None;
+    }
+
+    let r = &mut state.rifts[rift_idx];
+    if r.ring_radius <= 2 {
+        return None;
+    }
+    let mut d_rad = r.deepen_radius.clamp(1, (r.ring_radius - 1).max(1));
+    let mut picked = pop_next_deepen_column(
+        host,
+        level,
+        &mut r.deepen_columns,
+        &mut d_rad,
+        r.ring_radius,
+        rift_center,
+    );
+    while let Some(c) = picked {
+        if !state.session_deepened_cols.contains(&c) {
+            picked = Some(c);
+            break;
+        }
+        picked = pop_next_deepen_column(
+            host,
+            level,
+            &mut r.deepen_columns,
+            &mut d_rad,
+            r.ring_radius,
+            rift_center,
+        );
+    }
+    r.deepen_radius = d_rad;
+    r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
+    picked
+}
+
+fn bore_deepen_stream(
     host: &mut dyn ServerHost,
     level: LevelRef,
     state: &mut RiftState,
     rift_idx: usize,
     budget: &mut usize,
+    priority: bool,
 ) {
     let mut skips = 0usize;
     let rift_id = state.rifts[rift_idx].id;
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
 
-    while *budget > 0 && skips < 384 {
+    while *budget > 0 && skips < 3072 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;
 
-        if !state.active_deepen_columns.contains_key(&rift_id) {
-            if state.rifts[rift_idx].ring_radius <= 2 {
-                break;
-            }
-            let next_col = {
-                let r = &mut state.rifts[rift_idx];
-                if r.deepen_columns.is_empty() {
-                    r.deepen_radius = if r.deepen_radius + 1 >= r.ring_radius {
-                        1
-                    } else {
-                        r.deepen_radius + 1
-                    };
-                    r.deepen_columns =
-                        build_ring_columns(rift_center[0], rift_center[2], r.deepen_radius);
-                }
-                let mut d_rad = r.deepen_radius;
-                let picked = pop_next_loaded_column(
-                    host,
-                    level,
-                    &mut r.deepen_columns,
-                    &mut d_rad,
-                    rift_center,
-                );
-                r.deepen_radius = d_rad;
-                r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
-                picked
-            };
-            let Some(col) = next_col else {
+        let active_missing = if priority {
+            !state.active_priority_deepen.contains_key(&rift_id)
+        } else {
+            !state.active_deepen_columns.contains_key(&rift_id)
+        };
+        if active_missing {
+            let Some(col) = next_deepen_column_for_stream(
+                host,
+                level,
+                state,
+                rift_idx,
+                rift_id,
+                rift_center,
+                priority,
+            ) else {
                 break;
             };
-            let (world_surface, _, _) =
-                query_surface_and_cliff_heights(host, col, rift_center[1]);
+            let (world_surface, _, _) = query_surface_and_cliff_heights(host, col, rift_center[1]);
             let start_y = (world_surface + 2).min(OVERWORLD_MAX_Y - 1);
-            state
-                .active_deepen_columns
-                .insert(rift_id, (col, start_y, BEDROCK_FLOOR_Y));
+            let cursor = (col, start_y, BEDROCK_FLOOR_Y);
+            if priority {
+                state.active_priority_deepen.insert(rift_id, cursor);
+            } else {
+                state.active_deepen_columns.insert(rift_id, cursor);
+            }
         }
 
-        let Some((col, y, min_y)) = state.active_deepen_columns.get(&rift_id).copied() else {
+        let Some((col, y, min_y)) = (if priority {
+            state.active_priority_deepen.get(&rift_id).copied()
+        } else {
+            state.active_deepen_columns.get(&rift_id).copied()
+        }) else {
             break;
         };
         if y < min_y {
-            state.active_deepen_columns.remove(&rift_id);
+            if priority {
+                state.active_priority_deepen.remove(&rift_id);
+            } else {
+                state.active_deepen_columns.remove(&rift_id);
+            }
+            state.mark_session_col_deepened(col);
             continue;
         }
 
         let pos = [col[0], y, col[1]];
         if !level.is_loaded(host, pos) {
-            state.active_deepen_columns.remove(&rift_id);
+            if priority {
+                state.active_priority_deepen.remove(&rift_id);
+            } else {
+                state.active_deepen_columns.remove(&rift_id);
+            }
             break;
         }
 
         if y - 1 >= min_y {
-            state
-                .active_deepen_columns
-                .insert(rift_id, (col, y - 1, min_y));
+            if priority {
+                state
+                    .active_priority_deepen
+                    .insert(rift_id, (col, y - 1, min_y));
+            } else {
+                state
+                    .active_deepen_columns
+                    .insert(rift_id, (col, y - 1, min_y));
+            }
         } else {
-            state.active_deepen_columns.remove(&rift_id);
+            if priority {
+                state.active_priority_deepen.remove(&rift_id);
+            } else {
+                state.active_deepen_columns.remove(&rift_id);
+            }
+            state.mark_session_col_deepened(col);
         }
 
         let current = level.block(host, pos).map(|k| k.id(host)).unwrap_or_default();
-        if current.is_empty() || is_air_like(&current) {
+        if current.is_empty()
+            || is_air_like(&current)
+            || is_protected_block(&current)
+            || is_preserved_ore(&current)
+        {
+            skips += 1;
+            continue;
+        }
+
+        if is_nether_terrain_block(&current) {
+            if state.mark_quart_corrupted(pos) {
+                let d2 = horiz_dist_sq(rift_center, pos);
+                let local_flavor = if d2 <= 40 * 40 {
+                    rift_flavor
+                } else {
+                    NetherFlavor::pick_for_region(pos[0], pos[2], state.seed ^ rift_id)
+                };
+                paint_biome_column(level, host, pos[0], pos[2], local_flavor);
+                state.dirty = true;
+            }
             skips += 1;
             continue;
         }
@@ -1684,6 +1888,33 @@ fn corrupt_deepen_step(
     }
 }
 
+fn corrupt_deepen_step(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    rift_idx: usize,
+    budget: &mut usize,
+) {
+    if *budget == 0 || state.rifts[rift_idx].ring_radius <= 2 {
+        return;
+    }
+    refill_priority_deepen_cols(host, level, state, rift_idx);
+
+    let mut priority_budget = (*budget * 45) / 100;
+    let mut ring_budget = budget.saturating_sub(priority_budget);
+
+    bore_deepen_stream(host, level, state, rift_idx, &mut priority_budget, true);
+    ring_budget += priority_budget;
+    bore_deepen_stream(host, level, state, rift_idx, &mut ring_budget, false);
+
+    if ring_budget > 0 {
+        let mut extra = ring_budget;
+        bore_deepen_stream(host, level, state, rift_idx, &mut extra, true);
+        ring_budget = extra;
+    }
+    *budget = ring_budget;
+}
+
 fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
     if state.paused || state.rifts.is_empty() {
         return;
@@ -1704,14 +1935,21 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
         state.rifts[idx].age_ticks += 1;
     }
 
-    // Compute smooth radius-scaled budgets so outward pace stays steady and urgent
-    // across all radii, capped server-wide at 64 ops/tick when many portals are open.
+    // Compute smooth radius-scaled budgets for surface spread and a dedicated larger
+    // deep-boring budget for full peak-to-bedrock underground conversion.
     let raw_budgets: Vec<usize> = uncontained_indices
         .iter()
         .map(|&idx| effective_rift_budget(state.spread_budget, state.rifts[idx].ring_radius))
         .collect();
     let total_raw: usize = raw_budgets.iter().sum();
     let global_cap = (state.spread_budget * 5).clamp(48, 84);
+
+    let deepen_raw: Vec<usize> = uncontained_indices
+        .iter()
+        .map(|&idx| effective_deepen_budget(state.spread_budget, state.rifts[idx].ring_radius))
+        .collect();
+    let total_deep_raw: usize = deepen_raw.iter().sum();
+    let global_deep_cap = (state.spread_budget * 10).clamp(110, 220);
 
     let count = uncontained_indices.len();
     let start = (state.tick as usize) % count;
@@ -1729,13 +1967,15 @@ fn spread_corruption_tick(host: &mut dyn ServerHost, level: LevelRef, state: &mu
             let mut surf = rift_budget;
             corrupt_surface_step(host, level, state, r_idx, &mut surf);
         } else {
-            // 50% surface circular spread + 50% simultaneous peak-to-bedrock deepening every tick.
             let mut surface_budget = rift_budget.div_ceil(2);
-            let mut deepen_budget = rift_budget.saturating_sub(surface_budget);
-            corrupt_deepen_step(host, level, state, r_idx, &mut deepen_budget);
-            // Roll any unused underground budget straight into surface so zero budget is wasted.
-            surface_budget += deepen_budget;
             corrupt_surface_step(host, level, state, r_idx, &mut surface_budget);
+
+            let mut deep_budget = if total_deep_raw > global_deep_cap {
+                ((deepen_raw[pos_i] * global_deep_cap) / total_deep_raw).max(8)
+            } else {
+                deepen_raw[pos_i]
+            };
+            corrupt_deepen_step(host, level, state, r_idx, &mut deep_budget);
         }
     }
 }

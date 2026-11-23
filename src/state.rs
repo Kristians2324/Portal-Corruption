@@ -112,6 +112,11 @@ pub struct RiftState {
     /// Independent runtime vertical cursor `([x, z], next_y_down, min_y)` for each
     /// rift's simultaneous underground deepening pass, keyed by rift id.
     pub active_deepen_columns: HashMap<u64, ([i32; 2], i32, i32)>,
+    /// Runtime priority deep-bore cursor & queue around loaded players / epicenter.
+    pub active_priority_deepen: HashMap<u64, ([i32; 2], i32, i32)>,
+    pub priority_deepen_cols: HashMap<u64, VecDeque<[i32; 2]>>,
+    pub session_deepened_cols: HashSet<[i32; 2]>,
+    pub last_deepen_probe_tick: HashMap<u64, u64>,
     /// Runtime queue of recently evaporated/melted water, ice, or snow positions
     /// for emitting throttled black smoke effects without saving to disk.
     pub pending_melt_fx: Vec<[i32; 3]>,
@@ -167,9 +172,20 @@ impl RiftState {
             shore_columns: VecDeque::new(),
             shore_columns_set: HashSet::new(),
             active_deepen_columns: HashMap::new(),
+            active_priority_deepen: HashMap::new(),
+            priority_deepen_cols: HashMap::new(),
+            session_deepened_cols: HashSet::new(),
+            last_deepen_probe_tick: HashMap::new(),
             pending_melt_fx: Vec::new(),
             last_melt_sound_tick: 0,
         }
+    }
+
+    pub fn mark_session_col_deepened(&mut self, col: [i32; 2]) {
+        if self.session_deepened_cols.len() >= 32_768 {
+            self.session_deepened_cols.clear();
+        }
+        self.session_deepened_cols.insert(col);
     }
 
     pub fn queue_melt_fx(&mut self, pos: [i32; 3]) {
@@ -240,6 +256,8 @@ impl RiftState {
         let qz = z >> 2;
         self.corrupted_quart_cols.remove(&[qx, qz]);
         self.corrupted_quarts.retain(|q| q[0] != qx || q[2] != qz);
+        self.session_deepened_cols
+            .retain(|c| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
     }
 
     /// True if any *other* active (unpacified) Rift still reaches `(x, z)` so one
@@ -366,7 +384,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(8));
+        root.insert("version".into(), Value::from(9));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -495,6 +513,11 @@ impl RiftState {
         }
 
         self.rifts.clear();
+        self.active_deepen_columns.clear();
+        self.active_priority_deepen.clear();
+        self.priority_deepen_cols.clear();
+        self.session_deepened_cols.clear();
+        self.last_deepen_probe_tick.clear();
         if let Some(arr) = doc.get("rifts").and_then(|v| v.as_array()) {
             for item in arr {
                 let Some(center) = item.get("center").and_then(pos_from_json) else {
@@ -523,10 +546,14 @@ impl RiftState {
                 if ring_columns.is_empty() {
                     ring_columns = build_ring_columns(center[0], center[2], ring_radius);
                 }
-                let (deepen_radius, deepen_columns) = if version < 6 {
-                    // Older saves had shallow/frozen early deepening passes and skipped
-                    // high mountain peaks; reset deepen sweep to ring 1 so full-height
-                    // peak-to-bedrock deepening immediately fills in any skipped rock.
+                let is_pacified = item
+                    .get("pacified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (deepen_radius, deepen_columns) = if version < 9 && !is_pacified {
+                    // Older saves either stopped shallow (~10 blocks), stalled on low deepen
+                    // throughput, or bypassed inner rings; re-sweep active rifts from ring 1
+                    // all the way down to Bedrock (-63).
                     self.dirty = true;
                     (1, build_ring_columns(center[0], center[2], 1))
                 } else {
@@ -830,6 +857,22 @@ mod tests {
         let legacy = serde_json::json!({ "version": 1, "spread_budget": 28 });
         loaded.apply_json(&legacy);
         assert_eq!(loaded.spread_budget, 14);
+
+        // Pre-v9 saves reset active rifts' deepen_radius back to ring 1 so un-deepened stone
+        // around existing epicenters re-sweeps all the way down to Bedrock (-63).
+        let v8_shallow = serde_json::json!({
+            "version": 8,
+            "rifts": [{
+                "id": 7,
+                "center": [0, 64, 0],
+                "ring_radius": 80,
+                "deepen_radius": 45,
+                "pacified": false
+            }]
+        });
+        loaded.apply_json(&v8_shallow);
+        assert_eq!(loaded.rifts.len(), 1);
+        assert_eq!(loaded.rifts[0].deepen_radius, 1);
     }
 
     #[test]
