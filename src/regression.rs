@@ -379,6 +379,11 @@ pub fn transform_restore_block(
         return None;
     }
 
+    // Remove 100% of molten lava in former oceans/rivers before returning water touches it.
+    if original.had_water && !near_monument && matches!(short, "lava" | "flowing_lava") {
+        return Some("minecraft:air");
+    }
+
     if matches!(short, "shroomlight" | "nether_wart_block" | "warped_wart_block") {
         if near_monument || in_persistent_scar_patch(pos) {
             return None;
@@ -435,18 +440,14 @@ pub fn transform_restore_block(
         return None;
     }
 
-    // Clear elevated volcanic seawall / berm stone above the original ocean floor so
-    // returning water never leaves floating stone cubes suspended mid-ocean.
-    if original.had_water && !near_monument && pos[1] > original.surface_y + 1 {
+    // Clear volcanic seawall / berm / basalt-raft stone above the original ocean floor 100%
+    // of the time so returning water never collides or leaves rock outcrops mid-ocean.
+    if original.had_water && !near_monument && pos[1] > original.surface_y {
         return Some("minecraft:air");
     }
 
     if in_persistent_scar_patch(pos) {
         return None;
-    }
-
-    if original.had_water && !near_monument && pos[1] > original.surface_y {
-        return Some("minecraft:air");
     }
 
     if pos[1] >= original.surface_y - 3 {
@@ -702,6 +703,29 @@ pub fn tick_regression(host: &mut dyn ServerHost, ow: LevelRef, state: &mut Rift
                 {
                     let _ = ow.set_block(host, pos, bstate, flags);
                     state.dirty = true;
+                } else if orig.had_water
+                    && !near_monument
+                    && y > orig.surface_y
+                    && strip_ns(&current) == "obsidian"
+                {
+                    let portal_adjacent = [
+                        [pos[0] + 1, pos[1], pos[2]],
+                        [pos[0] - 1, pos[1], pos[2]],
+                        [pos[0], pos[1] + 1, pos[2]],
+                        [pos[0], pos[1] - 1, pos[2]],
+                        [pos[0], pos[1], pos[2] + 1],
+                        [pos[0], pos[1], pos[2] - 1],
+                    ]
+                    .into_iter()
+                    .any(|np| {
+                        ow.block(host, np).is_some_and(|k| {
+                            matches!(strip_ns(&k.id(host)), "nether_portal" | "crying_obsidian")
+                        })
+                    });
+                    if !portal_adjacent && let Some(air_state) = resolve_cached(host, "minecraft:air") {
+                        let _ = ow.set_block(host, pos, air_state, flags);
+                        state.dirty = true;
+                    }
                 }
             }
         }
@@ -949,6 +973,65 @@ mod tests {
                 "minecraft:air",
                 "minecraft:blackstone",
                 &ocean,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn regression_clears_lava_and_submerged_crust_inside_had_water_basins() {
+        let ocean_orig = OriginalColumnInfo {
+            surface_y: 45,
+            surface_block: "minecraft:gravel".to_owned(),
+            had_water: true,
+            biome: "minecraft:ocean".to_owned(),
+        };
+        for y in 44..=62 {
+            for blk in ["minecraft:lava", "minecraft:flowing_lava"] {
+                let target = transform_restore_block(
+                    [100, y, 200],
+                    blk,
+                    "minecraft:air",
+                    "minecraft:lava",
+                    &ocean_orig,
+                    false,
+                );
+                assert_eq!(
+                    target,
+                    Some("minecraft:air"),
+                    "lava {blk} at y={y} must clear 100% in ocean/river basins"
+                );
+            }
+        }
+        for x in 0..=40 {
+            for blk in [
+                "minecraft:basalt",
+                "minecraft:blackstone",
+                "minecraft:smooth_basalt",
+                "minecraft:magma_block",
+            ] {
+                assert_eq!(
+                    transform_restore_block(
+                        [x, 46, 200],
+                        blk,
+                        "minecraft:air",
+                        "minecraft:gravel",
+                        &ocean_orig,
+                        false,
+                    ),
+                    Some("minecraft:air"),
+                    "{blk} at surface_y+1 (x={x}) must clear in ocean basins"
+                );
+            }
+        }
+        assert_eq!(
+            transform_restore_block(
+                [100, 62, 200],
+                "minecraft:lava",
+                "minecraft:air",
+                "minecraft:lava",
+                &ocean_orig,
                 true,
             ),
             None

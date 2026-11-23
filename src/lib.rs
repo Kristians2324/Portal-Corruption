@@ -506,14 +506,12 @@ pub fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool 
 /// Depth inside the active unpacified rift frontier where deep ocean water quenches into a
 /// solid volcanic basalt seawall rather than boiling out into a vertical hovering water wall.
 const WATER_SEAWALL_RIM_DEPTH: f64 = 3.5;
-/// Distance inside the frontier where the terraced volcanic coastal shelf slopes all the way
-/// down to the scorched dried ocean floor.
-const WATER_SHELF_END_DEPTH: f64 = 12.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaterCorruptAction {
     EvaporateAir,
     QuenchVolcanicBerm(&'static str),
+    MoltenLake(&'static str),
 }
 
 fn best_active_rift_edge_dist(state: &RiftState, x: i32, z: i32) -> Option<f64> {
@@ -552,9 +550,9 @@ fn near_monument_footprint(state: &RiftState, x: i32, z: i32) -> bool {
 
 fn pick_volcanic_berm_block(pos: [i32; 3]) -> &'static str {
     match spatial_hash(pos[0], pos[1], pos[2], 0x5EA1_BA5A) % 16 {
-        0..=5 => "minecraft:basalt",
-        6..=9 => "minecraft:blackstone",
-        10..=13 => "minecraft:smooth_basalt",
+        0..=6 => "minecraft:obsidian",
+        7..=10 => "minecraft:basalt",
+        11..=13 => "minecraft:blackstone",
         _ => "minecraft:magma_block",
     }
 }
@@ -562,49 +560,49 @@ fn pick_volcanic_berm_block(pos: [i32; 3]) -> &'static str {
 fn is_volcanic_berm_block(name: &str) -> bool {
     matches!(
         strip_ns(name),
-        "basalt" | "smooth_basalt" | "blackstone" | "magma_block"
+        "obsidian" | "basalt" | "smooth_basalt" | "blackstone" | "magma_block"
     )
 }
 
-fn volcanic_shelf_target_y(col: [i32; 2], edge_dist: f64, seabed_y: i32, sea_top_y: i32) -> i32 {
-    if sea_top_y <= seabed_y {
-        return seabed_y;
-    }
-    if edge_dist <= WATER_SEAWALL_RIM_DEPTH {
-        return sea_top_y;
-    }
-
-    let stack_roll = spatial_hash(col[0] >> 1, 7, col[1] >> 1, 0x57AC_0001) % 24;
-    let sea_stack_top = if stack_roll == 0 {
-        let extra = 1 + (spatial_hash(col[0], 11, col[1], 0x57AC_0002) % 3) as i32;
-        (seabed_y + extra).min(sea_top_y)
+fn pick_lava_obsidian_lake_block(pos: [i32; 3], is_surface: bool) -> &'static str {
+    if is_surface {
+        // Organic 2x2 cooled obsidian crusts & magma islands floating across molten lava lakes.
+        let pocket = spatial_hash(pos[0] >> 1, 17, pos[2] >> 1, 0x0B51_DA41) % 100;
+        let fine = spatial_hash(pos[0], pos[1], pos[2], 0x0B51_DA42) % 100;
+        if pocket < 34 && fine < 62 {
+            return match fine % 10 {
+                0..=6 => "minecraft:obsidian",
+                7..=8 => "minecraft:magma_block",
+                _ => "minecraft:blackstone",
+            };
+        }
+        "minecraft:lava"
+    } else if spatial_hash(pos[0], pos[1], pos[2], 0x0B51_DA43) % 12 == 0 {
+        "minecraft:obsidian"
     } else {
-        seabed_y
-    };
-
-    if edge_dist >= WATER_SHELF_END_DEPTH {
-        return sea_stack_top;
+        "minecraft:lava"
     }
-
-    let t = ((edge_dist - WATER_SEAWALL_RIM_DEPTH)
-        / (WATER_SHELF_END_DEPTH - WATER_SEAWALL_RIM_DEPTH))
-        .clamp(0.0, 1.0);
-    let raw = f64::from(sea_top_y) + f64::from(seabed_y - sea_top_y) * t;
-    let jitter = (spatial_hash(col[0], 19, col[1], 0xBA5A_1701) % 5) as i32 - 2;
-    (raw.round() as i32 + jitter).clamp(sea_stack_top, sea_top_y)
 }
 
 fn classify_water_corruption(
     pos: [i32; 3],
     edge_dist: Option<f64>,
     is_deep_water: bool,
-    touches_deep_live_water: bool,
+    touches_frontier_live_water: bool,
+    is_surface_water: bool,
+    is_lake_top: bool,
 ) -> WaterCorruptAction {
-    if touches_deep_live_water {
+    if !is_surface_water && !is_deep_water && !touches_frontier_live_water {
+        return WaterCorruptAction::EvaporateAir;
+    }
+    if touches_frontier_live_water {
         return WaterCorruptAction::QuenchVolcanicBerm(pick_volcanic_berm_block(pos));
     }
     if is_deep_water && edge_dist.is_none_or(|d| d <= WATER_SEAWALL_RIM_DEPTH) {
         return WaterCorruptAction::QuenchVolcanicBerm(pick_volcanic_berm_block(pos));
+    }
+    if is_surface_water || is_deep_water {
+        return WaterCorruptAction::MoltenLake(pick_lava_obsidian_lake_block(pos, is_lake_top));
     }
     WaterCorruptAction::EvaporateAir
 }
@@ -662,7 +660,7 @@ fn decide_water_corruption(
     let local_span = column_water_span(host, level, pos, 3);
     let mut is_deep = local_span >= 3;
 
-    let mut touches_deep_live = false;
+    let mut touches_frontier_live = false;
     let horiz = [
         [pos[0] + 1, pos[1], pos[2]],
         [pos[0] - 1, pos[1], pos[2]],
@@ -671,6 +669,7 @@ fn decide_water_corruption(
     ];
     for n in horiz {
         if !level.is_loaded(host, n) {
+            touches_frontier_live = true;
             continue;
         }
         let Some(nk) = level.block(host, n) else {
@@ -679,13 +678,11 @@ fn decide_water_corruption(
         if !is_water_like(&nk.id(host)) {
             continue;
         }
-        // Only count as deep live water if neighbor's column spans >= 2 blocks vertically
-        // (1-block puddles/farm strips still boil cleanly without forming stone curbs).
         let n_edge = best_active_rift_edge_dist(state, n[0], n[2]);
         if n_edge.is_none_or(|ne| ne < WATER_SEAWALL_RIM_DEPTH) {
             let n_span = column_water_span(host, level, n, 3);
             if n_span >= 2 {
-                touches_deep_live = true;
+                touches_frontier_live = true;
                 if n_span >= 3 {
                     is_deep = true;
                 }
@@ -694,16 +691,35 @@ fn decide_water_corruption(
         }
     }
 
-    if !is_deep
-        && let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(pos[0], pos[2])])
+    let mut tc_water_top: Option<i32> = None;
+    if let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(pos[0], pos[2])])
         && let Some(Some(tc)) = tcs.first()
         && let Some(w) = tc.water
-        && w - (tc.height - 1) >= 3
     {
-        is_deep = true;
+        tc_water_top = Some(w - 1);
+        if w - (tc.height - 1) >= 3 {
+            is_deep = true;
+        }
     }
 
-    classify_water_corruption(pos, edge, is_deep, touches_deep_live)
+    let above_open = pos[1] >= OVERWORLD_MAX_Y
+        || level
+            .block(host, [pos[0], pos[1] + 1, pos[2]])
+            .is_some_and(|k| {
+                let id = k.id(host);
+                is_air_like(&id) || is_snow_or_ice(&id)
+            });
+    let is_lake_top = above_open || tc_water_top.is_some_and(|top| pos[1] >= top);
+    let is_surface_water = tc_water_top.is_some() || pos[1] >= 44;
+
+    classify_water_corruption(
+        pos,
+        edge,
+        is_deep,
+        touches_frontier_live,
+        is_surface_water,
+        is_lake_top,
+    )
 }
 
 /// Seals any existing vertical wall of water touching a dried corrupted seabed column (including
@@ -1012,7 +1028,7 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
     };
 
     let mut processed = 0usize;
-    while processed < 112 {
+    while processed < 224 {
         let Some(pos) = state.pop_water_evap() else {
             break;
         };
@@ -1043,7 +1059,9 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
                                 host,
                                 pos,
                                 berm_bs,
-                                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                                BlockUpdateFlags::CLIENTS
+                                    | BlockUpdateFlags::KNOWN_SHAPE
+                                    | BlockUpdateFlags::SUPPRESS_DROPS,
                             )
                             .unwrap_or(false)
                     {
@@ -1052,6 +1070,38 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
                         state.dirty = true;
                     }
                     continue;
+                }
+                WaterCorruptAction::MoltenLake(lake_id) => {
+                    if let Some(lake_bs) =
+                        resolve_block_cached(&mut state.block_state_cache, host, lake_id)
+                        && level
+                            .set_block(
+                                host,
+                                pos,
+                                lake_bs,
+                                BlockUpdateFlags::CLIENTS
+                                    | BlockUpdateFlags::KNOWN_SHAPE
+                                    | BlockUpdateFlags::SUPPRESS_DROPS,
+                            )
+                            .unwrap_or(false)
+                    {
+                        if lake_id != "minecraft:lava" {
+                            state.queue_melt_fx(pos);
+                        }
+                        state.dirty = true;
+                    }
+                    for n in neighbors_6(pos) {
+                        if n[1] >= OVERWORLD_MIN_Y
+                            && n[1] <= OVERWORLD_MAX_Y
+                            && is_within_evap_basin(state, n)
+                            && level.block(host, n).is_some_and(|nk| {
+                                let nid = nk.id(host);
+                                is_water_like(&nid) || is_snow_or_ice(&nid)
+                            })
+                        {
+                            state.queue_water_evap(n);
+                        }
+                    }
                 }
                 WaterCorruptAction::EvaporateAir => {
                     if level
@@ -1185,32 +1235,48 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
         if mb.is_some_and(|g| g < 62) {
             plug_exposed_ocean_wall_at_col(host, level, state, sub_x, sub_z);
         }
+        // Upgrade previously drained ocean/river basins in older saves into Lava+Obsidian lakes.
+        if best_active_rift_edge_dist(state, sub_x, sub_z)
+            .is_some_and(|d| d > WATER_SEAWALL_RIM_DEPTH + 1.0)
+            && !near_monument_footprint(state, sub_x, sub_z)
+            && let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(sub_x, sub_z)])
+            && let Some(Some(tc)) = tcs.first()
+            && let Some(w) = tc.water
+        {
+            let sea_top = (w - 1).clamp(OVERWORLD_MIN_Y + 4, OVERWORLD_MAX_Y - 2);
+            if sea_top > tc.height - 1
+                && level
+                    .block(host, [sub_x, sea_top, sub_z])
+                    .is_some_and(|k| is_air_like(&k.id(host)) || is_volcanic_berm_block(&k.id(host)))
+            {
+                state.queue_shore_col([sub_x, sub_z]);
+            }
+        }
     }
 }
 
-/// Smoothly erodes interior volcanic seawall columns down into a stepped volcanic coast and dried
-/// scorched seabed as the corruption front advances outward, while strictly refusing to lower any
-/// column beside live water so vertical water walls never form.
+/// Converts interior ocean & river columns (safely behind the Obsidian/Basalt coastal dam)
+/// cleanly into molten Lava + Obsidian lakes at sea/river level without creating water walls
+/// or cobblestone collisions.
 fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
-    if state.paused || state.tick % 2 != 0 || state.shore_columns.is_empty() {
+    if state.paused || state.shore_columns.is_empty() {
         return;
     }
     let Some(air) = resolve_block_cached(&mut state.block_state_cache, host, "minecraft:air") else {
         return;
     };
 
-    let max_rotations = state.shore_columns.len().min(24);
-    let mut eroded_ops = 0usize;
+    let max_rotations = state.shore_columns.len().min(36);
+    let mut converted_ops = 0usize;
     let mut rotated = 0usize;
 
-    while eroded_ops < 4 && rotated < max_rotations {
+    while converted_ops < 12 && rotated < max_rotations {
         let Some(col) = state.pop_shore_col() else {
             break;
         };
         rotated += 1;
 
         let Some(edge_dist) = best_active_rift_edge_dist(state, col[0], col[1]) else {
-            // Covering rift is now pacified; regression handles final restoration.
             state.dirty = true;
             continue;
         };
@@ -1223,7 +1289,7 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
             continue;
         }
 
-        eroded_ops += 1;
+        converted_ops += 1;
         let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(col[0], col[1])]) else {
             state.queue_shore_col(col);
             continue;
@@ -1257,7 +1323,6 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
         ];
         for [nx, nz] in horiz {
             if !level.is_loaded(host, [nx, 64, nz]) {
-                // Conservatively keep seawall sealed at chunk borders until neighbor loads.
                 max_neighbor_water_y = Some(sea_top_y);
                 break;
             }
@@ -1269,7 +1334,7 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
                     max_neighbor_water_y =
                         Some(max_neighbor_water_y.map_or(y, |cur| cur.max(y)));
                     if best_active_rift_edge_dist(state, nx, nz)
-                        .is_some_and(|ne| ne > WATER_SEAWALL_RIM_DEPTH + 1.0)
+                        .is_some_and(|ne| ne > WATER_SEAWALL_RIM_DEPTH + 0.5)
                     {
                         state.queue_water_evap([nx, y, nz]);
                     }
@@ -1278,14 +1343,8 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
             }
         }
 
-        let desired_top = volcanic_shelf_target_y(col, edge_dist, seabed_y, sea_top_y);
-        let safe_top = match max_neighbor_water_y {
-            Some(wy) => desired_top.max(wy),
-            None => desired_top,
-        };
-
-        // Never leave an air gap below adjacent neighbor water level.
         if let Some(wy) = max_neighbor_water_y {
+            // Still touching live uncorrupted water on a neighbor: hold solid Obsidian/Basalt dam!
             for y in (seabed_y + 1)..=wy {
                 let p = [col[0], y, col[1]];
                 let is_open = level.block(host, p).is_some_and(|k| {
@@ -1300,47 +1359,69 @@ fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut Rif
                             host,
                             p,
                             bs,
-                            BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                            BlockUpdateFlags::CLIENTS
+                                | BlockUpdateFlags::KNOWN_SHAPE
+                                | BlockUpdateFlags::SUPPRESS_DROPS,
                         )
                         .unwrap_or(false)
                 {
                     state.dirty = true;
                 }
             }
-        }
-
-        let mut cleared_any = false;
-        for y in (safe_top + 1..=scan_top).rev() {
-            let p = [col[0], y, col[1]];
-            let removable = level.block(host, p).is_some_and(|k| {
-                let id = k.id(host);
-                is_volcanic_berm_block(&id) || is_water_like(&id)
-            });
-            if removable
-                && level
-                    .set_block(
-                        host,
-                        p,
-                        air,
-                        BlockUpdateFlags::CLIENTS
-                            | BlockUpdateFlags::KNOWN_SHAPE
-                            | BlockUpdateFlags::SUPPRESS_DROPS,
-                    )
-                    .unwrap_or(false)
-            {
-                cleared_any = true;
-            }
-        }
-        if cleared_any {
-            if (col[0].wrapping_add(col[1]) & 3) == 0 {
-                state.queue_melt_fx([col[0], (safe_top + 1).min(OVERWORLD_MAX_Y - 1), col[1]]);
-            }
-            state.dirty = true;
-        }
-
-        if edge_dist <= WATER_SHELF_END_DEPTH + 1.0 || max_neighbor_water_y.is_some() {
             state.queue_shore_col(col);
-        } else {
+            continue;
+        }
+
+        // Safely separated from all live ocean/river water: convert dam & water basin into a
+        // level Lava + cooled Obsidian crust lake from seabed_y + 1 up to sea_top_y.
+        let mut changed_any = false;
+        for y in (seabed_y + 1)..=sea_top_y {
+            let p = [col[0], y, col[1]];
+            let eligible = level.block(host, p).is_some_and(|k| {
+                let id = k.id(host);
+                is_volcanic_berm_block(&id)
+                    || is_water_like(&id)
+                    || is_snow_or_ice(&id)
+                    || is_air_like(&id)
+            });
+            if eligible {
+                let target_id = pick_lava_obsidian_lake_block(p, y == sea_top_y);
+                if let Some(bs) = resolve_block_cached(&mut state.block_state_cache, host, target_id)
+                    && level
+                        .set_block(
+                            host,
+                            p,
+                            bs,
+                            BlockUpdateFlags::CLIENTS
+                                | BlockUpdateFlags::KNOWN_SHAPE
+                                | BlockUpdateFlags::SUPPRESS_DROPS,
+                        )
+                        .unwrap_or(false)
+                {
+                    changed_any = true;
+                }
+            }
+        }
+        for y in (sea_top_y + 1)..=scan_top {
+            let p = [col[0], y, col[1]];
+            if level.block(host, p).is_some_and(|k| {
+                let id = k.id(host);
+                is_volcanic_berm_block(&id) || is_water_like(&id) || is_snow_or_ice(&id)
+            }) && level
+                .set_block(
+                    host,
+                    p,
+                    air,
+                    BlockUpdateFlags::CLIENTS
+                        | BlockUpdateFlags::KNOWN_SHAPE
+                        | BlockUpdateFlags::SUPPRESS_DROPS,
+                )
+                .unwrap_or(false)
+            {
+                changed_any = true;
+            }
+        }
+        if changed_any {
             state.dirty = true;
         }
     }
@@ -1594,17 +1675,34 @@ fn apply_corruption_at(
 
     let is_water_or_frozen = is_water_like(current) || is_snow_or_ice(current);
     let mut quenched_berm = false;
-    if is_water_like(current) {
-        if let WaterCorruptAction::QuenchVolcanicBerm(berm_id) =
-            decide_water_corruption(host, level, state, pos)
-        {
-            out.block = Some(berm_id);
-            out.above = None;
-            out.below = None;
-            out.is_corrupt = true;
-            quenched_berm = true;
-        } else {
-            state.queue_water_evap(pos);
+    let frozen_over_water = is_snow_or_ice(current)
+        && (is_water_like(&below)
+            || host
+                .terrain_surface(OVERWORLD, &[(pos[0], pos[2])])
+                .is_ok_and(|tcs| {
+                    tcs.first()
+                        .and_then(|o| o.as_ref())
+                        .is_some_and(|tc| tc.water.is_some_and(|w| pos[1] < w))
+                }));
+    if is_water_like(current) || frozen_over_water {
+        match decide_water_corruption(host, level, state, pos) {
+            WaterCorruptAction::QuenchVolcanicBerm(berm_id) => {
+                out.block = Some(berm_id);
+                out.above = None;
+                out.below = None;
+                out.is_corrupt = true;
+                quenched_berm = true;
+            }
+            WaterCorruptAction::MoltenLake(lake_id) => {
+                out.block = Some(lake_id);
+                out.above = None;
+                out.below = None;
+                out.is_corrupt = true;
+                state.queue_water_evap(pos);
+            }
+            WaterCorruptAction::EvaporateAir => {
+                state.queue_water_evap(pos);
+            }
         }
     }
 
@@ -1618,8 +1716,10 @@ fn apply_corruption_at(
             || short_target.ends_with("_fence")
             || short_target.ends_with("_fence_gate")
             || short_target.ends_with("_door");
-        let known_shape_solid =
-            !is_water_or_frozen && !shape_connected && out.above.is_none() && out.below.is_none();
+        let known_shape_solid = (!is_water_or_frozen || out.block != Some("minecraft:air"))
+            && !shape_connected
+            && out.above.is_none()
+            && out.below.is_none();
         let flags = if target_id == "minecraft:air" || known_shape_solid {
             BlockUpdateFlags::CLIENTS
                 | BlockUpdateFlags::KNOWN_SHAPE
@@ -3034,48 +3134,55 @@ mod tests {
     }
 
     #[test]
-    fn waterfront_seawall_quenches_deep_edge_and_evaporates_interior_shallow_water() {
-        // Outer deep waterfront (<= 3.5 blocks from ring edge, or touching deep live water)
-        // quenches into cooled volcanic berm stone rather than creating a hovering water wall.
+    fn waterfront_dam_quenches_edge_and_fills_interior_with_lava_and_obsidian() {
+        // Outer deep waterfront (<= 3.5 blocks from ring edge, or touching frontier live water)
+        // quenches into cooled volcanic/obsidian dam stone rather than water walls or cobble messes.
         assert!(matches!(
-            classify_water_corruption([20, 56, 0], Some(2.0), true, true),
+            classify_water_corruption([20, 56, 0], Some(2.0), true, true, true, false),
             WaterCorruptAction::QuenchVolcanicBerm(b) if is_volcanic_berm_block(b)
         ));
         assert!(matches!(
-            classify_water_corruption([20, 62, 0], Some(2.5), true, false),
+            classify_water_corruption([20, 62, 0], Some(2.5), true, false, true, true),
             WaterCorruptAction::QuenchVolcanicBerm(_)
         ));
-        // Even a shallow block right beside deep outside water seals rather than punching air.
-        assert!(matches!(
-            classify_water_corruption([20, 62, 0], Some(5.0), false, true),
-            WaterCorruptAction::QuenchVolcanicBerm(_)
-        ));
-        // Shallow inland puddles boil cleanly to air, and well-inland deep blocks behind
-        // sealed neighbors clear out to air.
+
+        // Interior oceans and rivers convert into a mixture of lava and obsidian crust!
+        let mut saw_lava = false;
+        let mut saw_obsidian = false;
+        for x in 0..120 {
+            match classify_water_corruption([x, 62, (x * 5) % 80], Some(12.0), true, false, true, true) {
+                WaterCorruptAction::MoltenLake("minecraft:lava") => saw_lava = true,
+                WaterCorruptAction::MoltenLake("minecraft:obsidian") => saw_obsidian = true,
+                WaterCorruptAction::MoltenLake(_) => {}
+                other => panic!("expected MoltenLake on interior ocean surface, got {other:?}"),
+            }
+        }
+        assert!(saw_lava && saw_obsidian, "interior oceans/rivers must yield both lava and obsidian");
+
+        // Deep underground cave puddles stay air-evaporated so caves never flood with lava.
         assert_eq!(
-            classify_water_corruption([20, 62, 0], Some(1.0), false, false),
-            WaterCorruptAction::EvaporateAir
-        );
-        assert_eq!(
-            classify_water_corruption([20, 52, 0], Some(10.0), true, false),
+            classify_water_corruption([20, -20, 0], Some(10.0), false, false, false, false),
             WaterCorruptAction::EvaporateAir
         );
     }
 
     #[test]
-    fn volcanic_shelf_steps_down_smoothly_and_preserves_seabed() {
-        let col = [48, -16];
-        let seabed = 40;
-        let sea_top = 62;
-
-        // Outer rim holds sea level height.
-        assert_eq!(volcanic_shelf_target_y(col, 2.0, seabed, sea_top), sea_top);
-        // Mid-coastal shelf sits partway between seabed and sea level.
-        let mid = volcanic_shelf_target_y(col, 8.0, seabed, sea_top);
-        assert!(mid > seabed && mid < sea_top, "expected sloped shelf in (40, 62), got {mid}");
-        // Deep interior boils down to seabed (or at most a small 1-3 block volcanic sea-stack).
-        let inner = volcanic_shelf_target_y(col, 16.0, seabed, sea_top);
-        assert!(inner >= seabed && inner <= seabed + 3, "expected dried seabed/stack, got {inner}");
+    fn ocean_lake_crust_blends_lava_and_obsidian_while_keeping_strider_channels() {
+        let mut lava_count = 0usize;
+        let mut obsidian_count = 0usize;
+        for x in 0..40 {
+            for z in 0..40 {
+                match pick_lava_obsidian_lake_block([x, 62, z], true) {
+                    "minecraft:lava" => lava_count += 1,
+                    "minecraft:obsidian" => obsidian_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            lava_count >= 1000 && obsidian_count >= 120,
+            "expected predominantly navigable lava lake with obsidian crusts (lava={lava_count}, obsidian={obsidian_count})"
+        );
     }
 
     #[test]

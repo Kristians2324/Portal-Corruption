@@ -8,16 +8,17 @@ use crate::types::{
     spatial_hash, strip_ns,
 };
 use mod_api::{
-    ActiveEffect, BlockState, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, GoalSpec,
-    Heightmap, Host, Identifier, ItemStack, LevelRef, LivingChangeTargetEvent, LivingDeathEvent,
-    LivingIncomingDamageEvent, MobFilter, ParticleOptions, PotentialSpawnsEvent, ServerHost,
-    SoundSource, SpawnEntry, SpawnReason, Tag,
+    ActiveEffect, BlockState, BlockUpdateFlags, Compound, EntityRef, EquipmentSlot,
+    FinalizeSpawnEvent, GoalSpec, Heightmap, Host, Identifier, ItemStack, LevelRef,
+    LivingChangeTargetEvent, LivingDeathEvent, LivingIncomingDamageEvent, MobFilter,
+    ParticleOptions, PotentialSpawnsEvent, ServerHost, SoundSource, SpawnEntry, SpawnReason, Tag,
 };
 use std::collections::HashMap;
 
 const MOB_TICK_INTERVAL: u64 = 10;
 const HOGLIN_SPREAD_INTERVAL_TICKS: u64 = 24;
 const SUPPLEMENTAL_SPAWN_INTERVAL_TICKS: u64 = 100;
+const STRIDER_SPAWN_INTERVAL_TICKS: u64 = 60;
 
 /// Mobs only unlock once corruption has converted a pretty large Nether biome
 /// (~64-block diameter minimum across several chunks).
@@ -304,7 +305,8 @@ pub fn tick_mobs(
     let do_combat = state.tick % MOB_TICK_INTERVAL == 5;
     let do_hoglin = state.tick % HOGLIN_SPREAD_INTERVAL_TICKS == 11;
     let do_spawn = state.tick % SUPPLEMENTAL_SPAWN_INTERVAL_TICKS == 45;
-    if !do_combat && !do_hoglin && !do_spawn {
+    let do_strider = state.tick % STRIDER_SPAWN_INTERVAL_TICKS == 25;
+    if !do_combat && !do_hoglin && !do_spawn && !do_strider {
         return;
     }
 
@@ -332,6 +334,9 @@ pub fn tick_mobs(
     }
     if do_spawn {
         process_supplemental_spawns(host, level, state, &entities);
+    }
+    if do_strider {
+        try_spawn_lava_striders(host, level, state, &entities);
     }
 }
 
@@ -1480,6 +1485,176 @@ fn process_supplemental_spawns(
     }
 }
 
+fn active_strider_anchor(state: &RiftState, host: &mut dyn ServerHost) -> Option<[i32; 3]> {
+    let mut player_anchors = Vec::new();
+    for player in host.players().server_players() {
+        let Some(dim) = player.dimension(host) else {
+            continue;
+        };
+        if dim.to_string() != OVERWORLD {
+            continue;
+        }
+        let Some(pos) = player.entity().position(host) else {
+            continue;
+        };
+        let pp = [
+            pos[0].floor() as i32,
+            pos[1].floor() as i32,
+            pos[2].floor() as i32,
+        ];
+        let near_unlocked = state.rifts.iter().enumerate().any(|(idx, rift)| {
+            !rift.pacified
+                && !rift.regressing
+                && rift_mobs_unlocked_in_state(state, idx)
+                && (state.is_quart_corrupted(pp)
+                    || horiz_dist_sq(rift.center, pp)
+                        <= (rift.max_radius_sq + 4096).max(64 * 64))
+        });
+        if near_unlocked {
+            player_anchors.push(pp);
+        }
+    }
+    if !player_anchors.is_empty() {
+        let pick = (state.tick / STRIDER_SPAWN_INTERVAL_TICKS) as usize % player_anchors.len();
+        return Some(player_anchors[pick]);
+    }
+
+    let rift_anchors: Vec<[i32; 3]> = state
+        .rifts
+        .iter()
+        .enumerate()
+        .filter(|(idx, r)| !r.pacified && !r.regressing && rift_mobs_unlocked_in_state(state, *idx))
+        .map(|(_, r)| r.center)
+        .collect();
+    if rift_anchors.is_empty() {
+        return None;
+    }
+    let pick = (state.tick / STRIDER_SPAWN_INTERVAL_TICKS) as usize % rift_anchors.len();
+    Some(rift_anchors[pick])
+}
+
+fn is_open_lava_surface(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> bool {
+    let [x, lava_y, z] = pos;
+    level.is_loaded(host, pos)
+        && level
+            .block(host, pos)
+            .is_some_and(|k| strip_ns(&k.id(host)) == "lava")
+        && level
+            .block(host, [x, lava_y + 1, z])
+            .is_some_and(|k| is_air_like(&k.id(host)))
+        && level
+            .block(host, [x, lava_y + 2, z])
+            .is_some_and(|k| is_air_like(&k.id(host)))
+}
+
+/// Actively populates corrupted Overworld lava oceans and rivers with Striders
+/// (equipping ~25% with saddles so players can immediately ride them across molten lakes).
+fn try_spawn_lava_striders(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    entities: &[(EntityRef, u32, String, [f64; 3])],
+) {
+    const MAX_OVERWORLD_STRIDERS: usize = 16;
+    let strider_count = entities
+        .iter()
+        .filter(|(_, _, kind, _)| strip_ns(kind) == "strider")
+        .count();
+    if strider_count >= MAX_OVERWORLD_STRIDERS {
+        return;
+    }
+
+    let Some(anchor) = active_strider_anchor(state, host) else {
+        return;
+    };
+
+    let mut probes = Vec::with_capacity(8);
+    let loaded_y = anchor[1].clamp(OVERWORLD_MIN_Y + 1, OVERWORLD_MAX_Y - 2);
+    for i in 0..8usize {
+        let h = spatial_hash(
+            anchor[0],
+            anchor[1],
+            anchor[2],
+            state.tick ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        let dist = 10 + (h % 35) as i32;
+        let angle = ((h >> 12) % 360) as f64 * std::f64::consts::TAU / 360.0;
+        let sx = anchor[0] + (f64::from(dist) * angle.cos()).round() as i32;
+        let sz = anchor[2] + (f64::from(dist) * angle.sin()).round() as i32;
+        if level.is_loaded(host, [sx, loaded_y, sz]) {
+            probes.push((sx, sz));
+        }
+    }
+    if probes.is_empty() {
+        return;
+    }
+
+    let Ok(heights) = host.surface_heights(OVERWORLD, &probes, Heightmap::WorldSurface) else {
+        return;
+    };
+
+    let mut remaining_budget = MAX_OVERWORLD_STRIDERS - strider_count;
+    for (idx, ((sx, sz), opt_sy)) in probes.into_iter().zip(heights.into_iter()).enumerate() {
+        let Some(sy) = opt_sy else {
+            continue;
+        };
+        let lava_y = sy - 1;
+        if lava_y <= OVERWORLD_MIN_Y + 4 || lava_y + 2 > OVERWORLD_MAX_Y {
+            continue;
+        }
+        if !location_unlocks_nether_mobs(state, [sx, lava_y, sz]) {
+            continue;
+        }
+        if !is_open_lava_surface(host, level, [sx, lava_y, sz]) {
+            continue;
+        }
+
+        let adj_open_lava = is_open_lava_surface(host, level, [sx + 1, lava_y, sz]);
+        let roll = spatial_hash(sx, lava_y, sz, state.tick ^ (idx as u64));
+        let herd = (1 + ((roll >> 8) % 2) as usize).min(remaining_budget);
+        let mut spawned_any = false;
+        for member in 0..herd {
+            let mx = if member > 0 && adj_open_lava {
+                sx + 1
+            } else {
+                sx
+            };
+            let spawn_pos = [
+                f64::from(mx) + 0.5,
+                f64::from(lava_y + 1),
+                f64::from(sz) + 0.5,
+            ];
+            let member_roll = spatial_hash(
+                mx,
+                lava_y,
+                sz,
+                state.tick ^ (member as u64).wrapping_mul(0x517C_C1B7_2722_0A95),
+            );
+            if let Some(eid) =
+                host.summon(OVERWORLD, "minecraft:strider", spawn_pos, Compound::new())
+            {
+                spawned_any = true;
+                remaining_budget -= 1;
+                if (member_roll % 4) == 0
+                    && let Some(ent) = host.entity(eid)
+                    && let Some(living) = host.living(ent)
+                    && let Ok(ident) = Identifier::parse("minecraft:saddle")
+                    && let Some(item_key) = host.item_key(&ident)
+                    && let Some(saddle) = ItemStack::new(item_key, 1)
+                {
+                    let _ = living.set_equipment(host, EquipmentSlot::Saddle, Some(saddle));
+                }
+            }
+            if remaining_budget == 0 {
+                break;
+            }
+        }
+        if spawned_any {
+            return;
+        }
+    }
+}
+
 pub fn augment_potential_spawns(
     host: &dyn Host,
     state: &RiftState,
@@ -1555,10 +1730,10 @@ pub fn augment_potential_spawns(
         }
         ("creature", NetherFlavor::CrimsonForest) => {
             push_if_missing(&mut event.entries, "minecraft:hoglin", 20, 1, 3);
-            push_if_missing(&mut event.entries, "minecraft:strider", 4, 1, 2);
+            push_if_missing(&mut event.entries, "minecraft:strider", 10, 1, 3);
         }
         ("creature", _) => {
-            push_if_missing(&mut event.entries, "minecraft:strider", 6, 1, 2);
+            push_if_missing(&mut event.entries, "minecraft:strider", 10, 1, 3);
         }
         _ => {}
     }
