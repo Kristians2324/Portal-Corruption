@@ -1,7 +1,7 @@
 id = "rift_bleed"
 name = "Rift Bleed"
-version = "0.1.0"
-description = "Active Nether Portals corrupt the Overworld in 360-degree rings, shroud the sky in smooth volcanic smog up to the clouds, draw Nether mobs that convert slain victims, and birth rare grounded Bastions until sealed in Crying Obsidian."
+version = "0.2.0"
+description = "Active Nether Portals corrupt the Overworld and oceans, shroud the sky in volcanic smog, spawn Nether mobs and progressive structures including a Nether FOB, until broken or sealed by Wither defeat."
 authors = ["Kristians2324"]
 api = "0.2"
 side = "both"
@@ -9,5 +9,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "dd67b76ff23e28c6d8e21859df600d31572f81a0"
+horizon = "f1bb66f353cf67f2aa4665293fc75c8d91186fc7"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

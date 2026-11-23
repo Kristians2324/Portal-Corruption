@@ -43,12 +43,12 @@
 - `/rift speed <4..1200>` *(OP level 2)* — Adjust block spread budget per tick (default `14` ops/tick for calm early progression).
 - `/rift pause` / `/rift resume` *(OP level 2)* — Pause or resume Rift Bleed expansion.
 
-## Package Layout & Building (Horizon Launcher `>= 0.2.78`)
+## Package Layout & Building (Horizon Launcher `>= 0.2.107`)
 
-Built as a flat native `.hmod` package targeting `horizon-mod-api` (`nightly-2026-11-18-dd67b76`, zero mixins):
-- Manifest: [`horizon-mod.toml`](horizon-mod.toml) (`id = "rift_bleed"`, `api = "0.2"`, `horizon = "dd67b76ff23e28c6d8e21859df600d31572f81a0"`)
+Built as a flat native `.hmod` package targeting `horizon-mod-api` (`nightly-2026-11-22-f1bb66f`, zero mixins):
+- Manifest: [`horizon-mod.toml`](horizon-mod.toml) (`id = "rift_bleed"`, `version = "0.2.0"`, `api = "0.2"`, `horizon = "f1bb66f353cf67f2aa4665293fc75c8d91186fc7"`)
 - Crate & Mod Entry: [`Cargo.toml`](Cargo.toml), [`src/lib.rs`](src/lib.rs)
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Horizon Launcher\horizon-launcher.exe" native-build . --instance Horizon --version nightly-2026-11-18-dd67b76 --trust-native-code --profile optimized
+& "$env:LOCALAPPDATA\Programs\Horizon Launcher\horizon-launcher.exe" native-build . --instance Horizon --version nightly-2026-11-22-f1bb66f --trust-native-code --profile optimized
 ```
