@@ -574,10 +574,14 @@ fn pop_inward_loaded_col(
             *radius -= 1;
             *cols = build_ring_columns(center[0], center[2], *radius);
         }
-        if let Some(pos_idx) = cols.iter().rposition(|c| level.is_loaded(host, [c[0], 64, c[1]])) {
-            return Some(cols.swap_remove(pos_idx));
+        let tail_start = cols.len().saturating_sub(24);
+        if let Some(rel) = cols[tail_start..]
+            .iter()
+            .rposition(|c| level.is_loaded(host, [c[0], 64, c[1]]))
+        {
+            return Some(cols.swap_remove(tail_start + rel));
         }
-        if cols.len() > 64 {
+        if !cols.is_empty() {
             break;
         }
     }

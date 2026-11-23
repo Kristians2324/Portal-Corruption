@@ -1955,9 +1955,20 @@ fn refill_priority_deepen_cols(
         return;
     }
 
+    let queue_nonempty = state
+        .priority_deepen_cols
+        .get(&rift_id)
+        .is_some_and(|q| !q.is_empty());
+    // When a priority queue already has loaded columns, only check whether a player moved
+    // significantly every 10 ticks without issuing expensive per-tick OceanFloor queries.
+    if queue_nonempty && (state.tick % 10 != 0) {
+        return;
+    }
+
     // Track active Overworld players near this rift so moving into a new cave or digging
     // a new shaft immediately refocuses deep rock corruption instead of grinding old rock.
-    let mut tracked_player: Option<([i32; 3], i32)> = None;
+    let mut tracked_player: Option<[i32; 3]> = None;
+    let mut moved_focus = false;
     for player in host.players().server_players() {
         if !player
             .dimension(host)
@@ -1972,12 +1983,7 @@ fn refill_priority_deepen_cols(
         let py = epos[1].floor() as i32;
         let pz = epos[2].floor() as i32;
         if horiz_dist_sq(center, [px, 64, pz]) <= i64::from(rift.ring_radius + 8).pow(2) {
-            let surf_y = host
-                .surface_heights(OVERWORLD, &[(px, pz)], Heightmap::OceanFloor)
-                .ok()
-                .and_then(|hs| hs.first().copied().flatten())
-                .unwrap_or(center[1]);
-            tracked_player = Some(([px, py, pz], surf_y));
+            tracked_player = Some([px, py, pz]);
             if let Some(prev) = state.last_priority_focus.get(&rift_id).copied() {
                 let dxz2 = (px - prev[0]).abs().max((pz - prev[2]).abs());
                 let dy = (py - prev[1]).abs();
@@ -1985,17 +1991,14 @@ fn refill_priority_deepen_cols(
                     state.priority_deepen_cols.remove(&rift_id);
                     state.active_priority_deepen.remove(&rift_id);
                     state.last_deepen_probe_tick.remove(&rift_id);
+                    moved_focus = true;
                 }
             }
             break;
         }
     }
 
-    if state
-        .priority_deepen_cols
-        .get(&rift_id)
-        .is_some_and(|q| !q.is_empty())
-    {
+    if queue_nonempty && !moved_focus {
         return;
     }
     if state
@@ -2016,7 +2019,12 @@ fn refill_priority_deepen_cols(
     }
 
     let mut foci: Vec<ProbeFocus> = Vec::new();
-    if let Some(([px, py, pz], surf_y)) = tracked_player {
+    if let Some([px, py, pz]) = tracked_player {
+        let surf_y = host
+            .surface_heights(OVERWORLD, &[(px, pz)], Heightmap::OceanFloor)
+            .ok()
+            .and_then(|hs| hs.first().copied().flatten())
+            .unwrap_or(center[1]);
         state.last_priority_focus.insert(rift_id, [px, py, pz]);
         if py < surf_y - 10 {
             // Player is underground: first sweep a wide horizontal cavern band right at player
@@ -2077,9 +2085,7 @@ fn refill_priority_deepen_cols(
                 }
                 if state.session_deepened_cols.contains(&col)
                     || (focus.cave_band != i32::MIN
-                        && state
-                            .session_cave_band_cols
-                            .contains(&(col, focus.cave_band)))
+                        && state.has_session_cave_col_deepened(col, focus.cave_band))
                     || !level.is_loaded(host, [col[0], 64, col[1]])
                 {
                     continue;
@@ -2109,10 +2115,11 @@ fn next_deepen_column_for_stream(
     priority: bool,
 ) -> Option<([i32; 2], i32, i32, i32)> {
     if priority {
-        let q = state.priority_deepen_cols.get_mut(&rift_id)?;
-        while let Some((col, top_y, bottom_y, band)) = q.pop_front() {
+        while let Some((col, top_y, bottom_y, band)) =
+            state.priority_deepen_cols.get_mut(&rift_id)?.pop_front()
+        {
             let already_done = state.session_deepened_cols.contains(&col)
-                || (band != i32::MIN && state.session_cave_band_cols.contains(&(col, band)));
+                || (band != i32::MIN && state.has_session_cave_col_deepened(col, band));
             if !already_done && level.is_loaded(host, [col[0], 64, col[1]]) {
                 let start_y = if top_y >= OVERWORLD_MAX_Y {
                     let floor_y = host
@@ -2193,7 +2200,7 @@ fn bore_deepen_stream(
     let rift_center = state.rifts[rift_idx].center;
     let rift_flavor = state.rifts[rift_idx].flavor;
 
-    while *budget > 0 && skips < 2048 {
+    while *budget > 0 && skips < 640 {
         let rift_age = state.rifts[rift_idx].age_ticks;
         let rift_blocks = state.rifts[rift_idx].corrupted_blocks;
         let mature = rift_blocks >= 35_000 || rift_age >= 5_000;

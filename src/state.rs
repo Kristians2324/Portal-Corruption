@@ -89,6 +89,7 @@ pub struct RiftState {
     pub nether_fobs: Vec<[i32; 3]>,
     pub corrupted_quart_cols: HashSet<[i32; 2]>,
     pub corrupted_quart_cols_list: Vec<[i32; 2]>,
+    pub corrupted_quart_index: HashMap<[i32; 2], usize>,
     /// Tracks Overworld mobs buffed as Nether-Touched so loot & flames persist.
     pub nether_touched_mobs: HashSet<u32>,
     /// Tracks known living Nether predator entity IDs so `living_death` recognizes attackers cleanly.
@@ -139,7 +140,7 @@ pub struct RiftState {
     pub active_priority_deepen: HashMap<u64, ([i32; 2], i32, i32, i32)>,
     pub priority_deepen_cols: HashMap<u64, VecDeque<([i32; 2], i32, i32, i32)>>,
     pub session_deepened_cols: HashSet<[i32; 2]>,
-    pub session_cave_band_cols: HashSet<([i32; 2], i32)>,
+    pub session_cave_band_cols: HashMap<[i32; 2], u32>,
     pub last_deepen_probe_tick: HashMap<u64, u64>,
     pub last_priority_focus: HashMap<u64, [i32; 3]>,
     pub needs_forced_chunk_sync: bool,
@@ -178,6 +179,7 @@ impl RiftState {
             nether_fobs: Vec::new(),
             corrupted_quart_cols: HashSet::new(),
             corrupted_quart_cols_list: Vec::new(),
+            corrupted_quart_index: HashMap::new(),
             nether_touched_mobs: HashSet::new(),
             known_nether_mobs: HashSet::new(),
             magma_melee_ready: HashSet::new(),
@@ -212,7 +214,7 @@ impl RiftState {
             active_priority_deepen: HashMap::new(),
             priority_deepen_cols: HashMap::new(),
             session_deepened_cols: HashSet::new(),
-            session_cave_band_cols: HashSet::new(),
+            session_cave_band_cols: HashMap::new(),
             last_deepen_probe_tick: HashMap::new(),
             last_priority_focus: HashMap::new(),
             needs_forced_chunk_sync: true,
@@ -230,11 +232,24 @@ impl RiftState {
         self.session_deepened_cols.insert(col);
     }
 
+    pub fn has_session_cave_col_deepened(&self, col: [i32; 2], band: i32) -> bool {
+        let bit = band.saturating_add(4);
+        if !(0..=31).contains(&bit) {
+            return false;
+        }
+        self.session_cave_band_cols
+            .get(&col)
+            .is_some_and(|&mask| (mask & (1u32 << bit)) != 0)
+    }
+
     pub fn mark_session_cave_col_deepened(&mut self, col: [i32; 2], band: i32) {
         if self.session_cave_band_cols.len() >= 32_768 {
             self.session_cave_band_cols.clear();
         }
-        self.session_cave_band_cols.insert((col, band));
+        let bit = band.saturating_add(4);
+        if (0..=31).contains(&bit) {
+            *self.session_cave_band_cols.entry(col).or_insert(0) |= 1u32 << bit;
+        }
     }
 
     pub fn queue_melt_fx(&mut self, pos: [i32; 3]) {
@@ -298,7 +313,9 @@ impl RiftState {
         let q = quart_coords(block_pos);
         let col = [q[0], q[2]];
         if self.corrupted_quart_cols.insert(col) {
+            let idx = self.corrupted_quart_cols_list.len();
             self.corrupted_quart_cols_list.push(col);
+            self.corrupted_quart_index.insert(col, idx);
             true
         } else {
             false
@@ -309,15 +326,26 @@ impl RiftState {
         let qx = x >> 2;
         let qz = z >> 2;
         let col = [qx, qz];
-        if self.corrupted_quart_cols.remove(&col)
-            && let Some(idx) = self.corrupted_quart_cols_list.iter().position(|c| *c == col)
-        {
-            self.corrupted_quart_cols_list.swap_remove(idx);
+        if !self.corrupted_quart_cols.remove(&col) {
+            return;
         }
-        self.session_deepened_cols
-            .retain(|c| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
-        self.session_cave_band_cols
-            .retain(|(c, _)| (c[0] >> 2) != qx || (c[1] >> 2) != qz);
+        if let Some(idx) = self.corrupted_quart_index.remove(&col) {
+            let last_idx = self.corrupted_quart_cols_list.len() - 1;
+            self.corrupted_quart_cols_list.swap_remove(idx);
+            if idx < last_idx {
+                let moved = self.corrupted_quart_cols_list[idx];
+                self.corrupted_quart_index.insert(moved, idx);
+            }
+        }
+        let bx = qx << 2;
+        let bz = qz << 2;
+        for ox in 0..4 {
+            for oz in 0..4 {
+                let p = [bx + ox, bz + oz];
+                self.session_deepened_cols.remove(&p);
+                self.session_cave_band_cols.remove(&p);
+            }
+        }
     }
 
     /// True if any *other* active (unpacified) Rift still reaches `(x, z)` so one
@@ -788,12 +816,15 @@ impl RiftState {
 
         self.corrupted_quart_cols.clear();
         self.corrupted_quart_cols_list.clear();
+        self.corrupted_quart_index.clear();
         if let Some(arr) = doc.get("corrupted_quarts").and_then(|v| v.as_array()) {
             for item in arr {
                 if let Some(q) = pos_from_json(item) {
                     let c = [q[0], q[2]];
                     if self.corrupted_quart_cols.insert(c) {
+                        let idx = self.corrupted_quart_cols_list.len();
                         self.corrupted_quart_cols_list.push(c);
+                        self.corrupted_quart_index.insert(c, idx);
                     }
                 }
             }
@@ -801,7 +832,9 @@ impl RiftState {
         if let Some(val) = doc.get("corrupted_quart_cols") {
             for c in cols_from_json_any(val) {
                 if self.corrupted_quart_cols.insert(c) {
+                    let idx = self.corrupted_quart_cols_list.len();
                     self.corrupted_quart_cols_list.push(c);
+                    self.corrupted_quart_index.insert(c, idx);
                 }
             }
         }
@@ -1039,5 +1072,35 @@ mod tests {
         assert_eq!(d.spread_budget, 14);
         assert_eq!(d.next_id, 1);
         assert_ne!(d.seed, 0);
+    }
+
+    #[test]
+    fn quart_index_and_cave_band_bitmask_unmark_cleanly_in_constant_time() {
+        let mut s = RiftState::new();
+        assert!(s.mark_quart_corrupted([0, 64, 0]));
+        assert!(s.mark_quart_corrupted([16, 64, 0]));
+        assert!(s.mark_quart_corrupted([32, 64, 0]));
+        assert_eq!(s.corrupted_quart_cols_list.len(), 3);
+
+        s.mark_session_col_deepened([17, 2]);
+        s.mark_session_cave_col_deepened([17, 2], -2);
+        s.mark_session_cave_col_deepened([17, 2], 3);
+        assert!(s.has_session_cave_col_deepened([17, 2], -2));
+        assert!(s.has_session_cave_col_deepened([17, 2], 3));
+        assert!(!s.has_session_cave_col_deepened([17, 2], 1));
+
+        // Remove middle quart -> swapped element updates its index & cave caches clear cleanly.
+        s.unmark_quart_col(16, 0);
+        assert!(!s.is_quart_corrupted([16, 64, 0]));
+        assert!(s.is_quart_corrupted([0, 64, 0]));
+        assert!(s.is_quart_corrupted([32, 64, 0]));
+        assert_eq!(s.corrupted_quart_cols_list.len(), 2);
+        assert!(!s.session_deepened_cols.contains(&[17, 2]));
+        assert!(!s.has_session_cave_col_deepened([17, 2], -2));
+
+        s.unmark_quart_col(32, 0);
+        s.unmark_quart_col(0, 0);
+        assert!(s.corrupted_quart_cols_list.is_empty());
+        assert!(s.corrupted_quart_index.is_empty());
     }
 }
