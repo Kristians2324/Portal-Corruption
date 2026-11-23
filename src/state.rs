@@ -105,6 +105,10 @@ pub struct RiftState {
     pub pending_water_evap_set: HashSet<[i32; 3]>,
     pub pending_frontier_columns: VecDeque<[i32; 2]>,
     pub water_sweep_cursor: usize,
+    /// Active oceanic coastal berm columns queued for step-down / boiling erosion
+    /// as the rift front pushes deeper out to sea.
+    pub shore_columns: VecDeque<[i32; 2]>,
+    pub shore_columns_set: HashSet<[i32; 2]>,
     /// Independent runtime vertical cursor `([x, z], next_y_down, min_y)` for each
     /// rift's simultaneous underground deepening pass, keyed by rift id.
     pub active_deepen_columns: HashMap<u64, ([i32; 2], i32, i32)>,
@@ -160,6 +164,8 @@ impl RiftState {
             pending_water_evap_set: HashSet::new(),
             pending_frontier_columns: VecDeque::new(),
             water_sweep_cursor: 0,
+            shore_columns: VecDeque::new(),
+            shore_columns_set: HashSet::new(),
             active_deepen_columns: HashMap::new(),
             pending_melt_fx: Vec::new(),
             last_melt_sound_tick: 0,
@@ -182,6 +188,19 @@ impl RiftState {
         let pos = self.pending_water_evap.pop_front()?;
         self.pending_water_evap_set.remove(&pos);
         Some(pos)
+    }
+
+    pub fn queue_shore_col(&mut self, col: [i32; 2]) {
+        if self.shore_columns.len() < 16_384 && self.shore_columns_set.insert(col) {
+            self.shore_columns.push_back(col);
+            self.dirty = true;
+        }
+    }
+
+    pub fn pop_shore_col(&mut self) -> Option<[i32; 2]> {
+        let col = self.shore_columns.pop_front()?;
+        self.shore_columns_set.remove(&col);
+        Some(col)
     }
 
     pub fn reset_for_world(&mut self, dir: Option<PathBuf>, seed: Option<i64>) {
@@ -449,6 +468,9 @@ impl RiftState {
             .collect();
         root.insert("corrupted_quart_cols".into(), Value::Array(cols));
 
+        let shores: Vec<Value> = self.shore_columns.iter().copied().map(col_to_json).collect();
+        root.insert("shore_columns".into(), Value::Array(shores));
+
         Value::Object(root)
     }
 
@@ -657,6 +679,17 @@ impl RiftState {
             for item in arr {
                 if let Some(c) = col_from_json(item) {
                     self.corrupted_quart_cols.insert(c);
+                }
+            }
+        }
+        self.shore_columns.clear();
+        self.shore_columns_set.clear();
+        if let Some(arr) = doc.get("shore_columns").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(c) = col_from_json(item) {
+                    if self.shore_columns_set.insert(c) {
+                        self.shore_columns.push_back(c);
+                    }
                 }
             }
         }

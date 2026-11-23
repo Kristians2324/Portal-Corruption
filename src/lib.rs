@@ -21,7 +21,7 @@ use mobs::paint_biome_column;
 use state::RiftState;
 use types::{
     BEDROCK_FLOOR_Y, NetherFlavor, OVERWORLD, OVERWORLD_MAX_Y, OVERWORLD_MIN_Y, RiftSource,
-    build_ring_columns, dist_sq, horiz_dist_sq, neighbors_6, strip_ns,
+    build_ring_columns, dist_sq, horiz_dist_sq, neighbors_6, spatial_hash, strip_ns,
 };
 
 use mod_api::{
@@ -421,6 +421,302 @@ pub fn near_corruption_or_active_rift(state: &RiftState, pos: [i32; 3]) -> bool 
     false
 }
 
+/// Depth inside the active unpacified rift frontier where deep ocean water quenches into a
+/// solid volcanic basalt seawall rather than boiling out into a vertical hovering water wall.
+const WATER_SEAWALL_RIM_DEPTH: f64 = 3.5;
+/// Distance inside the frontier where the terraced volcanic coastal shelf slopes all the way
+/// down to the scorched dried ocean floor.
+const WATER_SHELF_END_DEPTH: f64 = 12.5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaterCorruptAction {
+    EvaporateAir,
+    QuenchVolcanicBerm(&'static str),
+}
+
+fn best_active_rift_edge_dist(state: &RiftState, x: i32, z: i32) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for rift in &state.rifts {
+        if rift.pacified || (!rift.is_actively_spreading() && rift.ring_radius <= 0) {
+            continue;
+        }
+        let dx = f64::from(x - rift.center[0]);
+        let dz = f64::from(z - rift.center[2]);
+        let edge = f64::from(rift.ring_radius) - dx.hypot(dz);
+        best = Some(best.map_or(edge, |b| b.max(edge)));
+    }
+    best
+}
+
+pub fn is_within_evap_basin(state: &RiftState, pos: [i32; 3]) -> bool {
+    state.is_quart_corrupted(pos)
+        || best_active_rift_edge_dist(state, pos[0], pos[2]).is_some_and(|e| e >= -0.5)
+}
+
+fn near_monument_footprint(state: &RiftState, x: i32, z: i32) -> bool {
+    state
+        .citadels
+        .iter()
+        .any(|c| (x - c[0]).abs() <= 34 && (z - c[2]).abs() <= 34)
+        || state
+            .bastions
+            .iter()
+            .any(|b| (x - b.center[0]).abs() <= 36 && (z - b.center[2]).abs() <= 36)
+        || state
+            .outposts
+            .iter()
+            .any(|o| (x - o.center[0]).abs() <= 22 && (z - o.center[2]).abs() <= 22)
+}
+
+fn pick_volcanic_berm_block(pos: [i32; 3]) -> &'static str {
+    match spatial_hash(pos[0], pos[1], pos[2], 0x5EA1_BA5A) % 16 {
+        0..=5 => "minecraft:basalt",
+        6..=9 => "minecraft:blackstone",
+        10..=13 => "minecraft:smooth_basalt",
+        _ => "minecraft:magma_block",
+    }
+}
+
+fn is_volcanic_berm_block(name: &str) -> bool {
+    matches!(
+        strip_ns(name),
+        "basalt" | "smooth_basalt" | "blackstone" | "magma_block"
+    )
+}
+
+fn volcanic_shelf_target_y(col: [i32; 2], edge_dist: f64, seabed_y: i32, sea_top_y: i32) -> i32 {
+    if sea_top_y <= seabed_y {
+        return seabed_y;
+    }
+    if edge_dist <= WATER_SEAWALL_RIM_DEPTH {
+        return sea_top_y;
+    }
+
+    let stack_roll = spatial_hash(col[0] >> 1, 7, col[1] >> 1, 0x57AC_0001) % 24;
+    let sea_stack_top = if stack_roll == 0 {
+        let extra = 1 + (spatial_hash(col[0], 11, col[1], 0x57AC_0002) % 3) as i32;
+        (seabed_y + extra).min(sea_top_y)
+    } else {
+        seabed_y
+    };
+
+    if edge_dist >= WATER_SHELF_END_DEPTH {
+        return sea_stack_top;
+    }
+
+    let t = ((edge_dist - WATER_SEAWALL_RIM_DEPTH)
+        / (WATER_SHELF_END_DEPTH - WATER_SEAWALL_RIM_DEPTH))
+        .clamp(0.0, 1.0);
+    let raw = f64::from(sea_top_y) + f64::from(seabed_y - sea_top_y) * t;
+    let jitter = (spatial_hash(col[0], 19, col[1], 0xBA5A_1701) % 5) as i32 - 2;
+    (raw.round() as i32 + jitter).clamp(sea_stack_top, sea_top_y)
+}
+
+fn classify_water_corruption(
+    pos: [i32; 3],
+    edge_dist: Option<f64>,
+    is_deep_water: bool,
+    touches_deep_live_water: bool,
+) -> WaterCorruptAction {
+    if touches_deep_live_water {
+        return WaterCorruptAction::QuenchVolcanicBerm(pick_volcanic_berm_block(pos));
+    }
+    if is_deep_water && edge_dist.is_none_or(|d| d <= WATER_SEAWALL_RIM_DEPTH) {
+        return WaterCorruptAction::QuenchVolcanicBerm(pick_volcanic_berm_block(pos));
+    }
+    WaterCorruptAction::EvaporateAir
+}
+
+fn column_water_span(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3], min_needed: usize) -> usize {
+    let mut span = 0usize;
+    let is_aqua_or_berm = |id: &str| is_water_like(id) || is_volcanic_berm_block(id);
+    if !level
+        .block(host, pos)
+        .is_some_and(|k| is_aqua_or_berm(&k.id(host)))
+    {
+        return 0;
+    }
+    span += 1;
+    for dy in 1..=3 {
+        if pos[1] - dy < OVERWORLD_MIN_Y {
+            break;
+        }
+        let p = [pos[0], pos[1] - dy, pos[2]];
+        if !level.is_loaded(host, p)
+            || !level.block(host, p).is_some_and(|k| is_aqua_or_berm(&k.id(host)))
+        {
+            break;
+        }
+        span += 1;
+        if span >= min_needed {
+            return span;
+        }
+    }
+    for dy in 1..=3 {
+        if pos[1] + dy > OVERWORLD_MAX_Y {
+            break;
+        }
+        let p = [pos[0], pos[1] + dy, pos[2]];
+        if !level.is_loaded(host, p)
+            || !level.block(host, p).is_some_and(|k| is_aqua_or_berm(&k.id(host)))
+        {
+            break;
+        }
+        span += 1;
+        if span >= min_needed {
+            return span;
+        }
+    }
+    span
+}
+
+fn decide_water_corruption(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &RiftState,
+    pos: [i32; 3],
+) -> WaterCorruptAction {
+    let edge = best_active_rift_edge_dist(state, pos[0], pos[2]);
+    let local_span = column_water_span(host, level, pos, 3);
+    let mut is_deep = local_span >= 3;
+
+    let mut touches_deep_live = false;
+    let horiz = [
+        [pos[0] + 1, pos[1], pos[2]],
+        [pos[0] - 1, pos[1], pos[2]],
+        [pos[0], pos[1], pos[2] + 1],
+        [pos[0], pos[1], pos[2] - 1],
+    ];
+    for n in horiz {
+        if !level.is_loaded(host, n) {
+            continue;
+        }
+        let Some(nk) = level.block(host, n) else {
+            continue;
+        };
+        if !is_water_like(&nk.id(host)) {
+            continue;
+        }
+        // Only count as deep live water if neighbor's column spans >= 2 blocks vertically
+        // (1-block puddles/farm strips still boil cleanly without forming stone curbs).
+        let n_edge = best_active_rift_edge_dist(state, n[0], n[2]);
+        if n_edge.is_none_or(|ne| ne < WATER_SEAWALL_RIM_DEPTH) {
+            let n_span = column_water_span(host, level, n, 3);
+            if n_span >= 2 {
+                touches_deep_live = true;
+                if n_span >= 3 {
+                    is_deep = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if !is_deep
+        && let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(pos[0], pos[2])])
+        && let Some(Some(tc)) = tcs.first()
+        && let Some(w) = tc.water
+        && w - (tc.height - 1) >= 3
+    {
+        is_deep = true;
+    }
+
+    classify_water_corruption(pos, edge, is_deep, touches_deep_live)
+}
+
+/// Seals any existing vertical wall of water touching a dried corrupted seabed column (including
+/// already-corrupted worlds loaded with the mod update).
+fn plug_exposed_ocean_wall_at_col(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    state: &mut RiftState,
+    x: i32,
+    z: i32,
+) {
+    if near_monument_footprint(state, x, z) || best_active_rift_edge_dist(state, x, z).is_none() {
+        return;
+    }
+    let probes_y = [62, 60, 56, 52];
+    let mut hit_water = false;
+    for py in probes_y {
+        let p = [x, py, z];
+        if !level.is_loaded(host, p)
+            || !level.block(host, p).is_some_and(|k| is_air_like(&k.id(host)))
+        {
+            continue;
+        }
+        for [nx, nz] in [[x + 1, z], [x - 1, z], [x, z + 1], [x, z - 1]] {
+            let np = [nx, py, nz];
+            if level.is_loaded(host, np)
+                && level.block(host, np).is_some_and(|k| is_water_like(&k.id(host)))
+                && column_water_span(host, level, np, 3) >= 3
+            {
+                hit_water = true;
+                break;
+            }
+        }
+        if hit_water {
+            break;
+        }
+    }
+    if !hit_water {
+        return;
+    }
+
+    let seabed_y = host
+        .terrain_surface(OVERWORLD, &[(x, z)])
+        .ok()
+        .and_then(|v| v.first().and_then(|o| o.as_ref()).map(|c| c.height - 1))
+        .unwrap_or(40)
+        .clamp(OVERWORLD_MIN_Y + 4, OVERWORLD_MAX_Y - 4);
+    let mut top_seal_y = seabed_y;
+    for y in (seabed_y + 1..=64).rev() {
+        let has_water_adj = [[x + 1, z], [x - 1, z], [x, z + 1], [x, z - 1]]
+            .into_iter()
+            .any(|[nx, nz]| {
+                let np = [nx, y, nz];
+                level.is_loaded(host, np)
+                    && level.block(host, np).is_some_and(|k| is_water_like(&k.id(host)))
+            });
+        if has_water_adj {
+            top_seal_y = y;
+            break;
+        }
+    }
+    if top_seal_y <= seabed_y {
+        return;
+    }
+
+    let mut placed_any = false;
+    for y in (seabed_y + 1)..=top_seal_y {
+        let pos = [x, y, z];
+        let is_open = level.block(host, pos).is_some_and(|k| {
+            let id = k.id(host);
+            is_air_like(&id) || is_water_like(&id)
+        });
+        if !is_open {
+            continue;
+        }
+        if let Some(bs) = resolve_block(host, pick_volcanic_berm_block(pos))
+            && level
+                .set_block(
+                    host,
+                    pos,
+                    bs,
+                    BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                )
+                .unwrap_or(false)
+        {
+            placed_any = true;
+        }
+    }
+    if placed_any {
+        state.queue_shore_col([x, z]);
+        state.queue_melt_fx([x, top_seal_y, z]);
+        state.dirty = true;
+    }
+}
+
 pub fn is_water_bucket_item(item_id: &str) -> bool {
     matches!(
         strip_ns(item_id),
@@ -652,13 +948,66 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
         let bname = bkey.id(host);
         let is_water = is_water_like(&bname);
         let is_cold = is_snow_or_ice(&bname);
-        if is_water || is_cold {
+        if is_water {
+            if !is_within_evap_basin(state, pos) {
+                continue;
+            }
+            match decide_water_corruption(host, level, state, pos) {
+                WaterCorruptAction::QuenchVolcanicBerm(berm_id) => {
+                    if let Some(berm_bs) = resolve_block(host, berm_id)
+                        && level
+                            .set_block(
+                                host,
+                                pos,
+                                berm_bs,
+                                BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                            )
+                            .unwrap_or(false)
+                    {
+                        state.queue_melt_fx(pos);
+                        state.queue_shore_col([pos[0], pos[2]]);
+                        state.dirty = true;
+                    }
+                    continue;
+                }
+                WaterCorruptAction::EvaporateAir => {
+                    if level
+                        .set_block(
+                            host,
+                            pos,
+                            air,
+                            BlockUpdateFlags::CLIENTS
+                                | BlockUpdateFlags::KNOWN_SHAPE
+                                | BlockUpdateFlags::SUPPRESS_DROPS,
+                        )
+                        .unwrap_or(false)
+                    {
+                        state.queue_melt_fx(pos);
+                    }
+                    state.dirty = true;
+                    for n in neighbors_6(pos) {
+                        if n[1] >= OVERWORLD_MIN_Y
+                            && n[1] <= OVERWORLD_MAX_Y
+                            && is_within_evap_basin(state, n)
+                            && level.block(host, n).is_some_and(|nk| {
+                                let nid = nk.id(host);
+                                is_water_like(&nid) || is_snow_or_ice(&nid)
+                            })
+                        {
+                            state.queue_water_evap(n);
+                        }
+                    }
+                }
+            }
+        } else if is_cold {
             if level
                 .set_block(
                     host,
                     pos,
                     air,
-                    BlockUpdateFlags::CLIENTS | BlockUpdateFlags::KNOWN_SHAPE | BlockUpdateFlags::SUPPRESS_DROPS,
+                    BlockUpdateFlags::CLIENTS
+                        | BlockUpdateFlags::KNOWN_SHAPE
+                        | BlockUpdateFlags::SUPPRESS_DROPS,
                 )
                 .unwrap_or(false)
             {
@@ -666,43 +1015,31 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
             }
             state.dirty = true;
 
-            if is_cold {
-                // Chain-melt adjacent and sloped snow/ice across mountain peaks and frozen lakes.
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        for dz in -1..=1 {
-                            if dx == 0 && dy == 0 && dz == 0 {
-                                continue;
-                            }
-                            let n = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
-                            if n[1] >= OVERWORLD_MIN_Y
-                                && n[1] <= OVERWORLD_MAX_Y
-                                && near_corruption_or_active_rift(state, n)
-                                && level.block(host, n).is_some_and(|nk| {
-                                    let nid = nk.id(host);
-                                    is_snow_or_ice(&nid) || is_water_like(&nid)
-                                })
-                            {
-                                state.queue_water_evap(n);
-                            }
+            // Chain-melt adjacent and sloped snow/ice across mountain peaks and frozen lakes.
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue;
+                        }
+                        let n = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                        if n[1] >= OVERWORLD_MIN_Y
+                            && n[1] <= OVERWORLD_MAX_Y
+                            && near_corruption_or_active_rift(state, n)
+                            && level.block(host, n).is_some_and(|nk| {
+                                let nid = nk.id(host);
+                                is_snow_or_ice(&nid)
+                                    || (is_water_like(&nid) && is_within_evap_basin(state, n))
+                            })
+                        {
+                            state.queue_water_evap(n);
                         }
                     }
                 }
-            } else {
-                for n in neighbors_6(pos) {
-                    if n[1] >= OVERWORLD_MIN_Y
-                        && n[1] <= OVERWORLD_MAX_Y
-                        && near_corruption_or_active_rift(state, n)
-                        && level.block(host, n).is_some_and(|nk| {
-                            let nid = nk.id(host);
-                            is_water_like(&nid) || is_snow_or_ice(&nid)
-                        })
-                    {
-                        state.queue_water_evap(n);
-                    }
-                }
             }
-        } else if level.block_property(host, pos, "waterlogged").as_deref() == Some("true") {
+        } else if is_within_evap_basin(state, pos)
+            && level.block_property(host, pos, "waterlogged").as_deref() == Some("true")
+        {
             let _ = host.set_block_property(pos, "waterlogged", "false");
             state.queue_melt_fx(pos);
             state.dirty = true;
@@ -711,7 +1048,7 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
 
     // Continuous gentle surface & river sweep over existing corrupted quart columns
     // so lingering ponds, snow, or ice patches (including beneath tall forest canopies)
-    // never survive inside corrupted lands.
+    // never survive inside corrupted lands, while any exposed ocean face is sealed.
     if state.corrupted_quart_cols.is_empty() {
         return;
     }
@@ -759,6 +1096,167 @@ fn drain_water_evaporation(host: &mut dyn ServerHost, level: LevelRef, state: &m
                     state.queue_water_evap(p);
                 }
             }
+        }
+
+        if mb.is_some_and(|g| g < 62) {
+            plug_exposed_ocean_wall_at_col(host, level, state, sub_x, sub_z);
+        }
+    }
+}
+
+/// Smoothly erodes interior volcanic seawall columns down into a stepped volcanic coast and dried
+/// scorched seabed as the corruption front advances outward, while strictly refusing to lower any
+/// column beside live water so vertical water walls never form.
+fn step_ocean_shores(host: &mut dyn ServerHost, level: LevelRef, state: &mut RiftState) {
+    if state.paused || state.shore_columns.is_empty() {
+        return;
+    }
+    let Some(air) = host.block_state_id("minecraft:air") else {
+        return;
+    };
+
+    let max_rotations = state.shore_columns.len().min(96);
+    let mut eroded_ops = 0usize;
+    let mut rotated = 0usize;
+
+    while eroded_ops < 16 && rotated < max_rotations {
+        let Some(col) = state.pop_shore_col() else {
+            break;
+        };
+        rotated += 1;
+
+        let Some(edge_dist) = best_active_rift_edge_dist(state, col[0], col[1]) else {
+            // Covering rift is now pacified; regression handles final restoration.
+            state.dirty = true;
+            continue;
+        };
+        if !level.is_loaded(host, [col[0], 64, col[1]]) || edge_dist <= WATER_SEAWALL_RIM_DEPTH {
+            state.queue_shore_col(col);
+            continue;
+        }
+        if near_monument_footprint(state, col[0], col[1]) {
+            state.dirty = true;
+            continue;
+        }
+
+        eroded_ops += 1;
+        let Ok(tcs) = host.terrain_surface(OVERWORLD, &[(col[0], col[1])]) else {
+            state.queue_shore_col(col);
+            continue;
+        };
+        let Some(Some(tc)) = tcs.first() else {
+            continue;
+        };
+        let seabed_y = (tc.height - 1).clamp(OVERWORLD_MIN_Y + 4, OVERWORLD_MAX_Y - 4);
+        let sea_top_y = tc
+            .water
+            .map(|w| (w - 1).clamp(seabed_y, OVERWORLD_MAX_Y - 2))
+            .unwrap_or(seabed_y);
+        if sea_top_y <= seabed_y {
+            continue;
+        }
+
+        let ws_top = host
+            .surface_heights(OVERWORLD, &[(col[0], col[1])], Heightmap::WorldSurface)
+            .ok()
+            .and_then(|hs| hs.first().copied().flatten())
+            .unwrap_or(sea_top_y + 1)
+            .clamp(seabed_y, OVERWORLD_MAX_Y - 2);
+        let scan_top = sea_top_y.max(ws_top);
+
+        let mut max_neighbor_water_y: Option<i32> = None;
+        let horiz = [
+            [col[0] + 1, col[1]],
+            [col[0] - 1, col[1]],
+            [col[0], col[1] + 1],
+            [col[0], col[1] - 1],
+        ];
+        for [nx, nz] in horiz {
+            if !level.is_loaded(host, [nx, 64, nz]) {
+                // Conservatively keep seawall sealed at chunk borders until neighbor loads.
+                max_neighbor_water_y = Some(sea_top_y);
+                break;
+            }
+            for y in (seabed_y + 1..=sea_top_y).rev() {
+                if level
+                    .block(host, [nx, y, nz])
+                    .is_some_and(|k| is_water_like(&k.id(host)))
+                {
+                    max_neighbor_water_y =
+                        Some(max_neighbor_water_y.map_or(y, |cur| cur.max(y)));
+                    if best_active_rift_edge_dist(state, nx, nz)
+                        .is_some_and(|ne| ne > WATER_SEAWALL_RIM_DEPTH + 1.0)
+                    {
+                        state.queue_water_evap([nx, y, nz]);
+                    }
+                    break;
+                }
+            }
+        }
+
+        let desired_top = volcanic_shelf_target_y(col, edge_dist, seabed_y, sea_top_y);
+        let safe_top = match max_neighbor_water_y {
+            Some(wy) => desired_top.max(wy),
+            None => desired_top,
+        };
+
+        // Never leave an air gap below adjacent neighbor water level.
+        if let Some(wy) = max_neighbor_water_y {
+            for y in (seabed_y + 1)..=wy {
+                let p = [col[0], y, col[1]];
+                let is_open = level.block(host, p).is_some_and(|k| {
+                    let id = k.id(host);
+                    is_air_like(&id) || is_water_like(&id)
+                });
+                if is_open
+                    && let Some(bs) = resolve_block(host, pick_volcanic_berm_block(p))
+                    && level
+                        .set_block(
+                            host,
+                            p,
+                            bs,
+                            BlockUpdateFlags::CLIENTS | BlockUpdateFlags::SUPPRESS_DROPS,
+                        )
+                        .unwrap_or(false)
+                {
+                    state.dirty = true;
+                }
+            }
+        }
+
+        let mut cleared_any = false;
+        for y in (safe_top + 1..=scan_top).rev() {
+            let p = [col[0], y, col[1]];
+            let removable = level.block(host, p).is_some_and(|k| {
+                let id = k.id(host);
+                is_volcanic_berm_block(&id) || is_water_like(&id)
+            });
+            if removable
+                && level
+                    .set_block(
+                        host,
+                        p,
+                        air,
+                        BlockUpdateFlags::CLIENTS
+                            | BlockUpdateFlags::KNOWN_SHAPE
+                            | BlockUpdateFlags::SUPPRESS_DROPS,
+                    )
+                    .unwrap_or(false)
+            {
+                cleared_any = true;
+            }
+        }
+        if cleared_any {
+            if (col[0].wrapping_add(col[1]) & 3) == 0 {
+                state.queue_melt_fx([col[0], (safe_top + 1).min(OVERWORLD_MAX_Y - 1), col[1]]);
+            }
+            state.dirty = true;
+        }
+
+        if edge_dist <= WATER_SHELF_END_DEPTH + 1.0 || max_neighbor_water_y.is_some() {
+            state.queue_shore_col(col);
+        } else {
+            state.dirty = true;
         }
     }
 }
@@ -884,11 +1382,22 @@ fn apply_corruption_at(
         state.queue_melt_fx(pos);
     }
 
-    let out = transform_block(pos, current, &above, &below, local_flavor, mature);
+    let mut out = transform_block(pos, current, &above, &below, local_flavor, mature);
 
     let is_water_or_frozen = is_water_like(current) || is_snow_or_ice(current);
+    let mut quenched_berm = false;
     if is_water_like(current) {
-        state.queue_water_evap(pos);
+        if let WaterCorruptAction::QuenchVolcanicBerm(berm_id) =
+            decide_water_corruption(host, level, state, pos)
+        {
+            out.block = Some(berm_id);
+            out.above = None;
+            out.below = None;
+            out.is_corrupt = true;
+            quenched_berm = true;
+        } else {
+            state.queue_water_evap(pos);
+        }
     }
 
     let mut changed = false;
@@ -906,6 +1415,9 @@ fn apply_corruption_at(
             changed = true;
             if is_water_or_frozen {
                 state.queue_melt_fx(pos);
+            }
+            if quenched_berm {
+                state.queue_shore_col([pos[0], pos[2]]);
             }
             state.rifts[rift_idx].corrupted_blocks += 1;
             if d2 > state.rifts[rift_idx].max_radius_sq {
@@ -1374,7 +1886,7 @@ impl Hooks for Mod {
         }
         let pos = [event.pos.x, event.pos.y, event.pos.z];
         if let Ok(state) = self.state.try_lock()
-            && near_corruption_or_active_rift(&state, pos)
+            && is_within_evap_basin(&state, pos)
         {
             if let Ok(mut q) = self.queues.lock() {
                 q.pending_water_evap.push(pos);
@@ -1394,7 +1906,7 @@ impl Hooks for Mod {
         }
         let pos = [event.pos.x, event.pos.y, event.pos.z];
         if let Ok(state) = self.state.try_lock()
-            && near_corruption_or_active_rift(&state, pos)
+            && is_within_evap_basin(&state, pos)
         {
             event.can_convert = false;
             if let Ok(mut q) = self.queues.lock() {
@@ -1772,6 +2284,7 @@ impl Hooks for Mod {
         evaluate_rift_containment(server, event.level, &mut state, false);
         drain_bucket_evaporations(server, event.level, &mut state, bucket_evap, pal.as_ref());
         drain_water_evaporation(server, event.level, &mut state);
+        step_ocean_shores(server, event.level, &mut state);
 
         if state.tick % 20 == 0 {
             sync_forced_chunks(server, event.level, &mut state);
@@ -1910,5 +2423,50 @@ mod tests {
         state.mark_quart_corrupted([4, 64, 4]);
         assert!(near_corruption_or_active_rift(&state, [4, 64, 4]));
         assert!(!near_corruption_or_active_rift(&state, [8, 64, 8]));
+    }
+
+    #[test]
+    fn waterfront_seawall_quenches_deep_edge_and_evaporates_interior_shallow_water() {
+        // Outer deep waterfront (<= 3.5 blocks from ring edge, or touching deep live water)
+        // quenches into cooled volcanic berm stone rather than creating a hovering water wall.
+        assert!(matches!(
+            classify_water_corruption([20, 56, 0], Some(2.0), true, true),
+            WaterCorruptAction::QuenchVolcanicBerm(b) if is_volcanic_berm_block(b)
+        ));
+        assert!(matches!(
+            classify_water_corruption([20, 62, 0], Some(2.5), true, false),
+            WaterCorruptAction::QuenchVolcanicBerm(_)
+        ));
+        // Even a shallow block right beside deep outside water seals rather than punching air.
+        assert!(matches!(
+            classify_water_corruption([20, 62, 0], Some(5.0), false, true),
+            WaterCorruptAction::QuenchVolcanicBerm(_)
+        ));
+        // Shallow inland puddles boil cleanly to air, and well-inland deep blocks behind
+        // sealed neighbors clear out to air.
+        assert_eq!(
+            classify_water_corruption([20, 62, 0], Some(1.0), false, false),
+            WaterCorruptAction::EvaporateAir
+        );
+        assert_eq!(
+            classify_water_corruption([20, 52, 0], Some(10.0), true, false),
+            WaterCorruptAction::EvaporateAir
+        );
+    }
+
+    #[test]
+    fn volcanic_shelf_steps_down_smoothly_and_preserves_seabed() {
+        let col = [48, -16];
+        let seabed = 40;
+        let sea_top = 62;
+
+        // Outer rim holds sea level height.
+        assert_eq!(volcanic_shelf_target_y(col, 2.0, seabed, sea_top), sea_top);
+        // Mid-coastal shelf sits partway between seabed and sea level.
+        let mid = volcanic_shelf_target_y(col, 8.0, seabed, sea_top);
+        assert!(mid > seabed && mid < sea_top, "expected sloped shelf in (40, 62), got {mid}");
+        // Deep interior boils down to seabed (or at most a small 1-3 block volcanic sea-stack).
+        let inner = volcanic_shelf_target_y(col, 16.0, seabed, sea_top);
+        assert!(inner >= seabed && inner <= seabed + 3, "expected dried seabed/stack, got {inner}");
     }
 }

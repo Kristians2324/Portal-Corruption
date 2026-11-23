@@ -432,8 +432,18 @@ pub fn transform_restore_block(
         return None;
     }
 
+    // Clear elevated volcanic seawall / berm stone above the original ocean floor so
+    // returning water never leaves floating stone cubes suspended mid-ocean.
+    if original.had_water && !near_monument && pos[1] > original.surface_y + 1 {
+        return Some("minecraft:air");
+    }
+
     if in_persistent_scar_patch(pos) {
         return None;
+    }
+
+    if original.had_water && !near_monument && pos[1] > original.surface_y {
+        return Some("minecraft:air");
     }
 
     if pos[1] >= original.surface_y - 3 {
@@ -900,6 +910,42 @@ mod tests {
                 "minecraft:air",
                 "minecraft:blackstone",
                 &desert,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn regression_clears_volcanic_berm_above_ocean_floor() {
+        let ocean = OriginalColumnInfo {
+            surface_y: 44,
+            surface_block: "minecraft:gravel".to_owned(),
+            had_water: true,
+            biome: "minecraft:ocean".to_owned(),
+        };
+        for y in 46..=62 {
+            for blk in [
+                "minecraft:basalt",
+                "minecraft:smooth_basalt",
+                "minecraft:blackstone",
+                "minecraft:magma_block",
+            ] {
+                assert_eq!(
+                    transform_restore_block([12, y, -8], blk, "minecraft:air", "minecraft:basalt", &ocean, false),
+                    Some("minecraft:air"),
+                    "expected submerged berm block {blk} at y={y} to clear so water refills cleanly"
+                );
+            }
+        }
+        // Monument masonry stays protected even in former ocean basins.
+        assert_eq!(
+            transform_restore_block(
+                [12, 56, -8],
+                "minecraft:polished_blackstone_bricks",
+                "minecraft:air",
+                "minecraft:blackstone",
+                &ocean,
                 true,
             ),
             None
