@@ -158,6 +158,7 @@ pub fn rift_eligible_for_bastion(rift: &RiftSource) -> bool {
             max_deepen_radius: rift.deepen_radius,
             max_ring_radius: rift.ring_radius,
             total_bastions_placed: rift.bastions_placed,
+            total_outposts_placed: rift.outposts_placed,
             member_count: 1,
         },
     )
@@ -211,7 +212,12 @@ pub fn site_outside_epicenters(state: &RiftState, cx: i32, cz: i32) -> bool {
         .citadels
         .iter()
         .all(|c| horiz_dist_sq(*c, [cx, 64, cz]) >= min_sq);
-    clear_rifts && clear_citadels
+    let out_sq = 64 * 64;
+    let clear_outposts = state
+        .outposts
+        .iter()
+        .all(|o| horiz_dist_sq(o.center, [cx, 64, cz]) >= out_sq);
+    clear_rifts && clear_citadels && clear_outposts
 }
 
 fn find_bastion_site(
@@ -843,7 +849,9 @@ mod tests {
             active_column: None,
             deepen_radius: 28,
             deepen_columns: Vec::new(),
+            max_deepen_reached: 28,
             bastions_placed: 0,
+            outposts_placed: 0,
             citadel_spawned: false,
             boss_uuid: None,
             pacified: false,

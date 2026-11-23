@@ -199,7 +199,18 @@ fn is_monument_masonry(short: &str) -> bool {
             | "cracked_nether_bricks"
             | "polished_basalt"
             | "gold_block"
+            | "iron_block"
             | "ancient_debris"
+            | "obsidian"
+            | "crying_obsidian"
+            | "iron_bars"
+            | "chain"
+            | "cauldron"
+            | "lava_cauldron"
+            | "crimson_planks"
+            | "crimson_fence"
+            | "stripped_crimson_stem"
+            | "crimson_stem"
     )
 }
 
@@ -414,6 +425,10 @@ fn near_citadel_or_bastion(state: &RiftState, x: i32, z: i32) -> bool {
             .bastions
             .iter()
             .any(|b| (x - b.center[0]).abs() <= 36 && (z - b.center[2]).abs() <= 36)
+        || state
+            .outposts
+            .iter()
+            .any(|o| (x - o.center[0]).abs() <= 22 && (z - o.center[2]).abs() <= 22)
 }
 
 fn parse_original_info(col: Option<&mod_api::TerrainColumn>) -> OriginalColumnInfo {
@@ -767,7 +782,9 @@ mod tests {
             active_column: None,
             deepen_radius: 45,
             deepen_columns: Vec::new(),
+            max_deepen_reached: 45,
             bastions_placed: 2,
+            outposts_placed: 0,
             citadel_spawned: citadel,
             boss_uuid,
             pacified: false,

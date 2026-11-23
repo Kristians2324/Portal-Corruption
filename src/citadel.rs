@@ -6,8 +6,8 @@ use crate::types::{
     spatial_hash, strip_ns,
 };
 use mod_api::{
-    BlockEdit, BlockRun, BlockState, BlockUpdateFlags, Compound, Heightmap, LevelRef, ServerHost,
-    SoundSource, Tag, Text,
+    BlockEdit, BlockRun, BlockState, BlockUpdateFlags, Compound, EquipmentSlot, GoalSpec,
+    Heightmap, Identifier, ItemStack, LevelRef, MobFilter, ServerHost, SoundSource, Tag, Text,
 };
 use std::collections::HashSet;
 
@@ -532,23 +532,30 @@ pub fn protect_citadel_portals_from_explosion(
         return;
     }
     blocks.retain(|b| {
-        let near_active_citadel_core = state
+        let near_active_citadel_wide = state
+            .rifts
+            .iter()
+            .any(|r| r.citadel_spawned && !r.pacified && horiz_dist_sq(r.center, *b) <= 30 * 30);
+        if !near_active_citadel_wide {
+            return true;
+        }
+        let near_portal_core = state
             .rifts
             .iter()
             .any(|r| r.citadel_spawned && !r.pacified && horiz_dist_sq(r.center, *b) <= 6 * 6);
-        if !near_active_citadel_core {
-            return true;
-        }
+
         if let Some(k) = level.block(host, *b) {
-            let s = k.id(host);
-            if matches!(
-                strip_ns(&s),
-                "nether_portal" | "obsidian" | "crying_obsidian"
-            ) {
+            let kid = k.id(host);
+            let s = strip_ns(&kid);
+            if matches!(s, "chest" | "barrel" | "ancient_debris" | "gold_block") {
+                return false;
+            }
+            if near_portal_core && matches!(s, "nether_portal" | "obsidian" | "crying_obsidian") {
                 return false;
             }
         }
-        if b[1] + 1 <= OVERWORLD_MAX_Y
+        if near_portal_core
+            && b[1] + 1 <= OVERWORLD_MAX_Y
             && let Some(above) = level.block(host, [b[0], b[1] + 1, b[2]])
         {
             let a = above.id(host);
@@ -874,10 +881,22 @@ fn place_citadel_vault_rewards(
         }
     }
 
-    // Treasure chests in NE & SW corner bastion-spires with real Bastion treasure loot.
+    // Stock 6 high-tier Fortress Vault, Armory, and Gatehouse Reserve chests
+    // (enriched by `loot::enrich_container_loot` when opened or broken!).
     if let Some(chest) = chest_state {
-        for (idx, (cx_off, cz_off)) in [(17, -17), (-17, 17)].iter().enumerate() {
-            let chest_pos = [center[0] + cx_off, floor_y + 1, center[2] + cz_off];
+        let placements: [([i32; 3], &str, i64); 6] = [
+            // 2 Sovereign Sanctuary Vaults inside NW & SE spires (top tier loot).
+            ([center[0] - 16, floor_y + 1, center[2] - 17], "minecraft:chests/bastion_treasure", 0xC17A_1001),
+            ([center[0] + 16, floor_y + 1, center[2] + 17], "minecraft:chests/bastion_treasure", 0xC17A_1002),
+            // 2 Horn-Spire Armories inside NE & SW spires.
+            ([center[0] + 17, floor_y + 1, center[2] - 17], "minecraft:chests/ancient_city", 0xC17A_2001),
+            ([center[0] - 17, floor_y + 1, center[2] + 17], "minecraft:chests/end_city_treasure", 0xC17A_2002),
+            // 2 Gatehouse War-Reserve Chests along the North & South courtyard battlements.
+            ([center[0] + 6, floor_y + 1, center[2] - 19], "minecraft:chests/bastion_other", 0xC17A_3001),
+            ([center[0] - 6, floor_y + 1, center[2] + 19], "minecraft:chests/bastion_other", 0xC17A_3002),
+        ];
+
+        for (chest_pos, table, seed) in placements {
             if ow.is_loaded(host, chest_pos)
                 && ow
                     .set_block(host, chest_pos, chest, BlockUpdateFlags::CLIENTS)
@@ -885,11 +904,8 @@ fn place_citadel_vault_rewards(
                 && let Some(be) = host.block_entity(ow, chest_pos)
             {
                 let mut data = Compound::new();
-                data.insert(
-                    "LootTable".into(),
-                    Tag::String("minecraft:chests/bastion_treasure".into()),
-                );
-                data.insert("LootTableSeed".into(), Tag::Long(0xB457_1000 + idx as i64));
+                data.insert("LootTable".into(), Tag::String(table.into()));
+                data.insert("LootTableSeed".into(), Tag::Long(seed));
                 let _ = be.merge_data(host, data);
             }
         }
@@ -904,28 +920,23 @@ fn spawn_citadel_garrison_and_wither(
     center: [i32; 3],
     floor_y: i32,
 ) -> Option<u128> {
-    let guards: &[(&str, [i32; 3])] = &[
-        ("minecraft:wither_skeleton", [7, 1, 0]),
-        ("minecraft:wither_skeleton", [-7, 1, 0]),
-        ("minecraft:wither_skeleton", [0, 1, 7]),
-        ("minecraft:wither_skeleton", [0, 1, -7]),
-        ("minecraft:piglin_brute", [10, 1, 10]),
-        ("minecraft:piglin_brute", [-10, 1, -10]),
-        ("minecraft:piglin_brute", [24, 8, 0]),
-        ("minecraft:piglin", [0, 8, 24]),
-        ("minecraft:piglin", [0, 8, -24]),
-        ("minecraft:piglin", [-24, 8, 0]),
-        ("minecraft:blaze", [17, 18, 17]),
-        ("minecraft:blaze", [-17, 18, 17]),
-        ("minecraft:blaze", [17, 18, -17]),
-        ("minecraft:blaze", [-17, 18, -17]),
-        ("minecraft:hoglin", [0, 1, 21]),
-        ("minecraft:hoglin", [21, 1, 0]),
-        ("minecraft:magma_cube", [-10, 1, 10]),
-        ("minecraft:magma_cube", [10, 1, -10]),
+    // Undead Wither Skeleton Honor Guard near portal (ignored by Wither AI naturally),
+    // plus Armored Piglin Brute Captains and War Hoglins — all allied to never fight the Wither.
+    let guards: &[(&str, [i32; 3], Option<&str>)] = &[
+        ("minecraft:wither_skeleton", [7, 1, 0], None),
+        ("minecraft:wither_skeleton", [-7, 1, 0], None),
+        ("minecraft:wither_skeleton", [0, 1, 7], None),
+        ("minecraft:wither_skeleton", [0, 1, -7], None),
+        ("minecraft:piglin_brute", [10, 1, 10], Some("Citadel Captain")),
+        ("minecraft:piglin_brute", [-10, 1, -10], Some("Citadel Captain")),
+        ("minecraft:piglin_brute", [10, 1, -10], Some("Sovereign's Captain")),
+        ("minecraft:piglin_brute", [-10, 1, 10], Some("Sovereign's Captain")),
+        ("minecraft:hoglin", [0, 1, 20], None),
+        ("minecraft:hoglin", [20, 1, 0], None),
+        ("minecraft:hoglin", [-20, 1, 0], None),
     ];
 
-    for (kind, [dx, dy, dz]) in guards {
+    for (kind, [dx, dy, dz], captain_name) in guards {
         let mut nbt = Compound::new();
         nbt.insert("PersistenceRequired".into(), Tag::Byte(1));
         if is_piglin_or_hoglin(kind) {
@@ -939,10 +950,35 @@ fn spawn_citadel_garrison_and_wither(
         ];
         if let Some(eid) = host.summon(OVERWORLD, kind, pos, nbt) {
             state.known_nether_mobs.insert(eid);
+            state.citadel_guards.insert(eid);
+            if let Some(ent) = host.entity(eid) {
+                let _ = ent.add_tag(host, "rift_bleed:nether_ally");
+                let _ = ent.add_tag(host, "rift_bleed:citadel_guard");
+                if let Some(title) = captain_name {
+                    let _ = ent.set_custom_name(host, Some(Text::literal((*title).to_owned())));
+                    if let Some(living) = host.living(ent) {
+                        let _ = living.set_attribute_base(host, "minecraft:max_health", 75.0);
+                        let _ = living.set_health(host, 75.0);
+                        for (slot, item_id) in [
+                            (EquipmentSlot::Head, "minecraft:golden_helmet"),
+                            (EquipmentSlot::Chest, "minecraft:golden_chestplate"),
+                            (EquipmentSlot::MainHand, "minecraft:netherite_axe"),
+                        ] {
+                            if let Ok(ident) = Identifier::parse(item_id)
+                                && let Some(key) = host.item_key(&ident)
+                                && let Some(stack) = ItemStack::new(key, 1)
+                            {
+                                let _ = living.set_equipment(host, slot, Some(stack));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Spawn the Wither Sovereign hovering inside the central Citadel arena!
+    // Spawn the Wither Sovereign hovering inside the central Citadel arena,
+    // locking its AI target goals exclusively onto Players so it never hunts its own Nether guards.
     let mut wither_nbt = Compound::new();
     wither_nbt.insert("PersistenceRequired".into(), Tag::Byte(1));
     wither_nbt.insert("Invul".into(), Tag::Int(140));
@@ -953,13 +989,29 @@ fn spawn_citadel_garrison_and_wither(
     ];
     let boss_id = host.summon(OVERWORLD, "minecraft:wither", spawn_pos, wither_nbt)?;
     state.known_nether_mobs.insert(boss_id);
+    state.known_withers.insert(boss_id);
 
     let mut boss_uuid = None;
     if let Some(ent) = host.entity(boss_id) {
         let _ = ent.add_tag(host, "rift_bleed:sovereign");
+        let _ = ent.add_tag(host, "rift_bleed:nether_ally");
         let _ = ent.add_tag(host, &format!("rift_bleed:rift_{rift_id}"));
         let _ = ent.set_custom_name(host, Some(Text::literal(format!("Rift #{rift_id} Sovereign"))));
         boss_uuid = ent.uuid(host);
+        if let Some(mob) = host.mob(ent) {
+            let _ = mob.remove_target_goal(host, "nearest_target");
+            let _ = mob.remove_target_goal(host, "hurt_by_target");
+            let _ = mob.add_target_goal(
+                host,
+                2,
+                &GoalSpec::NearestTarget {
+                    prey: MobFilter::Player,
+                    must_see: false,
+                    must_reach: false,
+                    interval: 10,
+                },
+            );
+        }
     }
     let _ = ow;
     boss_uuid
@@ -985,7 +1037,9 @@ mod tests {
             active_column: None,
             deepen_radius: 45,
             deepen_columns: Vec::new(),
+            max_deepen_reached: 45,
             bastions_placed: 2,
+            outposts_placed: 0,
             citadel_spawned: false,
             boss_uuid: None,
             pacified: false,
@@ -1005,6 +1059,7 @@ mod tests {
             max_deepen_radius: r.deepen_radius,
             max_ring_radius: r.ring_radius,
             total_bastions_placed: r.bastions_placed,
+            total_outposts_placed: r.outposts_placed,
             member_count: 1,
         };
         assert!(wasteland_eligible_for_citadel(&r, w));

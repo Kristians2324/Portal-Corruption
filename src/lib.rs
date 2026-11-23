@@ -3,7 +3,9 @@ mod bastion;
 mod citadel;
 mod containment;
 mod corruption;
+mod loot;
 mod mobs;
+mod outposts;
 mod regression;
 mod state;
 mod types;
@@ -14,6 +16,7 @@ use corruption::{
     SURFACE_CRUST_DEPTH, effective_rift_budget, is_air_like, is_snow_or_ice, is_water_like,
     surface_column_y_range, transform_block,
 };
+use loot::ItemPalette;
 use mobs::paint_biome_column;
 use state::RiftState;
 use types::{
@@ -24,13 +27,15 @@ use types::{
 use mod_api::{
     BlockChangedEvent, BlockSpreadEvent, BlockUpdateFlags, BucketEmptyEvent, ClientHost,
     ClientLevelLoadEvent, ClientLevelUnloadEvent, ClientTickPostEvent, Command,
-    CommandArgumentValue, ComputeFogColorEvent, CreateFluidSourceEvent, ExplosionDetonateEvent,
-    FillBucketEvent, FinalizeSpawnEvent, Flow, FluidLevelChangeEvent, Heightmap, Hooks, HostSide,
-    Identifier, ItemStack, LevelDimension, LevelHost, LevelRef, LevelTickPostEvent,
-    LivingConversionPreEvent, LivingDeathEvent, LootDropsEvent, MusicEvent, ParticleOptions,
-    PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RenderFogEvent, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerStoppingEvent,
-    SoundSource, Text, WorldLifecycleEvent, WorldPhase, WorldSavedEvent,
+    CommandArgumentValue, ComputeFogColorEvent, ContainerLootFilledEvent, CreateFluidSourceEvent,
+    ExplosionDetonateEvent, FillBucketEvent, FinalizeSpawnEvent, Flow, FluidLevelChangeEvent,
+    Heightmap, Hooks, Host, HostSide, Identifier, ItemStack, LevelDimension, LevelHost,
+    LevelRandomHost, LevelRef, LevelTickPostEvent, LivingChangeTargetEvent,
+    LivingConversionPreEvent, LivingDeathEvent, LivingIncomingDamageEvent, LootDropsEvent,
+    MusicEvent, ParticleOptions, PortalCreateEvent, PotentialSpawnsEvent, RegisterCommandsEvent,
+    Registrar, RegistrationContext, RenderFogEvent, RunModCommandEvent, ServerHost,
+    ServerStartedEvent, ServerStoppingEvent, SoundSource, Text, WorldLifecycleEvent, WorldPhase,
+    WorldSavedEvent,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
@@ -72,6 +77,7 @@ pub struct Mod {
     state: Mutex<RiftState>,
     atmo: Mutex<ClientAtmosphere>,
     particles: Mutex<Option<ParticlePalette>>,
+    items: Mutex<Option<ItemPalette>>,
 }
 
 struct ServerContainmentView<'a> {
@@ -148,6 +154,7 @@ fn release_all_forced_chunks(host: &mut dyn ServerHost, level: LevelRef, state: 
         }
     }
     bastion::release_bastion_chunks(host, level, state);
+    outposts::release_outpost_chunks(host, level, state);
     citadel::release_citadel_chunks(host, level, state);
 }
 
@@ -274,7 +281,9 @@ fn register_or_refresh_rift(host: &mut dyn ServerHost, level: LevelRef, state: &
         active_column: None,
         deepen_radius: 1,
         deepen_columns: build_ring_columns(centroid[0], centroid[2], 1),
+        max_deepen_reached: 1,
         bastions_placed: 0,
+        outposts_placed: 0,
         citadel_spawned: false,
         boss_uuid: None,
         pacified: false,
@@ -1078,6 +1087,7 @@ fn corrupt_deepen_step(
                     rift_center,
                 );
                 r.deepen_radius = d_rad;
+                r.max_deepen_reached = r.max_deepen_reached.max(d_rad);
                 picked
             };
             let Some(col) = next_col else {
@@ -1209,6 +1219,10 @@ impl Hooks for Mod {
         };
         if let Ok(mut guard) = self.particles.lock() {
             *guard = Some(pal);
+        }
+        let item_pal = ItemPalette::register(r);
+        if let Ok(mut guard) = self.items.lock() {
+            *guard = Some(item_pal);
         }
     }
 
@@ -1429,6 +1443,24 @@ impl Hooks for Mod {
         Flow::Continue
     }
 
+    fn living_change_target(&self, host: &dyn Host, event: &mut LivingChangeTargetEvent<'_>) -> Flow {
+        mobs::handle_living_change_target(host, event);
+        Flow::Continue
+    }
+
+    fn living_incoming_damage(
+        &self,
+        _level: &mut dyn LevelRandomHost,
+        event: &mut LivingIncomingDamageEvent<'_>,
+    ) -> Flow {
+        if let Ok(state) = self.state.try_lock()
+            && mobs::should_cancel_incoming_damage(&state, event)
+        {
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
     fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
         let pal = self.particles.lock().ok().and_then(|g| *g);
         if let Ok(mut state) = self.state.try_lock()
@@ -1455,6 +1487,19 @@ impl Hooks for Mod {
         };
         if let Ok(state) = self.state.try_lock() {
             citadel::protect_citadel_portals_from_explosion(host, level, &state, event.blocks);
+        }
+    }
+
+    fn container_loot_filled(
+        &self,
+        _level: &dyn LevelHost,
+        event: &mut ContainerLootFilledEvent<'_>,
+    ) {
+        let Some(item_pal) = self.items.lock().ok().and_then(|g| *g) else {
+            return;
+        };
+        if let Ok(state) = self.state.try_lock() {
+            loot::enrich_container_loot(&state, event, &item_pal);
         }
     }
 
@@ -1537,7 +1582,7 @@ impl Hooks for Mod {
                     let regressing = state.rifts.iter().filter(|r| r.regressing).count();
                     let blocks: u64 = state.rifts.iter().map(|r| r.corrupted_blocks).sum();
                     format!(
-                        "[Rift Bleed] Rifts: {} total ({} active, {} sealed, {} pacified{}) | Corrupted blocks: {} | Bastions: {} | Citadels: {} | Speed: {} ops/tick | State: {}",
+                        "[Rift Bleed] Rifts: {} total ({} active, {} sealed, {} pacified{}) | Corrupted blocks: {} | Bastions: {} | Outposts: {} | Citadels: {} | Speed: {} ops/tick | State: {}",
                         state.rifts.len(),
                         active,
                         sealed,
@@ -1549,6 +1594,7 @@ impl Hooks for Mod {
                         },
                         blocks,
                         state.bastions.len(),
+                        state.outposts.len(),
                         state.citadels.len(),
                         state.spread_budget,
                         if state.paused { "PAUSED" } else { "RUNNING" }
@@ -1711,6 +1757,7 @@ impl Hooks for Mod {
         emit_melt_evap_fx(server, event.level, &mut state, pal.as_ref());
         mobs::tick_mobs(server, event.level, &mut state, pal.as_ref());
         bastion::tick_bastion_emergence(server, event.level, &mut state);
+        outposts::tick_outposts(server, event.level, &mut state);
         citadel::tick_citadel_emergence(server, event.level, &mut state);
         regression::tick_regression(server, event.level, &mut state);
 
@@ -1825,7 +1872,9 @@ mod tests {
             active_column: None,
             deepen_radius: 1,
             deepen_columns: Vec::new(),
+            max_deepen_reached: 1,
             bastions_placed: 0,
+            outposts_placed: 0,
             citadel_spawned: false,
             boss_uuid: None,
             pacified: false,

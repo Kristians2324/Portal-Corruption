@@ -109,7 +109,10 @@ pub struct RiftSource {
     /// Inner-ring deepening pass so underground zones sink all the way to bedrock `-63`.
     pub deepen_radius: i32,
     pub deepen_columns: Vec<[i32; 2]>,
+    /// Highest `deepen_radius` ever reached by this Rift (preserved when `deepen_radius` wraps to 1).
+    pub max_deepen_reached: i32,
     pub bastions_placed: u32,
+    pub outposts_placed: u32,
     /// True once this Rift's unique central Citadel has erupted around the portal.
     pub citadel_spawned: bool,
     /// Persistent UUID of the Wither Sovereign guarding this Rift's Citadel.
@@ -132,6 +135,42 @@ impl RiftSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BastionSite {
     pub center: [i32; 3],
+    pub flavor: NetherFlavor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutpostKind {
+    HoglinVillage = 0,
+    InfernalFoundry = 1,
+    SiegeWatchtower = 2,
+}
+
+impl OutpostKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::InfernalFoundry,
+            2 => Self::SiegeWatchtower,
+            _ => Self::HoglinVillage,
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::HoglinVillage => "Hoglin War-Kraal",
+            Self::InfernalFoundry => "Hellforge Foundry",
+            Self::SiegeWatchtower => "Mordor Siege Garrison",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutpostSite {
+    pub center: [i32; 3],
+    pub kind: OutpostKind,
     pub flavor: NetherFlavor,
 }
 

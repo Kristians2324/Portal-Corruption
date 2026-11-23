@@ -1,4 +1,7 @@
-use crate::types::{BastionSite, NetherFlavor, RiftSource, build_ring_columns, quart_coords};
+use crate::types::{
+    BastionSite, NetherFlavor, OutpostKind, OutpostSite, RiftSource, build_ring_columns,
+    quart_coords,
+};
 use mod_api::serde_json::{self, Map, Value};
 use mod_api::{ConfigPath, ServerHost, WorldEpoch};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,6 +17,7 @@ pub struct ConnectedWasteland {
     pub max_deepen_radius: i32,
     pub max_ring_radius: i32,
     pub total_bastions_placed: u32,
+    pub total_outposts_placed: u32,
     pub member_count: usize,
 }
 
@@ -44,6 +48,17 @@ pub struct PendingCitadel {
     pub queued_tick: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingOutpost {
+    pub rift_id: u64,
+    pub center: [i32; 3],
+    pub kind: OutpostKind,
+    pub flavor: NetherFlavor,
+    pub roll: u64,
+    pub forced_chunks: Vec<[i32; 2]>,
+    pub queued_tick: u64,
+}
+
 pub struct RiftState {
     pub world_epoch: Option<WorldEpoch>,
     pub world_dir: Option<PathBuf>,
@@ -55,6 +70,7 @@ pub struct RiftState {
     pub dirty: bool,
     pub rifts: Vec<RiftSource>,
     pub bastions: Vec<BastionSite>,
+    pub outposts: Vec<OutpostSite>,
     pub citadels: Vec<[i32; 3]>,
     pub corrupted_quarts: HashSet<[i32; 3]>,
     pub corrupted_quart_cols: HashSet<[i32; 2]>,
@@ -62,6 +78,10 @@ pub struct RiftState {
     pub nether_touched_mobs: HashSet<u32>,
     /// Tracks known living Nether predator entity IDs so `living_death` recognizes attackers cleanly.
     pub known_nether_mobs: HashSet<u32>,
+    /// Tracks living Sovereign/Citadel Wither entity IDs for friendly-fire ceasefire checks.
+    pub known_withers: HashSet<u32>,
+    /// Tracks allied Citadel/Outpost garrison entity IDs (`rift_bleed:nether_ally`).
+    pub citadel_guards: HashSet<u32>,
     /// Tracks Piglins/Brutes/Hoglins already stabilized with `IsImmuneToZombification: 1b`
     /// so vanilla Overworld zombification never triggers repeated conversion sounds.
     pub zombification_immune_mobs: HashSet<u32>,
@@ -72,6 +92,9 @@ pub struct RiftState {
     pub pending_bastion: Option<PendingBastion>,
     pub bastion_release_chunks: Vec<[i32; 2]>,
     pub bastion_release_ttl: u8,
+    pub pending_outpost: Option<PendingOutpost>,
+    pub outpost_release_chunks: Vec<[i32; 2]>,
+    pub outpost_release_ttl: u8,
     pub pending_citadel: Option<PendingCitadel>,
     pub citadel_release_chunks: Vec<[i32; 2]>,
     pub citadel_release_ttl: u8,
@@ -110,11 +133,14 @@ impl RiftState {
             dirty: false,
             rifts: Vec::new(),
             bastions: Vec::new(),
+            outposts: Vec::new(),
             citadels: Vec::new(),
             corrupted_quarts: HashSet::new(),
             corrupted_quart_cols: HashSet::new(),
             nether_touched_mobs: HashSet::new(),
             known_nether_mobs: HashSet::new(),
+            known_withers: HashSet::new(),
+            citadel_guards: HashSet::new(),
             zombification_immune_mobs: HashSet::new(),
             core_chunks: HashSet::new(),
             frontier_chunks: VecDeque::new(),
@@ -122,6 +148,9 @@ impl RiftState {
             pending_bastion: None,
             bastion_release_chunks: Vec::new(),
             bastion_release_ttl: 0,
+            pending_outpost: None,
+            outpost_release_chunks: Vec::new(),
+            outpost_release_ttl: 0,
             pending_citadel: None,
             citadel_release_chunks: Vec::new(),
             citadel_release_ttl: 0,
@@ -236,11 +265,17 @@ impl RiftState {
                 summary.total_corrupted_blocks.saturating_add(r.corrupted_blocks);
             summary.total_area_radius_sq =
                 summary.total_area_radius_sq.saturating_add(r.max_radius_sq);
-            summary.max_deepen_radius = summary.max_deepen_radius.max(r.deepen_radius);
+            summary.max_deepen_radius = summary
+                .max_deepen_radius
+                .max(r.deepen_radius)
+                .max(r.max_deepen_reached);
             summary.max_ring_radius = summary.max_ring_radius.max(r.ring_radius);
             summary.total_bastions_placed = summary
                 .total_bastions_placed
                 .saturating_add(r.bastions_placed);
+            summary.total_outposts_placed = summary
+                .total_outposts_placed
+                .saturating_add(r.outposts_placed);
             summary.member_count += 1;
 
             for next in 0..self.rifts.len() {
@@ -312,7 +347,7 @@ impl RiftState {
 
     pub fn to_json(&self) -> Value {
         let mut root = Map::new();
-        root.insert("version".into(), Value::from(7));
+        root.insert("version".into(), Value::from(8));
         root.insert("seed".into(), Value::from(self.seed));
         root.insert("next_id".into(), Value::from(self.next_id));
         root.insert("paused".into(), Value::from(self.paused));
@@ -333,7 +368,9 @@ impl RiftState {
                 obj.insert("max_radius_sq".into(), Value::from(r.max_radius_sq));
                 obj.insert("ring_radius".into(), Value::from(r.ring_radius));
                 obj.insert("deepen_radius".into(), Value::from(r.deepen_radius));
+                obj.insert("max_deepen_reached".into(), Value::from(r.max_deepen_reached));
                 obj.insert("bastions_placed".into(), Value::from(r.bastions_placed));
+                obj.insert("outposts_placed".into(), Value::from(r.outposts_placed));
                 obj.insert("citadel_spawned".into(), Value::from(r.citadel_spawned));
                 if let Some(u) = r.boss_uuid {
                     obj.insert("boss_uuid".into(), Value::String(format!("{u:032x}")));
@@ -390,6 +427,19 @@ impl RiftState {
 
         let citadels: Vec<Value> = self.citadels.iter().copied().map(pos_to_json).collect();
         root.insert("citadels".into(), Value::Array(citadels));
+
+        let outposts: Vec<Value> = self
+            .outposts
+            .iter()
+            .map(|o| {
+                let mut obj = Map::new();
+                obj.insert("center".into(), pos_to_json(o.center));
+                obj.insert("kind".into(), Value::from(o.kind.to_u8()));
+                obj.insert("flavor".into(), Value::from(o.flavor.to_u8()));
+                Value::Object(obj)
+            })
+            .collect();
+        root.insert("outposts".into(), Value::Array(outposts));
 
         let cols: Vec<Value> = self
             .corrupted_quart_cols
@@ -471,6 +521,11 @@ impl RiftState {
                     (dr, dc)
                 };
                 let active_column = item.get("active_column").and_then(active_col_from_json);
+                let max_deepen_reached = item
+                    .get("max_deepen_reached")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| (v as i32).max(deepen_radius))
+                    .unwrap_or(deepen_radius);
                 let citadel_spawned = item
                     .get("citadel_spawned")
                     .and_then(|v| v.as_bool())
@@ -526,8 +581,13 @@ impl RiftState {
                     active_column,
                     deepen_radius,
                     deepen_columns,
+                    max_deepen_reached,
                     bastions_placed: item
                         .get("bastions_placed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    outposts_placed: item
+                        .get("outposts_placed")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32,
                     citadel_spawned,
@@ -560,6 +620,26 @@ impl RiftState {
                 if let Some(center) = pos_from_json(item) {
                     self.citadels.push(center);
                 }
+            }
+        }
+
+        self.outposts.clear();
+        if let Some(arr) = doc.get("outposts").and_then(|v| v.as_array()) {
+            for item in arr {
+                let Some(center) = item.get("center").and_then(pos_from_json) else {
+                    continue;
+                };
+                let kind = OutpostKind::from_u8(
+                    item.get("kind").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                );
+                let flavor = NetherFlavor::from_u8(
+                    item.get("flavor").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                );
+                self.outposts.push(OutpostSite {
+                    center,
+                    kind,
+                    flavor,
+                });
             }
         }
 
@@ -652,7 +732,9 @@ mod tests {
             active_column: Some(([121, -88], 12, -63)),
             deepen_radius: 6,
             deepen_columns: vec![[122, -88]],
+            max_deepen_reached: 24,
             bastions_placed: 1,
+            outposts_placed: 2,
             citadel_spawned: true,
             boss_uuid: Some(0x1234_5678_9abc_def0_1122_3344_5566_7788),
             pacified: false,
@@ -662,6 +744,11 @@ mod tests {
             regress_active_column: Some(([120, -88], 40, -63)),
         });
         s.citadels.push([120, 64, -88]);
+        s.outposts.push(OutpostSite {
+            center: [185, 68, -20],
+            kind: OutpostKind::HoglinVillage,
+            flavor: NetherFlavor::CrimsonForest,
+        });
         s.bastions.push(BastionSite {
             center: [210, 70, -40],
             flavor: NetherFlavor::BasaltDeltas,
@@ -687,6 +774,10 @@ mod tests {
         assert!(loaded.rifts[0].regressing);
         assert_eq!(loaded.rifts[0].regress_radius, 12);
         assert_eq!(loaded.citadels, vec![[120, 64, -88]]);
+        assert_eq!(loaded.outposts.len(), 1);
+        assert_eq!(loaded.outposts[0].kind, OutpostKind::HoglinVillage);
+        assert_eq!(loaded.rifts[0].max_deepen_reached, 24);
+        assert_eq!(loaded.rifts[0].outposts_placed, 2);
         assert_eq!(loaded.rifts[0].flavor, NetherFlavor::SoulSandValley);
         assert_eq!(loaded.rifts[0].ring_radius, 14);
         assert_eq!(loaded.rifts[0].active_column, Some(([121, -88], 12, -63)));

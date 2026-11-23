@@ -6,9 +6,10 @@ use crate::types::{
     spatial_hash, strip_ns,
 };
 use mod_api::{
-    ActiveEffect, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, Heightmap, Host,
-    Identifier, ItemStack, LevelRef, LivingDeathEvent, ParticleOptions, PotentialSpawnsEvent,
-    ServerHost, SoundSource, SpawnEntry, SpawnReason, Tag,
+    ActiveEffect, BlockUpdateFlags, Compound, EntityRef, FinalizeSpawnEvent, GoalSpec, Heightmap,
+    Host, Identifier, ItemStack, LevelRef, LivingChangeTargetEvent, LivingDeathEvent,
+    LivingIncomingDamageEvent, MobFilter, ParticleOptions, PotentialSpawnsEvent, ServerHost,
+    SoundSource, SpawnEntry, SpawnReason, Tag,
 };
 
 const MOB_TICK_INTERVAL: u64 = 20;
@@ -308,8 +309,11 @@ fn process_predator_hunting_and_buffs(
     let mut fire_buffs: Vec<EntityRef> = Vec::new();
     let mut immunize_mobs: Vec<u32> = Vec::new();
     let mut touched_buffs: Vec<(EntityRef, [f64; 3])> = Vec::new();
+    let mut withers: Vec<(EntityRef, u32)> = Vec::new();
 
     state.known_nether_mobs.clear();
+    state.known_withers.clear();
+    state.citadel_guards.clear();
     for (ent, id, kind, pos) in entities {
         let bp = [
             pos[0].floor() as i32,
@@ -317,8 +321,30 @@ fn process_predator_hunting_and_buffs(
             pos[2].floor() as i32,
         ];
 
+        if strip_ns(kind) == "wither" {
+            let is_sovereign = ent
+                .tags(host)
+                .is_some_and(|ts| ts.iter().any(|t| t == "rift_bleed:sovereign"))
+                || state
+                    .citadels
+                    .iter()
+                    .any(|c| horiz_dist_sq(*c, bp) <= 44 * 44);
+            if is_sovereign {
+                state.known_nether_mobs.insert(*id);
+                state.known_withers.insert(*id);
+                withers.push((*ent, *id));
+            }
+            continue;
+        }
+
         if is_nether_predator(kind) {
             state.known_nether_mobs.insert(*id);
+            if ent.tags(host).is_some_and(|ts| {
+                ts.iter()
+                    .any(|t| t == "rift_bleed:nether_ally" || t == "rift_bleed:citadel_guard")
+            }) {
+                state.citadel_guards.insert(*id);
+            }
             if matches!(
                 strip_ns(kind),
                 "piglin" | "piglin_brute" | "hoglin" | "wither_skeleton" | "blaze" | "zoglin"
@@ -371,6 +397,56 @@ fn process_predator_hunting_and_buffs(
         apply_mob_effects(host, ent, 20 * 600, 20 * 600);
     }
 
+    // Ensure Sovereign Withers (even loaded from older saves) target only Players and
+    // drop any stray lock onto nearby Nether guards, and keep allied guards off the Wither.
+    for (w_ent, _) in withers {
+        if let Some(mob) = host.mob(w_ent) {
+            if let Some(goals) = mob.target_goals(host) {
+                let needs_fix = goals.iter().any(|g| g.id == "hurt_by_target")
+                    || !goals.iter().any(|g| g.id == "nearest_target");
+                if needs_fix {
+                    let _ = mob.remove_target_goal(host, "nearest_target");
+                    let _ = mob.remove_target_goal(host, "hurt_by_target");
+                    let _ = mob.add_target_goal(
+                        host,
+                        2,
+                        &GoalSpec::NearestTarget {
+                            prey: MobFilter::Player,
+                            must_see: false,
+                            must_reach: false,
+                            interval: 10,
+                        },
+                    );
+                }
+            }
+            if let Some(tgt) = mob.target(host)
+                && tgt
+                    .entity()
+                    .kind(host)
+                    .is_some_and(|k| is_nether_predator(&k.id(host)))
+            {
+                let _ = mob.set_target(host, None);
+            }
+        }
+    }
+
+    for (hunter_ent, _) in &hunters {
+        if state.citadel_guards.contains(&hunter_ent.id())
+            && let Some(mob) = host.mob(*hunter_ent)
+            && let Some(tgt) = mob.target(host)
+        {
+            let tgt_id = tgt.entity().id();
+            let tgt_wither = tgt
+                .entity()
+                .kind(host)
+                .is_some_and(|k| strip_ns(&k.id(host)) == "wither");
+            if tgt_wither || state.citadel_guards.contains(&tgt_id) {
+                let _ = mob.set_target(host, None);
+                let _ = mob.set_brain_target(host, None);
+            }
+        }
+    }
+
     if hunters.is_empty() || prey.is_empty() {
         return;
     }
@@ -406,6 +482,103 @@ fn process_predator_hunting_and_buffs(
             }
         }
     }
+}
+
+/// Stops the Citadel Wither Sovereign and allied Nether guards from targeting
+/// or infighting with one another.
+pub fn handle_living_change_target(host: &dyn Host, event: &mut LivingChangeTargetEvent<'_>) {
+    let Some(target) = *event.new_target else {
+        return;
+    };
+    let Some(mob_kind) = event.mob.entity().kind(host).map(|k| k.id(host)) else {
+        return;
+    };
+    let Some(tgt_kind) = target.entity().kind(host).map(|k| k.id(host)) else {
+        return;
+    };
+
+    let mob_short = strip_ns(&mob_kind);
+    let tgt_short = strip_ns(&tgt_kind);
+    let mob_nether = is_nether_predator(&mob_kind) || mob_short == "strider";
+    let tgt_nether = is_nether_predator(&tgt_kind) || tgt_short == "strider";
+
+    if (mob_short == "wither" && tgt_nether) || (mob_nether && tgt_short == "wither") {
+        *event.new_target = None;
+        return;
+    }
+
+    if mob_nether && tgt_nether {
+        let mob_ally = event
+            .mob
+            .entity()
+            .tags(host)
+            .is_some_and(|ts| ts.iter().any(|t| t == "rift_bleed:nether_ally"));
+        let tgt_ally = target
+            .entity()
+            .tags(host)
+            .is_some_and(|ts| ts.iter().any(|t| t == "rift_bleed:nether_ally"));
+        if mob_ally && tgt_ally {
+            *event.new_target = None;
+        }
+    }
+}
+
+pub fn should_cancel_damage_pair(
+    state: &RiftState,
+    victim_id: Option<u32>,
+    victim_kind: &str,
+    damage_type: &str,
+    causing: Option<u32>,
+    direct: Option<u32>,
+) -> bool {
+    let victim_short = strip_ns(victim_kind);
+    let victim_is_nether = is_nether_predator(victim_kind) || victim_short == "strider";
+    let victim_is_wither = victim_short == "wither";
+
+    if victim_is_nether {
+        if matches!(strip_ns(damage_type), "wither" | "wither_skull") {
+            return true;
+        }
+        if causing.is_some_and(|id| state.known_withers.contains(&id))
+            || direct.is_some_and(|id| state.known_withers.contains(&id))
+        {
+            return true;
+        }
+        if victim_id.is_some_and(|vid| state.citadel_guards.contains(&vid))
+            && (causing.is_some_and(|cid| state.citadel_guards.contains(&cid))
+                || direct.is_some_and(|did| state.citadel_guards.contains(&did)))
+        {
+            return true;
+        }
+    }
+
+    if victim_is_wither
+        && (causing
+            .is_some_and(|id| state.known_nether_mobs.contains(&id) || state.citadel_guards.contains(&id))
+            || direct.is_some_and(|id| {
+                state.known_nether_mobs.contains(&id) || state.citadel_guards.contains(&id)
+            }))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Cancels all friendly-fire damage (including Wither skull splash, wither status
+/// decay, and accidental swings) between any Wither boss and Nether mobs/allied guards.
+pub fn should_cancel_incoming_damage(
+    state: &RiftState,
+    event: &LivingIncomingDamageEvent<'_>,
+) -> bool {
+    should_cancel_damage_pair(
+        state,
+        u32::try_from(event.entity).ok(),
+        event.kind,
+        event.source.damage_type,
+        u32::try_from(event.source.causing).ok(),
+        u32::try_from(event.source.direct).ok(),
+    )
 }
 
 /// Converts any Overworld creature killed by a Nether mob (or slain inside an already-large
@@ -947,7 +1120,9 @@ mod tests {
             active_column: None,
             deepen_radius: 10,
             deepen_columns: Vec::new(),
+            max_deepen_reached: 10,
             bastions_placed: 0,
+            outposts_placed: 0,
             citadel_spawned: false,
             boss_uuid: None,
             pacified: false,
@@ -1070,5 +1245,67 @@ mod tests {
         assert!(is_piglin_or_hoglin("minecraft:hoglin"));
         assert!(is_zombified_outcome("minecraft:zombified_piglin"));
         assert!(is_zombified_outcome("minecraft:zoglin"));
+    }
+
+    #[test]
+    fn citadel_wither_and_nether_guards_never_friendly_fire() {
+        let mut st = RiftState::new();
+        st.known_withers.insert(100);
+        st.known_nether_mobs.insert(201);
+        st.citadel_guards.insert(201);
+        st.citadel_guards.insert(202);
+
+        // Wither hitting a Hoglin or Piglin Brute Captain must cancel.
+        assert!(should_cancel_damage_pair(
+            &st,
+            Some(201),
+            "minecraft:hoglin",
+            "minecraft:explosion.player",
+            Some(100),
+            None,
+        ));
+        assert!(should_cancel_damage_pair(
+            &st,
+            Some(202),
+            "minecraft:piglin_brute",
+            "minecraft:wither_skull",
+            Some(100),
+            None,
+        ));
+        // Captain hitting Wither must cancel.
+        assert!(should_cancel_damage_pair(
+            &st,
+            Some(100),
+            "minecraft:wither",
+            "minecraft:mob_attack",
+            Some(201),
+            Some(201),
+        ));
+        // Allied Hoglins & Captains never hurt each other.
+        assert!(should_cancel_damage_pair(
+            &st,
+            Some(202),
+            "minecraft:hoglin",
+            "minecraft:mob_attack",
+            Some(201),
+            None,
+        ));
+        // Players CAN still damage both the Wither and guards!
+        assert!(!should_cancel_damage_pair(
+            &st,
+            Some(100),
+            "minecraft:wither",
+            "minecraft:player_attack",
+            Some(999),
+            Some(999),
+        ));
+        assert!(!should_cancel_damage_pair(
+            &st,
+            Some(201),
+            "minecraft:piglin_brute",
+            "minecraft:player_attack",
+            Some(999),
+            None,
+        ));
     }
 }
